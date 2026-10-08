@@ -16,8 +16,11 @@
 >
 > **第 49 轮（规范已更新）**：新增门禁档 **`--hw-kbdexcl`** + 脚本 `otilink/kbdexcl.sh`；
 > 排障入口新增 **`RUNBOOK §19`（症状 → 病因 → 一句探针 + 必须成立的不变量）**——一症多因，先定层再动手；
-> `re/` 起有**本地** git（仅本地、无远端；首个提交 `3637b2a`，230 文件），回滚/查改用
-> `git -C re log/show/diff`（见 `NOTES §64.2`）。
+> `re/` 现在是 git 仓库：远端 **`git@github.com:yezi4271/otilink-kvm.git`**（私有，首推干净单提交 `8e9c9ea`，
+> 内容已**公开就绪**：无凭据/内网 IP/用户名/厂商二进制）；旧历史只在本地的
+> `do-not-push-pre-public` tag 里（**绝不要 `git push --tags`**）。
+> 提交身份用仓库级配置：`yezi4271 <209439523+yezi4271@users.noreply.github.com>`（GitHub noreply，挂得到账号、不暴露真实邮箱）。
+> 细节见 `NOTES §64.2 / §66`。
 >
 > **第 49 轮（现场报障与修复）**：
 > 现场报障"**我在 windows 上打字，kylin 也在同步打字**"= 接管对端期间**双重输入**。

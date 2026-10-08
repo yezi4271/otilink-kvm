@@ -4080,3 +4080,14 @@ systemd-journald: File .../system.journal corrupted or uncleanly shut down, rena
 脱敏只影响**新提交**：厂商二进制与密码仍在旧提交 `3637b2a` 的历史里。公开必须用**干净历史** ——
 本轮把旧历史留在本地（tag `pre-public`），`main` 重做成一个清洁单提交后再推；
 `git` 的日常用法见 §64.2。
+
+### 66.6 远端与历史
+
+* GitHub：**`git@github.com:yezi4271/otilink-kvm.git`**（用户选定**私有**；内容已公开就绪，随时可改公开）。
+  首次推送的是**干净单提交** `8e9c9ea`（119 文件 / 28585 行）——**不含**厂商二进制、凭据、内网 IP、用户名。
+* 旧历史（含厂商二进制与旧密码）留在本地，tag 名故意写成 **`do-not-push-pre-public`**：
+  `git push` 默认不带 tag，所以它不会上去；**但 `git push --tags` 会把它推上去 → 千万别用**。
+* 提交身份用**仓库级**配置（不污染全局）：`yezi4271 <209439523+yezi4271@users.noreply.github.com>`——
+  即 GitHub 官方的 **noreply 邮箱**（`<数字ID>+<用户名>@users.noreply.github.com`），提交会挂到账号名下，
+  且仓库历史里**不含真实邮箱**。首个快照最初误用了 `otilink-local <otilink@localhost>` 占位身份，
+  已 `rebase --root --exec 'git commit --amend --reset-author'` 重写后强推。
