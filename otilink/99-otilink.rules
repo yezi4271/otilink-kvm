@@ -1,0 +1,17 @@
+# OTi WinDroid Linker / VirtualLink 对拷线 (0ea0:2213) 的非 root 使用规则
+# 安装： sudo cp 99-otilink.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+# 然后把用户加入 input / disk 组： sudo usermod -aG input,disk $USER   （重新登录生效）
+
+# 1) uinput：允许组内用户创建虚拟键鼠（注入被控端的键鼠事件）
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+
+# 2) 对拷线的 SCSI 通用设备（/dev/sgN）：允许组内用户发私有 SCSI 命令
+#    ATTRS 会沿设备树向上匹配到 USB 设备的 idVendor/idProduct
+SUBSYSTEM=="scsi_generic", ATTRS{idVendor}=="0ea0", ATTRS{idProduct}=="2213", GROUP="disk", MODE="0660"
+
+# 3) 输入设备：允许抓取（EVIOCGRAB 需要读权限即可，这里统一给 input 组）
+SUBSYSTEM=="input", KERNEL=="event*", GROUP="input", MODE="0660"
+
+# 4) 抑制自动挂载：厂商 Initialize() 的第一步是 UnmountMedia（传输期间两个 LUN 不应被挂载）。
+#    Linux 侧等价做法是让 udisks 不要自动挂上来。
+SUBSYSTEM=="block", ATTRS{idVendor}=="0ea0", ATTRS{idProduct}=="2213", ENV{UDISKS_IGNORE}="1", ENV{SYSTEMD_READY}="0"

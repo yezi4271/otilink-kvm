@@ -1,0 +1,40 @@
+# re/ 本地 git 忽略表（只为"能回滚/能查改动"服务，不回远端）
+#
+# 原则：**只跟踪源码/脚本/文档/最终产物清单**；编译出来的二进制不入库 ——
+#   * 开发机（glibc 2.39）编的二进制拿到麒麟（2.31）根本起不来（AGENTS L16）；
+#   * 麒麟侧重编译后要重打 KySec 标签（L6），二进制是"每台机器各自生成"的东西。
+# 需要时按各自平台重建：`cd re/otilink && make -j4 all`、`./gate.sh --deploy-kylin`。
+
+# ---- otilink 的编译产物（Makefile 的 BINS + 各脚本 ad-hoc 编的）----
+otilink/otikm
+otilink/otikm_wsl
+otilink/otikm_asan
+otilink/probe
+otilink/otiprobe
+otilink/otiprobe-static
+otilink/selftest_proto
+otilink/e2e_test
+otilink/mocktest
+otilink/cabletest
+otilink/hidprobe
+otilink/uisim
+otilink/hidlat
+otilink/hidmon
+otilink/coretest
+otilink/*.o
+
+# ---- 生成的标记/缓存 ----
+otilink/.kysec-stamp
+__pycache__/
+*.pyc
+
+# ---- 编辑器/系统垃圾 ----
+*~
+.DS_Store
+
+# ---- 厂商逆向材料：**不属于运行路径**（AGENTS §1），本地保留、不入库 ----
+mac/MacKMLink.app/
+WinDroid_Linker.apk
+
+# ---- 绿色包产物：由 re/portable/build.sh 现场按声明基线生成 ----
+portable/dist/

@@ -1,0 +1,21 @@
+# 安装： sudo cp otikm /usr/local/bin/ && sudo cp otikm.service /etc/systemd/system/
+#        sudo cp 99-otilink.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+#        sudo install -m644 otikm.default /etc/default/otikm      # 按机器改这里的参数
+#        sudo systemctl enable --now otikm
+[Unit]
+Description=otikm —— OTi 对拷线键鼠/剪贴板共享
+Documentation=file:/usr/local/share/otilink/README.md
+After=network.target
+
+[Service]
+Type=simple
+# 参数放 /etc/default/otikm（每台机器不同：一端 cable，另一端 tcp-connect 等）
+EnvironmentFile=-/etc/default/otikm
+ExecStart=/usr/local/bin/otikm $OTIKM_ARGS
+Restart=on-failure
+RestartSec=3
+# 需要访问 /dev/sgN 与 /dev/uinput：
+SupplementaryGroups=input disk
+
+[Install]
+WantedBy=multi-user.target

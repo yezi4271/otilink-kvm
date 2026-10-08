@@ -1,0 +1,11 @@
+# /etc/default/otikm —— 每台机器的参数
+#
+# 【阶段一：先用网络把输入/剪贴板链路跑通（会真实用到 evdev/uinput/系统剪贴板）】
+# 机器 A: OTIKM_ARGS="--transport tcp-listen:27811 --capture /dev/input/event3 --capture /dev/input/event4 --grab --inject --clipboard --verbose"
+# 机器 B: OTIKM_ARGS="--transport tcp-connect:机器A的IP:27811 --capture /dev/input/event3 --capture /dev/input/event4 --grab --inject --clipboard --verbose"
+#
+# 【阶段二：切到对拷线（两端都插线，SCSI booking 标定完成后）】
+# 两端:   OTIKM_ARGS="--transport cable --capture /dev/input/event3 --capture /dev/input/event4 --grab --inject --clipboard"
+#
+# 设备名用 ./probe inputs 或 ls /dev/input/by-id/ 确认；--hotkey 默认 29(KEY_LEFTCTRL)
+OTIKM_ARGS="--transport cable --grab --inject --clipboard"
