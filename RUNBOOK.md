@@ -84,7 +84,7 @@ sudo ./otikm --transport cable --peer hid --hid-probe \
      --capture /dev/input/event3 --capture /dev/input/event4 --grab
 ```
 - `--peer hid`：键鼠直接发成 HID 包（对端无需软件）；
-- 指针**撞到屏幕边缘**开始控制 Windows，按热键（默认 `KEY_LEFTCTRL`）拉回本机；
+- 指针**撞到屏幕边缘**开始控制 Windows；把鼠标往**回程边**推收回本机（本项目**不使用热键**）；
 - `--hid-kbd-layout N` / `--hid-mouse-layout N`：切换候选布局；`--hid-probe` 启动时发一组探针。
 
 ---
@@ -306,7 +306,7 @@ powershell -ExecutionPolicy Bypass -File .\otiagent.ps1 -Cable -Inject -Clipboar
 | 信号处理 | Ctrl+C / kill / 关终端 → 立刻 `EVIOCGRAB` 释放，键鼠回到本机桌面 |
 | 崩溃兜底 | 进程死亡时 fd 关闭，evdev 独占自动解除 |
 
-**万一还是被卡住**：按一下**左 Ctrl**（默认热键）；或直接 `pkill -x otikm`。
+**万一还是被卡住**：把鼠标往**回程边**推（回程手势）；或直接 `pkill -x otikm`（信号处理会立刻释放独占，键盘马上能用）。
 
 ### 12.2 两端都开机自启，不用手动管
 
@@ -334,14 +334,14 @@ Windows 侧日志：agent 是隐藏窗口，若要排查可手动前台运行一
 ```ini
 [general]
 edges = left,right           # 撞哪些边交出去：left,right,top,bottom | all | none
-switch_modifier =            # 撞边需按住的修饰键（防误触）：空/shift/ctrl/alt/meta
+switch_modifier = shift      # 撞边需按住的修饰键（防误触）：空/shift/ctrl/alt/meta（本项目用 shift）
 corner = 40                  # 角部死区（防误切）
 idle_release = 3000          # 看门狗
 [hotkeys]
-hotkey_toggle    = ctrl+alt+space
-hotkey_to_remote = ctrl+alt+right
-hotkey_to_local  = ctrl+alt+left
-hotkey_lock      = ctrl+alt+l
+hotkey_toggle    = none
+hotkey_to_remote = none
+hotkey_to_local  = none
+hotkey_lock      = none
 ```
 
 命令行优先，例如临时只用热键：`./run-kylin.sh` 之外直接
@@ -351,10 +351,10 @@ hotkey_lock      = ctrl+alt+l
 
 | 想做什么 | 怎么做 |
 |---|---|
-| 切换控制权 | `ctrl+alt+space`，或把指针推到屏幕边缘 |
-| 只交给对端 / 只拉回 | `ctrl+alt+right` / `ctrl+alt+left` |
-| 临时不被撞边打扰 | `ctrl+alt+l` 锁定（再按解锁） |
-| 改热键/边缘/防误触 | 编辑 `~/.config/otilink/kvm.conf` 后重启 `run-kylin.sh` |
+| 切换控制权 | 按住 **Shift** 把指针推到屏幕边缘（本项目**不使用热键**） |
+| 只交给对端 / 只拉回 | Shift+撞边交出；鼠标**回程手势**拉回 |
+| 临时不被撞边打扰 | 光标别贴边缘（无热键锁定） |
+| 改边缘/防误触 | 编辑 `~/.config/otilink/kvm.conf` 后重启 `run-kylin.sh`（`hotkey_*` 保持 none） |
 | 看状态（Windows） | 托盘图标双击；右键可暂停注入/退出 |
 | 看状态（Linux） | `tail -f /tmp/otikm.log` |
 | 完全停掉 | Linux `pkill -x otikm`；Windows 托盘退出 |
@@ -737,7 +737,7 @@ OTI_XFER_DROP_PART=100 ./otikm ...         # 真机上故意丢片（麒麟侧�
 cd re/windows && ./deploy.sh --restart        # 剪贴板代理
 cd re/windows && ./deploy.sh --restart-km     # 键鼠代理 otiagent2
 # 麒麟：otikm
-pkill -x otikm; sg input -c "DISPLAY=:0 nohup ~/otilink/run-kylin.sh > /tmp/rk.log 2>&1 &"
+pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkill -9 -x otikm; sleep 1; DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority setsid -f nohup ~/otilink/run-kylin.sh >/tmp/rk.log 2>&1 </dev/null
 ```
 
 **自动看门狗（不需要人管）**：
@@ -759,17 +759,17 @@ pkill -x otikm; sg input -c "DISPLAY=:0 nohup ~/otilink/run-kylin.sh > /tmp/rk.l
 它用 USB `unbind/bind` **模拟拔插** N 轮，断言 otikm 不崩 + 传输能自发现重开 —— **不需要真拔线**，
 也不用重启机器。修复前（`NOTES §53` 那个 use-after-free）第 2 轮必崩。
 另外：`run-kylin.sh` 现在用**裸 `cable` 自发现**，换口/设备号变化都不再需要手工改脚本；
-手工拉起 otikm 仍可用：`pkill -x otikm; sg input -c "DISPLAY=:0 nohup ~/otilink/run-kylin.sh > /tmp/rk.log 2>&1 &"`。
+手工拉起 otikm 仍可用：`pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkill -9 -x otikm; sleep 1; DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority setsid -f nohup ~/otilink/run-kylin.sh >/tmp/rk.log 2>&1 </dev/null`。
 
 **指针"回不来"时**（按顺序试）：
-1. **在有键盘的那一侧按急救热键**：Windows 侧 **`Ctrl+Alt+→`**（`--hotkey-back`，VK_RIGHT）、
-   麒麟侧 `ctrl+alt+←`（`hotkey_to_local`）。热键由**捕获侧**识别，所以在哪一侧按是确定的。
+1. **把指针推回入口边**（回程手势）：麒麟为主控时把鼠标往**右**推回麒麟；Windows 为主控时推回 Windows 那一侧。
+   本项目**不使用热键**（会撞 IDE/窗管）；拿不回就 `pkill -x otikm`（立即释放独占）。
 2. `cd re/windows && ./deploy.sh --restart-km`（键鼠代理重启即回 LOCAL）。
 3. 被驱动侧（键鼠在对端）：把指针推到**朝向控制端那条边**并继续推 ~0.3 秒（默认左边缘）。
 4. 主控侧（**键鼠插在这一侧**，例如拓扑 B 的麒麟）：在对端屏幕上**继续往外推**（§15.14）。
    要点：推出去多少、就得推回来多少，再多推一点 —— 回程判据累计的是**未缩放的位移**，
    所以小步慢推（每个事件 1~3 个计数）照样会触发；另外落点会同步真实光标（不会停在边上）。
-   仍回不来时：**在有键盘的那侧按 Ctrl+Alt+←**（hotkey_to_local，由捕获侧识别，一定有效），
+   仍回不来时：在**有键盘的那侧**把鼠标推向**回程边**（回程手势）；或 `pkill -x otikm` 立即释放独占，
    或看 /tmp/otikm.log 有没有 "HID 模式：指针拉回本机"。
 5. 拓扑 B 专项回归（自动，不需人推鼠标）：cd re/tools && KY=kylin ./gate.sh --hw-kmb
    （re/otilink/kmbret.sh：合成手势经真实线缆 → 断言小步回程 + park + by-id 抓取 + Ctrl 组合到 Windows）。
@@ -804,7 +804,7 @@ pkill -x otikm; sg input -c "DISPLAY=:0 nohup ~/otilink/run-kylin.sh > /tmp/rk.l
   判据 = **未缩放位移累计** ≥ `max(8, edge_px*4)`（2026-09-21 修正：以前只看单次位移、
   慢推永远回不来；且远端几何中途到达会换坐标系 —— 现在驱动期间冻结几何，见 NOTES §59）。
   `rem_entry_x/y` 记录"从对端哪条边进来的"。
-* **热键**：`ctrl+alt+space` 切换、`ctrl+alt+left` 拉回本机（**键盘在哪一侧就在哪一侧按**）。
+* **切换/收回**：按住 **Shift** 把指针推到边缘交出；把鼠标推回入口边收回（本项目**不使用热键**）。
 * 逻辑回归：`cd re/otilink && make coretest && ./coretest`（45 项断言，不需要设备/图形环境）。
   **改 `otikm_core.c` 的交接/回程逻辑后必须跑它** —— 这条路径真机验证要靠人手推边缘，成本极高。
   拓扑 B（键鼠在麒麟）真机回归：`re/otilink/kmbret.sh`（合成手势，不抢用户光标；注册在 `gate.sh --hw-kmb`）。
@@ -935,7 +935,7 @@ otilink.cmd --stop              ；停掉本包拉起的代理
 | 症状 | 先看 |
 |---|---|
 | 起了但没反应 | `otilink.sh --doctor` 的"线缆/会话"两行；Windows 看 `otilink.cmd --scan` |
-| 指针回不来 | 被驱动侧日志有没有 `撞边…回程令牌 F24 已发…rc=0`；接收端热键（Linux Ctrl+Alt+← / Windows Ctrl+Alt+→） |
+| 指针回不来 | 被驱动侧日志有没有 `撞边…回程令牌 F24 已发…rc=0`；或把指针推向**回程边**（本项目不用热键） |
 | 剪贴板不动 | `--doctor` 的"剪贴板"那一行（Wayland 要 wl-clipboard，X11 要 xclip） |
 
 ### 17.4 用久了之后"剪贴板单向不通、拔插无效"（第 40 轮现场故障）
@@ -951,7 +951,7 @@ otilink.cmd --stop              ；停掉本包拉起的代理
 
 `@bash
 cd re/windows && ./deploy.sh --restart            # ① Windows 剪贴板代理
-ssh kylin@<麒麟IP> 'pkill -x otikm; cd ~/otilink && ./run-kylin.sh'   # ② 麒麟 otikm
+ssh kylin@<麒麟IP> 'pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkill -9 -x otikm; sleep 1; pgrep -x otikm >/dev/null || cd ~/otilink && ./run-kylin.sh'   # ② 麒麟 otikm
 `@
 
 > ⚠️ 卡死的是**设备侧会话**：只拔一端、或只重启一端，另一端还攥着旧句柄 → 看起来"拔插没用"。
@@ -967,6 +967,19 @@ ssh kylin@<麒麟IP> 'pkill -x otikm; cd ~/otilink && ./run-kylin.sh'   # ② �
 **手感调优（第 41 轮续）**：被驱动侧把指针推出边缘交还控制权时，旧版要求"贴边停留 250ms"，
 用户反馈"卡一下"。现在默认 **立即交还**（`--edge-dwell 0`，与主控端撞边一致）；
 如果想避免误触，可以在麒麟侧加 `--edge-dwell 250`（或配置 `edge_dwell = 250`）。
+
+**第 57 轮新增真因：某一方向彻底不通、日志里连「发送」都没有 = `xclip` 读进程卡死（无超时）**
+
+现象：**W→L 正常，L→W 一条都发不出**；麒麟日志里没有 `CLIP 发送`，也没有 `重发/放弃`；拔插无效。
+一句探针（**先看 otikm 名下有没有活得很久的 `xclip … -o` 子进程**）：
+
+`@bash
+ssh kylin@<麒麟IP> 'ps --ppid $(pgrep -x otikm) -o pid,stat,etimes,args'
+# 看到 `xclip -selection clipboard -t text/uri-list -o` 且 etimes 很大 = 就是它
+`@
+
+恢复：清理该进程并按 `AGENTS §4.1` 重启 otikm（新版本已把读路径包成 `timeout 3 xclip …`，不会再卡）。
+详见 `NOTES §72`。
 
 ---
 
@@ -1008,11 +1021,11 @@ cd re/tools && KY=kylin@<tailscale-IP> ./gate.sh --hw-kbdexcl
 
 ```bash
 cd re/tools && KY=kylin@<tailscale-IP> ./gate.sh --deploy-kylin
-ssh kylin@<麒麟IP> 'pkill -x otikm; cd ~/otilink && sg input -c "DISPLAY=:0 nohup ./run-kylin.sh > /tmp/rk.log 2>&1 &"'
+ssh kylin@<麒麟IP> 'pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkill -9 -x otikm; sleep 1; cd ~/otilink && DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority setsid -f nohup ./run-kylin.sh >/tmp/rk.log 2>&1 </dev/null'
 grep -a "已独占" /tmp/otikm.log | tail -3      # 推到 Windows 后再看一眼
 ```
 
-**临时逃生**：麒麟键盘 **`Ctrl+Alt+←`** 立刻拉回本机（热键由 otikm 自己读捕获设备，独占不影响它）；
+**临时逃生**：把鼠标往**右**推回麒麟（回程手势）；拿不回就 `pkill -x otikm`（立即释放独占，键盘马上能用）；
 或 `run-kylin.sh --no-grab` 整体关掉独占（代价：鼠标也会双重输入）。
 
 ### 18.2 剪贴板双向全废、日志刷 "（对端在吗？）"：先查 Windows 侧代理在不在
@@ -1079,6 +1092,7 @@ powershell.exe -NoProfile -Command 'Get-Content C:\Users\Public\km.log  -Tail 20
 | | ② 设备侧会话卡死（用久了/拔插无效） | 麒麟 `重发 3 次仍无确认…放弃` + `clip.log` `设备连续读取失败，尝试重连` | `§15.13.7` |
 | | ③ 厂商 XML 通知抢发送授权 | 麒麟日志 `已通知厂商端交还控制权` 每 1.5 秒刷屏 | `NOTES §49` |
 | | ④ 2 秒内连续两次复制（已知限制，只救一条） | 复现节奏对得上 | `NOTES §42` |
+| | ⑤ `xclip` 读进程卡死（`popen` 无超时，遇到不响应的选区所有者） | `ps --ppid $(pgrep -x otikm)` 里有活很久的 `xclip … -o`；**日志里连 `CLIP 发送` 都没有** | `NOTES §72` |
 | **「拔插后失效 / otikm 崩」** | keepalive 裸指针 use-after-free（已修）+ 抓取自愈缺失（已修） | `gate.sh --replug`（USB unbind/bind 模拟拔插 N 轮） | `NOTES §52/§53/§54/§55` |
 | **「线缆冒出个假光盘 / 机器被拖卡」** | 假光盘 LUN 读不出来 → usb-storage 卡 D 态 | `gate.sh --pre` 的「线缆 MSC 在位」检查；**不要解绑 usb-storage 接口** | `NOTES §62`、`§10.4` |
 | **「两侧都没反应」** | 线缆会话彻底死 | 拔插对拷线重置会话 → 重启两端 | `AGENTS §8` 急救表 |
@@ -1089,7 +1103,7 @@ powershell.exe -NoProfile -Command 'Get-Content C:\Users\Public\km.log  -Tail 20
 |---|---|---|
 | 任何时刻**只有一个主控**（grab） | 帧管道双向全丢、剪贴板两边"未确认" | `L17` + 角色协商 + `--hw-kmb` / `--hw-km` |
 | **驱动侧必须独占**本地键鼠 | 两机同时打字 / 鼠标双动 | `gate.sh --hw-kbdexcl`（本轮新增） |
-| 交出去的**必须收得回来**（热键 + 看门狗 + 回程） | 用户被锁死在对端，只能拔线 | `L8` + `coretest` + `--hw-kmb` |
+| 交出去的**必须收得回来**（回程手势 + 看门狗；**不使用热键**） | 用户被锁死在对端，只能拔线 | `L8` + `coretest` + `--hw-kmb` |
 | 判据必须与它**保护的通道同源** | 静默反向行为（本轮双重输入就是这条被违反） | `AGENTS §9` 的坑表（人工 review + 双档真机回归） |
 | 一条链路**只有一个主人**（厂商/我们） | 一接管就卡死，只能拔线 | `L1` + `vendor-off.vbs` + `--pre` |
 
@@ -1130,7 +1144,7 @@ echo "$KY_PASS" | ssh kylin "sudo -S -p '' ls -la /sys/fs/pstore/"
 ```bash
 # 整机硬锁只能长按电源键；重启后确认键鼠/剪贴板恢复
 cd re/windows && ./deploy.sh --restart      # 剪贴板代理
-ssh kylin 'pkill -x otikm; cd ~/otilink && ./run-kylin.sh'   # 麒麟侧（自动选拓扑）
+ssh kylin 'pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkill -9 -x otikm; sleep 1; pgrep -x otikm >/dev/null || cd ~/otilink && ./run-kylin.sh'   # 麒麟侧（自动选拓扑）
 ```
 
 ### 20.3 本机已装的取证基建（2026-10-08）
@@ -1140,5 +1154,49 @@ ssh kylin 'pkill -x otikm; cd ~/otilink && ./run-kylin.sh'   # 麒麟侧（自�
 | 面包屑 v2 | 每 5s：load / top CPU / Dirty,Writeback / D 态进程 + **每个 D 进程的 `/proc/<pid>/stack`（`timeout 2`）、`wchan`**；`dmesg` 尾 30 行每 60s 最多一次 | `/usr/local/bin/freeze-breadcrumb.sh`（备份 `.bak-20261008`）+ `freeze-breadcrumb.service` |
 | 硬锁必 panic | `kernel.hardlockup_panic=1`、`kernel.panic=20`（panic 后自动重启） | `/etc/sysctl.d/99-otilink-crashcapture.conf`；删文件即可回滚 |
 | kdump | 实测正常：`kexec_crash_loaded=1`、`kexec_crash_size=201326592`（192MiB），`/proc/iomem: 60000000-6bffffff : Crash kernel`。⚠️ **非 root 读 `/proc/iomem` 会把地址抹成 `00000000-00000000`**，别据此判断 | 见 `NOTES §65.4` |
+| GPU 崩溃快照 | 监听 journald 的 `dumped core`，一崩即落 `dmesg` 尾 40 / D 态栈 → `/var/log/gpu-crash-snapshot.log`（2026-10-08 三次死机里 2 次在 chrome GPU 进程崩溃后 20–90s 整机冻结） | `/usr/local/bin/gpu-crash-snapshot.sh` + service；`NOTES §65.8` |
+| **oops 不升级为 panic** | `kernel.panic_on_oops=0`。⚠️ **只改 `/etc/default/kdump-tools` 的 `KDUMP_SYSCTL` 无效**——`/usr/sbin/kdump-config`（446–449、565–568）末尾会强制设回 1；必须用 **late unit** `otilink-panic-on-oops.service`（`After=kdump-tools.service`）在它之后再压回 0。代价：oops 不再产生 vmcore（dmesg / EFI pstore 仍留证） | `/etc/sysctl.d/99-otilink-crashcapture.conf` + `otilink-panic-on-oops.service`；`NOTES §71` |
+| netconsole | 麒麟内核 printk 经热点 UDP 实时发到 Windows `C:\Users\Public\netconsole.log`（死机时 SSH 不通的唯一取证途径；注意 `loglevel=0` 会把 console printk 过滤掉，已把 `kernel.printk` 提到 `7 4 1 7`）。**接口/网关自动探测**（换网卡/换热点不用改脚本） | `otilink-netconsole.service`；`NOTES §65.10 / §71` |
 
 > ⚠️ **不要**设 `hung_task_panic=1`：本机 `usb-storage` 经常短暂 D 态，设了会变成"日常自杀"。
+
+---
+
+## 21 Windows 热点 SSH relay（`127.0.0.1:2222` → 麒麟）
+
+**是什么**：Windows 侧常驻 PowerShell 脚本 `C:\Users\<你的用户名>\dsh-kylin-relay.ps1`，在 `127.0.0.1:2222`
+监听，把连接转发到**麒麟无线网卡的 22 端口**。热点是 DHCP（IP 会变），所以它靠 Windows 邻居表（ARP）
+**按 MAC 找麒麟的当前 IP**。Windows 登录时由 **HKCU Run** 键 `dsh-kylin-relay` 拉起。
+
+开发机（WSL，`mirrored` 网络模式 → WSL 能打到 Windows 的 loopback）的 `~/.ssh/config`：
+* `Host kylin` → `127.0.0.1:2222`（走 relay）
+* `Host kylin-ts` → `<tailscale-IP>:22`（走 tailscale；**本机 WSL 与麒麟无共同 LAN → 实测走 DERP 中转**（hkg/nue，~430ms），单次 SSH 连接 5–8s。**容错好，但慢**）
+
+**⚠️ 最大的坑：relay 里写死了 MAC**。原版只有 `<AIC网卡MAC>`（AIC8800）。换网卡后 ARP 里找不到它 →
+用 fallback 旧 IP → 连不上 → relay 直接 `Close()` → `ssh` 报
+**`kex_exchange_identification: read: Connection reset by peer`**。
+2026-10-10 已改成**多 MAC 列表 + 当前 IP fallback（新卡在前）**：
+```powershell
+$macList    = '<新网卡MAC>,<备用网卡MAC>,<AIC网卡MAC>'
+$fallbackIp = '<麒麟热点IP>'
+```
+
+**换网卡后怎么办（三步）**
+1. 在麒麟上取新网卡 MAC：`cat /sys/class/net/<iface>/address`（或 `ip -o link show <iface>`），
+   转成 **大写 + 横线** 形式 `AA-BB-CC-DD-EE-FF`；
+2. 把它放到 `$macList` **最前面**，`$fallbackIp` 改成该网卡当前热点 IP（`<热点网段>`）；
+3. 重启 relay：
+   ```bash
+   powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Users\Public\relay-stop.ps1'
+   cscript //B //NoLogo 'C:\Users\Public\relay-start.vbs'
+   ```
+   验证：`netstat -ano | findstr :2222` 出现新的 `LISTENING`，且 `ssh kylin 'hostname'` 返回 `kylin-pc`。
+
+**回滚**：原脚本在同目录 `dsh-kylin-relay.ps1.bak-*`；从 HKCU Run 删掉 `dsh-kylin-relay` 即不再自启。
+
+**为什么还要留着 relay（它比 tailscale 更快）**：本机 WSL 的 tailscale 节点**只有 `<WSL网段>`**，
+**看不到麒麟所在的热点网段 `<热点网段>`**（WSL mirrored 模式不镜像 Windows 的"移动热点"适配器），
+两端又共用同一个公网 IP `<公网IP>`（`netcheck` 里 `PortMapping:` 为空）→ **建不起直连，只能走 DERP**。
+实测 `ssh <host> true`（各 3 次）：**relay（LAN 直连）1.7–2.1s** vs **tailscale（DERP）5.3–8.1s**。
+> 结论：**交互用 `ssh kylin`（relay，快）；relay 失效或跨网时用 `ssh kylin-ts`（稳但慢）**。
+> 想让 tailscale 也直连：在 **Windows 主机**上跑 tailscale（它与麒麟同在热点 L2），或让 WSL 能看见热点网段。

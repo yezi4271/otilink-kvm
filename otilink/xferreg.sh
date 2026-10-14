@@ -94,13 +94,13 @@ LOG2=$(newlines_log)
 pwsh_cmd "Set-Clipboard -Path 'C:\Users\Public\otitest\xferreg.bin'" >/dev/null   # 再传一次，边传边测
 # 先发 F24 令牌把控制权强制拉回 Windows（hwtest.sh 同款前置动作）：
 # 否则可能停在 REMOTE，HID 包推不动 Windows 光标 → 假失败（实测踩过）
-kssh 'cd ~/otilink && ./otiprobe hidsend 2 000073000000000000000000 >/dev/null 2> /dev/sg3 >/dev/null 2>&11; sleep 0.2; ./otiprobe hidsend 2 000000000000000000000000 >/dev/null 2> /dev/sg3 >/dev/null 2>&11' >/dev/null
+kssh 'cd ~/otilink && ./otiprobe hidsend 2 000073000000000000000000 >/dev/null 2>&1; sleep 0.2; ./otiprobe hidsend 2 000000000000000000000000 >/dev/null 2>&1' >/dev/null
 sleep 1
 for i in $(seq 1 30); do sleep 2; agent_since "$LOG2" | grep -q "片（" && break; done
 RUNNING=$(agent_since "$LOG2" | grep -c "片（")
 pwsh_file "$WIN/setcur.ps1" -X 1200 -Y 500 >/dev/null; sleep 1
 B=$(pwsh_file "$WIN/curlog.ps1" -Secs 1 | tail -1 | awk '{print $3}')
-kssh 'cd ~/otilink && for i in 1 2 3; do ./otiprobe hidsend 1 006400000000000000000000 >/dev/null 2> /dev/sg3 >/dev/null 2>&11; sleep 0.2; done' >/dev/null
+kssh 'cd ~/otilink && for i in 1 2 3; do ./otiprobe hidsend 1 006400000000000000000000 >/dev/null 2>&1; sleep 0.2; done' >/dev/null
 A=$(pwsh_file "$WIN/curlog.ps1" -Secs 1 | tail -1 | awk '{print $3}')
 D=$(( ${A:-0} - ${B:-0} ))
 if [ "${RUNNING:-0}" -lt 1 ]; then

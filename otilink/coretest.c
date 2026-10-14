@@ -98,8 +98,8 @@ int main(void)
     printf("=== 1b) 慢推回程：小步位移必须累计触发（真机 bug 回归）===\n");
     setup(&c);
     expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "先交出去");
-    expect(push(&c, 1, 0, 5), OTI_ACT_TO_REMOTE, "贴边抖动 5×1px → 仍不回程（阈值 16）");
-    expect(push(&c, 2, 0, 40), OTI_ACT_SWITCH_TO_LOCAL, "慢推 2px/次 → 累计到阈值即回程");
+    expect(push(&c, 1, 0, 5), OTI_ACT_TO_REMOTE, "贴边抖动 5×1px → 仍不回程（阈值 100）");
+    expect(push(&c, 2, 0, 60), OTI_ACT_SWITCH_TO_LOCAL, "慢推 2px/次 → 累计到阈值即回程");
 
     /* ---- 1c) 镜像手势：往对端里推多少，就得推回来多少（再多推一点才回程）---- */
     printf("=== 1c) 镜像手势：回程距离要与推入距离对称 ===\n");
@@ -107,7 +107,7 @@ int main(void)
     expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "先交出去");
     expect(push(&c, -20, 0, 5), OTI_ACT_TO_REMOTE, "往对端里面推 100px");
     expect(push(&c, 20, 0, 5), OTI_ACT_TO_REMOTE, "推回 100px（刚好回到入口边）→ 还不回程");
-    expect(push(&c, 20, 0, 1), OTI_ACT_SWITCH_TO_LOCAL, "再多推一点 → 回程");
+    expect(push(&c, 20, 0, 6), OTI_ACT_SWITCH_TO_LOCAL, "回到入口边后再推 120 计数 → 回程");
 
     /* ---- 1d) 远端几何在手势中途到达（2026-09-21 真机 bug：Windows 侧的 HELLO
        报的是 4480x1440 的**虚拟桌面**，它可能在"指针已经在 Windows 上"时才到）----
@@ -126,7 +126,7 @@ int main(void)
     } else {
         printf("  [PASS] 驱动期间几何被暂存（rem_w 仍 %d，pending %d）\n", c.rem_w, c.rem_w_pend);
     }
-    expect(push(&c, 1, 0, 40), OTI_ACT_SWITCH_TO_LOCAL, "小步推回来 → 回程（与远端几何无关）");
+    expect(push(&c, 1, 0, 120), OTI_ACT_SWITCH_TO_LOCAL, "小步推回来 → 回程（与远端几何无关）");
     expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "再交出去");
     checks++;
     if (c.rem_w != 4480 || c.rem_w_pend != 0) {

@@ -86,7 +86,7 @@ cd re/windows && ./deploy.sh --restart-km   # 键鼠代理（先杀→编译→�
 | **L5** | **改了 `otiagent2.cs` 必须 bump `BuildTag` 并重新部署** | `csc /out:` 覆盖**正在运行**的 exe 会**静默失败** → 一直在跑旧二进制（为此白查半天） |
 | **L6** | **麒麟侧重编译后必须重打 KySec 标签**（`label-kysec.sh`），否则图片剪贴板退化成"一串路径" | KySec 禁止未信任二进制读受保护目录（errno 13） |
 | **L7** | **被驱动侧永不 grab、永不接管**（只监听 + 撞边交还） | 两侧互相抢控制权，刚过去就被弹回 |
-| **L8** | **任何"交出去"的能力都必须有对称的"收回来"**：回程判据 + 急救热键 + 看门狗，三者缺一不可 | "指针回不来"是这个项目最贵的故障，用户只能拔线 |
+| **L8** | **任何"交出去"的能力都必须有对称的"收回来"**：回程判据 + 看门狗，缺一不可（**不使用热键**：用户明确要求，热键会撞 IDEA/窗管；收回控制权只走鼠标回程手势） | "指针回不来"是这个项目最贵的故障，用户只能拔线 |
 | **L9** | **不得用宽泛正则批量删除/禁用系统对象**；先打印清单（dry-run）再动手 | `OTi` 命中了 `Notificati**ons**`（误禁 5 个系统任务），`Link` 命中了我们自己的自启项 |
 | **L10** | **捕获 SSH 输出时不得合并 stderr** | 麒麟登录横幅 `Kylin V10 SP1` 在 stderr → 文本比对/md5/二进制解析全错 |
 | **L11** | **杀进程用 `pkill -x` 或按 pid**，禁用 `pkill -f` | `pkill -f <pattern>` 会匹配到调用者自己的命令行 → 自杀 |
@@ -109,7 +109,7 @@ cd re/otilink && make -j4 all && ./coretest     # 先在开发机编过 + 状态
 cd re/tools && ./gate.sh --static                # 静态门禁
 ./gate.sh --deploy-kylin                         # 同步 → 麒麟编译 → KySec 标签 → 写标签戳
 # 重启麒麟侧进程（改完不重启 = 跑的还是旧进程）：
-ssh kylin@<麒麟IP> 'pkill -x otikm; cd ~/otilink && ./run-kylin.sh'   # 会自动选拓扑
+ssh kylin@<麒麟IP> 'pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkill -9 -x otikm; sleep 1; if pgrep -x otikm >/dev/null; then echo "旧 otikm 还活着，别起新的！"; else cd ~/otilink && DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority setsid -f nohup ./run-kylin.sh >/tmp/rk.log 2>&1 </dev/null; fi'   # SIGTERM 可能卡住→必须确认旧进程没了再起；跑起来后 pgrep -x otikm | wc -l 必须=1
 ./gate.sh --hw-km        # 碰了键鼠/交接：必跑
 ./gate.sh --hw-clip      # 碰了剪贴板：必跑
 ./gate.sh --hw-xfer      # 碰了传输/分片：必跑（大改动加 500MB：--hw-xfer 524288000）
@@ -148,7 +148,7 @@ ssh kylin@<麒麟IP> 'pkill -x otikm; cd ~/otilink && ./run-kylin.sh'   # 会自
 | 键鼠共享 / 交接 / 回程 / 钩子 / 令牌（**拓扑 A：键鼠在 Windows**） | `--static` + `--hw-km` | `hwtest` PASS=12 FAIL=0；`km.log` 出现 `LOCAL(startup) → REMOTE → F24 token seen → LOCAL(peer token)` |
 | 键鼠回程（**拓扑 B：键鼠在麒麟**，主控端本地判定） | `--static` + `--hw-kmb` | `kmbret` FAIL=0（小步外推能回程 + 落点同步 + 入口边 park + by-id 抓取 + 麒麟侧抑制缓冲补发）；Windows 侧「真收到 Ctrl/C」两条按 §61.2 线缆固件丢包**只算 WARN**（见 NOTES §63.9）；`coretest` 全过 |
 | 键鼠卡顿（"过几秒卡一下" = HID 写被设备级操作堵住） | `--static` + `--hw-lat` | `hidlat` PASS：与 otikm 并发时 HID 写最大间隔 ≤ 200ms、`SEND_FAIL=0` |
-| 键盘独占 / 双重输入（"我在 Windows 上打字，麒麟也在同步打字"） | `--static` + `--hw-kbdexcl` | `kbdexcl` FAIL=0：接管期间虚拟键盘探针 **BUSY**（本机桌面收不到按键）、回程/热键后 **FREE**（能力收得回来），日志无「键盘不独占」 |
+| 键盘独占 / 双重输入（"我在 Windows 上打字，麒麟也在同步打字"） | `--static` + `--hw-kbdexcl` | `kbdexcl` FAIL=0：接管期间虚拟键盘探针 **BUSY**（本机桌面收不到按键）、回程后 **FREE**（能力收得回来），日志无「键盘不独占」 |
 | 线缆拔插自愈（拔插后 otikm 不崩 + 自发现重开） | `--static` + `--deploy-kylin` + `--replug` | `replugreg` FAIL=0（N 轮拔插后 otikm 存活、传输重新就绪、无 segfault） |
 | 剪贴板（任一格式） | `--static` + `--hw-clip` | `clipreg` PASS=17 FAIL=0 |
 | 大文件 / 分片 / 位图重传 | `--static` + `--local` + `--hw-xfer` | `xferlocal` 通过；`xferreg` PASS=12 FAIL=0 |
@@ -187,7 +187,7 @@ ssh kylin@<麒麟IP> 'pkill -x otikm; cd ~/otilink && ./run-kylin.sh'   # 会自
 | `otilink/hwtest.sh` | 双向 | 键鼠真机回归（12 项，**会动真实光标**；**只覆盖拓扑 A**） |
 | `otilink/kmbret.sh` | 麒麟主控 | **拓扑 B 回程手势**真机回归（22 项 = 20 硬断言 + 2 WARN）：`--sim-input` 合成手势经真实线缆 → 小步（2px/次）外推必须回程、落点同步、入口边 park、by-id 抓取、抑制缓冲补发；Windows 侧「真收到 Ctrl/C」受 §61.2 固件丢包影响**只 warn**；会短暂停/恢复麒麟 otikm（`gate.sh --hw-kmb`） |
 | `otilink/hidlat.sh [秒数] [ms]` | 麒麟主控 | **键鼠卡顿**回归（20 项左右）：与 otikm **并发**量 HID 写间隔，>200ms 即 FAIL（`gate.sh --hw-lat`）—— 真机案例：保活 dummy 帧 64KB 单次堵设备 ~1.3s |
-| `otilink/kbdexcl.sh` | 麒麟主控 | **键盘独占**真机回归（拓扑 B，约 40s）：用 `uisim` 造 uinput 虚拟键鼠给 otikm 抓（不碰真键鼠），探针按 **EVIOCGRAB 排他性**判定 —— 接管期间必须 **BUSY**（本机桌面收不到按键 = 不双重输入）、热键回本机后必须 **FREE**（L8）；会短暂停/恢复麒麟 otikm（`gate.sh --hw-kbdexcl`） |
+| `otilink/kbdexcl.sh` | 麒麟主控 | **键盘独占**真机回归（拓扑 B，约 40s）：用 `uisim` 造 uinput 虚拟键鼠给 otikm 抓（不碰真键鼠），探针按 **EVIOCGRAB 排他性**判定 —— 接管期间必须 **BUSY**（本机桌面收不到按键 = 不双重输入）、回程后必须 **FREE**（L8）；会短暂停/恢复麒麟 otikm（`gate.sh --hw-kbdexcl`） |
 | `otilink/replugreg.sh [N]` | 双向 | 线缆拔插自愈回归：用 USB unbind/bind **模拟拔插** N 轮（缺省 3），不需人手拔线；修复前二进制第 2 轮必崩 |
 | `otilink/xferlocal.sh` | 本机 | 大文件本机回归（AF_UNIX，无硬件，秒级） |
 | `otilink/coretest` | 本机 | 交接/回程状态机单测（45 项，改 core 必跑） |
@@ -241,7 +241,7 @@ ssh kylin@<麒麟IP> 'pkill -x otikm; cd ~/otilink && ./run-kylin.sh'   # 会自
 | 场景 | 动作 |
 |---|---|
 | 指针卡在麒麟 | Windows 键盘 **`Ctrl+Alt+→`**（强制回 LOCAL）；或 `cd re/windows && ./deploy.sh --restart-km` |
-| 键盘在麒麟侧 | 麒麟键盘 **`Ctrl+Alt+←`**（拉回本机）；`Ctrl+Alt+Space`（切换）；`Ctrl+Alt+L`（锁定） |
+| 键盘在麒麟侧（拓扑 B，**无热键**） | 把鼠标往**右**推回麒麟（回程手势）；拿不回就 `pkill -x otikm`（立即释放独占） |
 | 完全没反应 / 两侧都不动 | **拔插对拷线**（重置线缆会话）→ 然后 `./deploy.sh --restart-km` + 重启麒麟 `otikm` |
 | 怀疑厂商在抢 | `cmd.exe /c "cscript //B //NoLogo C:\\Users\\Public\\vendor-off.vbs"`（UAC 一次） |
 
@@ -265,6 +265,9 @@ ssh kylin@<麒麟IP> 'pkill -x otikm; cd ~/otilink && ./run-kylin.sh'   # 会自
 | 剪贴板突发 <2s 会丢一条 | 已知限制：ACK+重发只能救"未被覆盖"的那条 |
 | 拔插后 `eventN` 会被重新分配（键盘的 event7 可能变成 "System Control" 接口） | 抓取必须用 **by-id 稳定路径**（`oti_input_stable_path()`）；重开要**校验能力位**（`oti_capture.kind`），不符就按类别重新发现（L 见 `NOTES §60`） |
 | 热插拔判据只看"有没有键鼠"（>0）会漏掉**新插的第二个设备** | 按**个数**判（`nlocal != a->local_count`）→ `cap_rescan` → 重扫抓取集合（真机："先插鼠标再插键盘"键盘永远用不了） |
+| **`pkill -x otikm`（SIGTERM）可能不退出**（卡在设备 read/线程 join）→ 再起一个就变成**两个主控**抢设备：键鼠 1~2 秒来回切、键盘反复被 grab | 重启前必须 `pgrep -x otikm` 确认为空，不退就 `pkill -9 -x otikm`；启动用 `setsid -f`；跑起来后 `pgrep -x otikm \| wc -l` 必须=1（L17） |
+| **AIC8800 USB 网卡驱动 oops，且 disconnect/deinit 会死锁整机（hang，连 `panic_on_oops=0` 都兜不住）；`panic_on_oops=1` 把 oops 升级成全机 panic → Kylin SOS rescue 卡死 console → 蓝屏（VT 停 tty5）** | **首选换 Kylin 自带网卡**（RTL8821CU → 内核模块 `rtl8821cu`），AIC 用 `install aic8800_fdrv /bin/false`+`/etc/modprobe.d/aic8800-block.conf` 与 udev `.disabled` 挡死；`panic_on_oops=0` 必须靠 **late unit** `otilink-panic-on-oops.service`（`After=kdump-tools.service`）——**只改 `/etc/default/kdump-tools` 的 `KDUMP_SYSCTL` 无效**，`/usr/sbin/kdump-config` 末尾会强制设回 1；见 `NOTES §71`。**GPU（innogpu）不背这个锅** |
+| **换了麒麟的无线网卡 → Windows 热点 relay（`127.0.0.1:2222`）立刻失效**：`dsh-kylin-relay.ps1` 按**写死的 MAC** 在 ARP 表里找麒麟 IP，找不到就用旧 fallback IP → 连不上 → `ssh` 报 `kex_exchange_identification: read: Connection reset by peer` | 换卡后把新 MAC 放到脚本 `$macList` 最前、`$fallbackIp` 改成新 IP，再重启 relay；或直接用 `ssh kylin-ts`（tailscale，容错好，**但本机走 DERP 中转 ~430ms，比 relay 慢**）。见 `RUNBOOK §21`、`NOTES §71` |
 | 任何**大块/会失败的设备写**都会堵住 HID（单队列设备）→ "键鼠每几秒冻结一下" | 保活 dummy 帧（64KB）只在**链路真空闲 >60s** 时发，且必须拿 `otilink_cable_io_lock()`；判据用 `gate.sh --hw-lat`（hidlat 量 maxgap） |
 | **健康判据不能挂到与"这条能力"无关的通道上**：纯键盘独占曾用"帧管道健康"当判据，而 HID 直发模式（对端零软件）下帧管道**本来就该静默** → 纯键盘永远不独占 → 接管期间**两机同时打字** | 判据必须对着**这条能力真正走的通道**（`otikm.c` 的 `km_path_ok()`：HID 直发看 HID 写失败计数，协议模式才看帧管道）；且"维持独占"要周期性幂等重放（判据会变，见 `gate.sh --hw-kbdexcl`） |
 | 线缆"假光盘"（LUN1/CD）读不出来会让 usb-storage 卡 D 状态、拖卡整机 | **不要解绑 usb-storage 接口**（会连带杀掉 `/dev/sgN` 传输通道，otikm 只剩 rc=-19）；用 `usb-storage.quirks=0ea0:2213:s`（SINGLE_LUN，只枚举 LUN0），`install-kylin.sh` 已装，见 NOTES §62 |

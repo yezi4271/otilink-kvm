@@ -20,6 +20,21 @@ static int have_cmd(const char *cmd)
     return system(buf) == 0;
 }
 
+/* xclip -o 是"同步请求器"：当选区所有者不响应、或不提供请求的目标时，它会**永久等待**。
+   实测一次 `xclip -t text/uri-list -o` 卡死 41 小时 → clip_thread 阻塞在 pclose，
+   之后再也没读过本地剪贴板 → 麒麟→Windows 剪贴板**一条都发不出**（接收方向正常，
+   因为走 RX 线程）——用户视角就是"L→W 复制失败、拔插无效"。
+   所以所有"读剪贴板"的 popen 都必须带硬超时；没有 coreutils timeout 时退回旧行为。 */
+static FILE *xclip_read_popen(const char *args)
+{
+    static int has_timeout = -1;
+    char cmd[512];
+    if (has_timeout < 0)
+        has_timeout = have_cmd("timeout") ? 1 : 0;
+    snprintf(cmd, sizeof(cmd), "%sxclip %s", has_timeout ? "timeout 3 " : "", args);
+    return popen(cmd, "r");
+}
+
 const char *oti_clip_backend_name(const struct oti_clip *c)
 {
     switch (c->be) {
@@ -213,7 +228,7 @@ int oti_clip_probe_files(struct oti_clip *c, char files[][OTI_CLIP_PATH_MAX], in
         return 0;
 
     /* 1) text/uri-list（文件管理器/截图工具的标准做法） */
-    FILE *pu = popen("xclip -selection clipboard -t text/uri-list -o 2>/dev/null", "r");
+    FILE *pu = xclip_read_popen("-selection clipboard -t text/uri-list -o 2>/dev/null");
     if (pu) {
         char *ub = NULL; size_t ul = 0;
         if (read_stream(pu, &ub, &ul) == 0 && ub && ul > 8) {
@@ -243,7 +258,7 @@ int oti_clip_probe_files(struct oti_clip *c, char files[][OTI_CLIP_PATH_MAX], in
     }
     /* 2) 兜底：纯文本路径（有些程序只把路径当文本放进剪贴板） */
     if (n == 0) {
-        FILE *pt = popen("xclip -selection clipboard -o 2>/dev/null", "r");
+        FILE *pt = xclip_read_popen("-selection clipboard -o 2>/dev/null");
         if (pt) {
             char *tb = NULL; size_t tl = 0;
             if (read_stream(pt, &tb, &tl) == 0 && tb && tl > 1 && tl < 4096) {
@@ -358,7 +373,7 @@ int oti_clip_read(struct oti_clip *c, char **out, size_t *len)
            因为很多程序复制图片时同时提供 text/plain 的占位串）。
            注意 xclip 找不到该目标时退出码非 0 且无输出 → 退回文本。 */
         c->last_format = 1;
-        FILE *pi = popen("xclip -selection clipboard -t image/png -o 2>/dev/null", "r");
+        FILE *pi = xclip_read_popen("-selection clipboard -t image/png -o 2>/dev/null");
         if (pi) {
             char *ibuf = NULL; size_t ilen = 0;
             int irc = read_stream(pi, &ibuf, &ilen);
@@ -375,7 +390,7 @@ int oti_clip_read(struct oti_clip *c, char **out, size_t *len)
            只放文件路径，不放 image/png**，只读文本的话对端只会收到一串路径
            （用户实际遇到的就是这个）。路径指向本地文件时，直接把文件内容当图片发。 */
         {
-            FILE *pu = popen("xclip -selection clipboard -t text/uri-list -o 2>/dev/null", "r");
+            FILE *pu = xclip_read_popen("-selection clipboard -t text/uri-list -o 2>/dev/null");
             if (pu) {
                 char *ub = NULL; size_t ul = 0;
                 int urc = read_stream(pu, &ub, &ul);
@@ -444,7 +459,7 @@ int oti_clip_read(struct oti_clip *c, char **out, size_t *len)
                 free(ub);
             }
         }
-        FILE *p = popen("xclip -selection clipboard -o 2>/dev/null", "r");
+        FILE *p = xclip_read_popen("-selection clipboard -o 2>/dev/null");
         if (!p)
             return -EIO;
         int rc = read_stream(p, out, len);

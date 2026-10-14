@@ -188,6 +188,8 @@ struct app {
     int      local_count;        /* 上次采到的"本机键鼠"个数（增删都要重扫抓取集合） */
     volatile int cap_rescan;     /* 抓取集合需要重扫（热插拔：插了键盘/鼠标也要抓进来） */
     long     drive_log_ms;       /* 回程判据诊断日志节流 */
+    long     cursor_sync_ms;     /* 主控端本地：状态机坐标对齐真实光标的节流（防漂移误判边） */
+    long     cursor_sync_log_ms; /* 上述对齐的诊断日志节流 */
     int      kbd_grab_warned;    /* "键盘不独占"只提示一次 */
     long     grab_maint_ms;      /* 驱动期"维持独占"重放的节流（判据会变，见 apply_grab） */
     long     grab_err_log_ms;    /* 独占失败告警节流（维持重放反复失败时别刷屏） */
@@ -600,7 +602,7 @@ static void hid_send_state(struct app *a, struct otilink_dev *cd)
    调用方随后用 otix11_warp() 把真实光标也挪到同一处，core 与真实桌面不再打架。 */
 static void return_landing_xy(const otikm_core *c, int *ox, int *oy)
 {
-    int m = c->edge_px + 8;
+    int m = otikm_core_return_inset(c);
     int x = c->mx, y = c->my;
     switch (c->edge) {
     case OTI_EDGE_RIGHT:  x = c->screen_w - 1 - m; break;
@@ -1045,6 +1047,39 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
         a->input_last_ms = now_ms();
     oti_switch_evt sw;
     memset(&sw, 0, sizeof(sw));
+
+    /* 主控端本地用：把状态机坐标周期性对齐到**真实光标**。
+       为什么要对齐：本机指针走 X 的加速曲线，而状态机按 evdev 原始位移积分，
+       两者会漂移；用户报障“鼠标还没推到边就切到 Windows”（漂移让状态机以为已到边）。
+       ~60Hz 对齐一次（16ms）：压住漂移，又不给每个鼠标事件都加一次 X 往返。仅主控端本地态做。 */
+    if (is_mouse && !a->cfg.return_on_edge) {
+        long nw = now_ms();
+        if (nw - a->cursor_sync_ms >= 16) {
+            int px = -1, py = -1;
+            pthread_mutex_lock(&a->lock);
+            int local_now = a->core.have_control;
+            int oldx = a->core.mx, oldy = a->core.my;
+            pthread_mutex_unlock(&a->lock);
+            if (local_now && otix11_pos(&px, &py) == 0) {
+                int ddx = px - oldx, ddy = py - oldy;
+                pthread_mutex_lock(&a->lock);
+                if (a->core.have_control) {
+                    /* 减掉本次位移：真实光标已含本次事件，核心还会再加一次 m->dx，
+                       直接写 px 会把它重复计一次、导致提前 |dx| 像素判边。 */
+                    a->core.mx = (int16_t)(px - m->dx);
+                    a->core.my = (int16_t)(py - m->dy);
+                }
+                pthread_mutex_unlock(&a->lock);
+                if ((ddx > 8 || ddx < -8 || ddy > 8 || ddy < -8) &&
+                    nw - a->cursor_sync_log_ms >= 2000) {
+                    a->cursor_sync_log_ms = nw;
+                    say(a, "光标校准：状态机 %d,%d → 真实 %d,%d（漂移 %d,%d）",
+                        oldx, oldy, px, py, ddx, ddy);
+                }
+            }
+            a->cursor_sync_ms = nw;
+        }
+    }
 
     /* 被控端零软件模式：**仍然用状态机决定何时转发**（边缘穿越→转发，热键→收回），
        只把"转发"的载体从协议消息换成 HID 包 —— 对端内核直接收标准 HID，无需任何软件。

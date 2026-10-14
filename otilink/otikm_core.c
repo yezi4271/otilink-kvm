@@ -194,6 +194,17 @@ static void remote_reset_disp(otikm_core *c)
     c->drv_x = c->drv_y = 0;
 }
 
+/* 回程落点：离出口边多远（px）。必须足够远，否则回程后的一点惯性/抖动又会立刻推出去。
+   真机（2026-10-10，纯鼠标切换）：落点 edge+8=12px，用户在 Windows 上用鼠标 1~2 秒就
+   回程一次 → 键盘被反复 EVIOCGRAB，"在 Kylin 上打不了字"。现在至少 60px。 */
+int otikm_core_return_inset(const otikm_core *c)
+{
+    int m = c->edge_px + 8;
+    if (m < 60)
+        m = 60;
+    return m;
+}
+
 static void fill_switch(const otikm_core *c, int side, oti_switch_evt *sw)
 {
     memset(sw, 0, sizeof(*sw));
@@ -491,9 +502,12 @@ otikm_act otikm_core_local_mouse(otikm_core *c, const oti_mouse_evt *m, oti_swit
         {
             c->drv_x += m->dx;
             c->drv_y += m->dy;
-            int need = c->edge_px * 4;
-            if (need < 8)
-                need = 8;
+            /* 纯鼠标切换：回程必须是一个"明确的推回"动作，不能一碰就回。
+               原来是 edge_px*4=16 计数（约 0.3mm）→ 在 Windows 上稍微一动就被拉回来，
+               表现成"过不去 Windows / 键盘在两机之间跳"（2026-10-10 真机）。 */
+            int need = c->edge_px * 12;
+            if (need < 100)
+                need = 100;
             int back = 0;
             if (c->rem_entry_x == 0 && c->drv_x <= -need)
                 back = 1;
@@ -506,7 +520,7 @@ otikm_act otikm_core_local_mouse(otikm_core *c, const oti_mouse_evt *m, oti_swit
             if (back) {
                 /* 指针放回"当初出去的那条边"往里一点点：
                    既让用户一眼看到指针回来了，又不会因为惯性立刻又推出去。 */
-                int inset = c->edge_px + 8;
+                int inset = otikm_core_return_inset(c);
                 if (c->edge == OTI_EDGE_RIGHT) {
                     c->mx = (int16_t)(c->screen_w - 1 - inset);
                     c->my = (int16_t)((long)ny * c->screen_h / (rh > 0 ? rh : 1));

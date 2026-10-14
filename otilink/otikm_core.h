@@ -82,7 +82,7 @@ typedef struct {
         只在"键鼠在对端"的老拓扑里成立）。 */
     int      rem_entry_x, rem_entry_y;
     /* 交出去之后累计的**未缩放位移**（入口边 = 0；往对端里面为负/正见下）。
-       回程判据只看它：用户必须把"推出去的距离"推回来，再多推 max(8, edge_px*4)。
+       回程判据只看它：用户必须把"推出去的距离"推回来，再多推 max(100, edge_px*12)。
        为什么不用 rem_x：rem_x 是**远端像素**坐标，要按 rem_w/local_w 缩放，而远端
        几何可能在手势中途才到（真机实测：Windows 的 HELLO 报的是 4480x1440 虚拟桌面，
        它在驱动中途到达 → 缩放从 2 跳到 4、出口边从 1919 跳到 4479，用户推回去的
@@ -101,6 +101,8 @@ typedef struct {
 } otikm_core;
 
 void otikm_core_init(otikm_core *c, int w, int h, int edge_px);
+/* 回程落点：离出口边的距离（px），至少 60，避免回程后立刻又被推出去 */
+int  otikm_core_return_inset(const otikm_core *c);
 /* 热键与撞边策略（配置解析后调用；字符串形如 "ctrl+alt+space"） */
 void otikm_core_set_edges(otikm_core *c, unsigned edge_mask);
 void otikm_core_set_switch_mods(otikm_core *c, uint8_t mods);

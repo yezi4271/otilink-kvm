@@ -44,7 +44,7 @@ fi
 P0=$(kpos); [ -n "${P0:-}" ] && ok "麒麟真实光标可读: $P0" || bad "读不到麒麟光标（xdotool / DISPLAY）"
 
 # 上一次（可能被超时打断的）运行可能把代理留在 REMOTE，先发 F24 令牌让它回 LOCAL
-kssh 'cd ~/otilink && ./otiprobe hidsend 2 000073000000000000000000 >/dev/null 2> /dev/sg3 >/dev/null 2>&11; sleep 0.2; ./otiprobe hidsend 2 000000000000000000000000 >/dev/null 2> /dev/sg3 >/dev/null 2>&11' >/dev/null
+kssh 'cd ~/otilink && ./otiprobe hidsend 2 000073000000000000000000 >/dev/null 2>&1; sleep 0.2; ./otiprobe hidsend 2 000000000000000000000000 >/dev/null 2>&1' >/dev/null
 sleep 1
 
 if [ "${1:-run}" = "check" ]; then
@@ -60,7 +60,7 @@ BX=$(echo "$B" | tr -d ' ')
 if [ "${BX:-0}" -gt 2000 ]; then   # 归位没生效（还贴在右边缘）→ 重试一次，否则 +100 推不动会造成假失败
     sleep 1; pwsh_file "$WIN/setcur.ps1" -X 1200 -Y 500 >/dev/null; sleep 1; B=$(winx)
 fi
-kssh 'cd ~/otilink && for i in 1 2 3; do ./otiprobe hidsend 1 006400000000000000000000 >/dev/null 2> /dev/sg3 >/dev/null 2>&11; sleep 0.2; done' >/dev/null
+kssh 'cd ~/otilink && for i in 1 2 3; do ./otiprobe hidsend 1 006400000000000000000000 >/dev/null 2>&1; sleep 0.2; done' >/dev/null
 sleep 1
 A=$(winx)
 D=$(( ${A:-0} - ${B:-0} ))

@@ -4,6 +4,17 @@
 > 目标：OTi/瀚邦 USB2.0 对拷线（`0ea0:2213`），麒麟 ↔ Windows 键鼠共享 + 剪贴板。
 > **当前状态：目标全部达成**（键鼠双向、文本/图片/文件剪贴板双向、≤500MB 大文件双向），
 > 三条免手动回归脚本 + 看门狗/拔插自愈。出问题的自救命令见 `RUNBOOK §15.13.7`。
+> **⚠️ 规范已更新（第 54 轮，用户指令）**：**不使用热键**；L8 改为"回程判据 + 看门狗"，
+> 切换=把鼠标推到**朝对端那条边**、收回=鼠标**回程手势**（要明确往回推，不是一碰就回）；拿不回就 `pkill -9 -x otikm`。
+> **⚠️ 2026-10-10 蓝屏复盘（NOTES §71）**：真凶是 **AIC8800 USB 网卡驱动 oops + disconnect/deinit 死锁**（`aic8800_fdrv`，taint OE）
+> 被 **kdump 设的 `kernel.panic_on_oops=1`** 升级成全机 panic → Kylin `kysos` SOS rescue → `console_lock` 死锁 →
+> 活动 VT 停 `tty5`（蓝屏）。**已改用 Kylin 自带的 `rtl8821cu` 网卡**（RTL8821CU，插上即用，5GHz 正常），
+> AIC 驱动用 `install /bin/false` + udev `.disabled` **挡死**（重启后 `lsmod | grep aic` 为空）；
+> `panic_on_oops=0` 用 **late unit** `otilink-panic-on-oops.service`（`After=kdump-tools.service`）落地 ——
+> **只改 `KDUMP_SYSCTL` 无效**（`kdump-config` 末尾强制设回 1）。**与对拷线无关**。
+> **⚠️ 换无线网卡会打断 Windows 热点 relay**：`127.0.0.1:2222`（`ssh kylin` 别名）按写死的 MAC
+> 找麒麟 IP，换卡后报 `Connection reset by peer`。已改成多 MAC 列表（新卡在前）+ IP fallback；换卡后
+> 记得更新 `C:\Users\<你的用户名>\dsh-kylin-relay.ps1` 并重启 relay（`RUNBOOK §21`）。实测：**`ssh kylin`（relay）是 LAN 直连 1.7–2.1s；`ssh kylin-ts`（tailscale）在本机走 DERP 中转 5.3–8.1s** —— 交互用前者、容错用后者。
 > **⚠️ 动手前先读 `re/AGENTS.md`（agent 运行规范：硬约束/工作流/门禁矩阵/DoD）**；
 > 门禁入口 `re/tools/gate.sh`（`--pre` 体检 / `--static` 静态 / `--local` 本机 /
 > `--hw-clip|--hw-km|--hw-kmb|--hw-kbdexcl|--hw-lat|--hw-xfer` 真机 / `--deploy-kylin` 部署 / `--report` 看上次报告）。
@@ -36,12 +47,27 @@
 > **欠账**：① 真人复测（推到 Windows 打字，看是否还重复）；② `re/portable/build.sh` 重建
 > `dist/`（`--portable` 现在 2 FAIL：包内指纹过期，与本次修复无关）；③ §61.3 键盘改走帧管道（根治丢包）。
 >
+> **第 57 轮（现场，2026-10-14）**：用户报「kylin→Windows 复制失败」。真因 = `oticlip.c` 的
+> `popen("xclip … -o")` **无超时**，遇到不响应的选区所有者时 `clip_thread` 被**永久卡死**
+> （现场一个 `xclip -t text/uri-list -o` 子进程活了 41 小时）→ 本地剪贴板再也不被读取 →
+> **L→W 一条都发不出**，而 W→L（RX 线程）正常、拔插无效。已修：新增 `xclip_read_popen()`，
+> 读路径统一 `timeout 3 xclip …`；重启 otikm 后双向恢复，`--static` 80 PASS、`coretest` 45/45。
+> 详见 `NOTES §72`。
+>
+> **第 53 轮（现场，2026-10-09）**：一次收敛四条独立真因 —— ①设置窗口闪烁=`ukui-control-center` 重绘循环（与对拷线无关）；
+> ②Kylin 键盘输入不了 + 「回本机→3s 又抓走」乒乓=`hotkey_to_local/remote` 撞 IDEA 的 Ctrl+Alt+←/→（已关成 `none`）；
+> ③IDEA 仍无反应=`ukui-kwin` 的 `kglobalshortcutsrc`（`...Left 1`/`...Right 1`）也占着这两个键
+> （清成 `none` + 重启 `kglobalaccel5` + `ukui-kwin_x11 --replace` 拉回其它窗管快捷键）；
+> ④鼠标没到边就切=状态机积分 vs X 加速光标漂移（`otikm.c handle_local()` 每事件用真实光标校准，已部署并重打 KySec）。
+> 新坑：SSH 重启 otikm 必须带 `DISPLAY/XAUTHORITY`（否则退回 DRM、真实光标校准失效）；`pgrep -x` 因 comm 15 字符截断会假 MISSING。
+> 详见 `NOTES §68`；副作用/回滚见该节。**待办：`gate.sh --hw-kmb` 未跑（用户在用机器）。**
+>
 > **第 50 轮（运维，2026-10-08）**：麒麟当天**两次整机硬卡死**（11:16、15:18），都只能人工硬断电。
 > 已排除 OOM / 过热 / 盘满 / panic，也排除 §51 的 Kylin 升级检查器（6 个 unit 仍 masked）；
 > 最强线索是 **USB 子系统**（11:16：AIC8800 无线网卡 USB **运行时**掉线 → `usb_hub_wq` 卡 D → 整机死；
 > 旁证：对拷线 usb-storage 全天 778 次 D 态，最后一次距死机 ~30s）。**与 otilink 无关**（otikm 当时空闲）。
 > 已加固取证：`kernel.hardlockup_panic=1` + `kernel.panic=20`、面包屑加 D 态栈与 `dmesg` 尾；
-> kdump crash 区实测正常（`kexec_crash_loaded=1`、192MiB 已保留；早前"零长"是非 root 读 `/proc/iomem` 的地址抹零假象）；**15:18 那次归因仍未定**。详见 `NOTES §65`、`RUNBOOK §20`。
+> kdump crash 区实测正常（`kexec_crash_loaded=1`、192MiB 已保留；早前"零长"是非 root 读 `/proc/iomem` 的地址抹零假象）；第三次死机（16:59）前 20s 抓到 **chrome GPU 进程崩在 InnoSilicon 驱动**（`GLSLCompileToUniflex`/`libufwriter_inno`），3 次里 2 次吻合 → **嫌疑转向显卡**；已装 `gpu-crash-snapshot`（崩溃即快照）+ 已下发 Chrome 禁硬件加速策略（可撤销）+ **netconsole 已上线**（死机时内核日志实时到 Windows `C:\Users\Public\netconsole.log`，断电不丢）。**15:18 那次归因仍未定**。详见 `NOTES §65`、`RUNBOOK §20`。
 >
 > **第 48 轮（假光盘 / usb-storage D 态）**：现场用 udev **解绑线缆存储接口**来隐藏“假光盘”
 > → 连 `/dev/sgN` 传输通道一起杀掉（otikm 698 次“重开传输失败” + `recv rc=-19`）。

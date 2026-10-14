@@ -4007,6 +4007,10 @@ systemd-journald: File .../system.journal corrupted or uncleanly shut down, rena
    `kexec_crash_loaded=1` / 192MiB 已保留。**未改 GRUB**。现在 `hardlockup_panic=1` 已开，
    下次硬锁应能 panic→kdump→`/var/crash/vmcore`（**待下一次验证**）。
 
+4. `/etc/sysctl.d/99-otilink-crashcapture.conf` 追加 `kernel.unknown_nmi_panic=1`（见 §65.8）。
+5. `/usr/local/bin/gpu-crash-snapshot.sh` + `gpu-crash-snapshot.service`（见 §65.8）：
+   回滚：`sudo systemctl disable --now gpu-crash-snapshot; sudo rm /etc/systemd/system/gpu-crash-snapshot.service /usr/local/bin/gpu-crash-snapshot.sh; sudo systemctl daemon-reload`。
+
 **B. 文档**：本节 + `HANDOFF.md` 顶部状态 + `RUNBOOK §20`（操作步骤与核对单）。
 
 ### 65.6 下次遇到"麒麟整机死"的核对单
@@ -4023,6 +4027,138 @@ systemd-journald: File .../system.journal corrupted or uncleanly shut down, rena
 * 无线网卡隔离实验（`modprobe -r aic8800_fdrv`）**未做**：默认路由走 WiFi（`<网关IP>`），
   拔了会影响 tailscale/relay，需用户配合挑时间。
 * **15:18 那次死机完全没有触发事件日志，归因仍未定**。
+
+---
+
+### 65.8 补充：第三次死机（2026-10-08 16:59）—— InnoSilicon 显卡线索浮出
+
+**结果**：15:29–16:59 这轮（boot -1）**又硬死一次**，而且这次**机器自己起来了**（16:59:16 最后一格面包屑
+→ 17:01:21 新 boot，间隔 2:05），但 `/var/crash` **仍无 vmcore**，`hardlockup_panic=1` 也**没打出 panic**。
+
+**关键新证据（崩溃时刻 vs 显卡驱动）**：
+
+```
+16:58:54  chrome (PID 289290)  Signal: 5 (TRAP)   ← chrome 的 GPU 进程
+          Command: /opt/google/chrome/chrome --type=gpu-process ...
+          #0 chrome
+          #1 libufwriter_inno.so + 0x1af1d3
+          #2 libufwriter_inno.so + 0x295bc9
+          #3 GLSLCompileToUniflex              (libufwriter_inno.so)
+          #4 libGL_INNO_MESA.so + 0x1eb28d
+16:58:56/57/58  又有两个 chrome 进程 dumped core（同样 libufwriter_inno / libsrv_um_inno 栈）
+16:59:16  面包屑最后一格（完整、无 D-state、load 2.21、MemAvailable 6.9G、Dirty 10MB）
+16:59:2x  下一格没来 → 整机冻结
+17:01:21  新 boot
+```
+
+**跨三次死机的相关性**：
+
+| 死机 | 之前有没有 chrome GPU 驱动崩溃 | 间隔 |
+|---|---|---|
+| 11:16（boot -3） | 有：11:14:40–43 三个 chrome core，栈含 `libsrv_um_inno` | ~90 秒 |
+| 15:18（boot -2） | **没有**（该 boot 的 GPU core 只在 11:29 开机时） | — |
+| 16:59（boot -1） | 有：16:58:54–58 三个 chrome core，栈含 `GLSLCompileToUniflex`/`libufwriter_inno` | ~20 秒 |
+
+→ **3 次里 2 次**在整机冻结前 20–90 秒发生「chrome GPU 进程崩在 InnoSilicon 用户态驱动」。
+这不等于因果（也可能是 GPU 驱动已经开始坏、chrome 只是先崩的那个），但**嫌疑从 USB 转向显卡**。
+
+**为什么还是没 panic**：`nmi_watchdog=1` + `hardlockup_panic=1` 本应捕获"某 CPU 关中断自旋"的硬锁，
+却一条都没出。最可能的解释是**它不是 CPU 自旋型锁死，而是 GPU/PCIe/固件级挂起**（CPU 没有在关中断自旋，
+NMI watchdog 无事可做）。
+
+**本轮新增采集（可逆，见 §65.5）**：
+1. `kernel.unknown_nmi_panic=1`（收到未处理 NMI 就 panic → kdump 留证）。
+2. `gpu-crash-snapshot.service`：监听 journald 的 `dumped core`，**一崩就立刻**落
+   loadavg / MemAvailable / Dirty / `dmesg` 尾 40 行 / D 态进程及 `/proc/<pid>/stack`
+   → `/var/log/gpu-crash-snapshot.log`（已用无害 core dump 实测触发成功）。
+   目的：GPU 进程崩溃到整机冻结之间还有 20–90 秒，这个窗口能抓到内核状态。
+
+**用户确认（2026-10-08 追问）**：① 这次是**人工按电源键重启**（不是自愈/看门狗）——2 分钟间隔是人不是
+自动重启，也再次说明**系统没有产生 panic**；② 触发场景只是**刚打开 Chrome 浏览普通网页、没有视频**，
+就能崩在 `GLSLCompileToUniflex`。→ 显卡嫌疑进一步加重（普通页面也会走 GPU shader 编译）。
+
+**已执行的判别处置（可撤销）**：系统级禁用 Chrome 硬件加速——
+`/etc/opt/chrome/policies/managed/otilink-disable-hwaccel.json` = `{"HardwareAccelerationModeEnabled": false}`
+（需**完全退出并重启 Chrome** 才生效；`chrome://policy` 可查）。撤销：`sudo rm` 该文件 + 重启 Chrome。
+若不再死机 → 显卡驱动坐实；若仍死 → 下一步隔离 `innogpu`（退软渲染）。
+
+**仍未定**：15:18 那次既无 D-state 也无 GPU 崩溃，仍是独立疑点。
+
+### 65.9 第四次死机（2026-10-08 18:31）—— 无 Chrome、重负载，仍无任何 trace
+
+* boot -1 = 17:01:21 → **18:31:06 硬死** → 18:34:34 新 boot（人工断电，约 3.5 min）。
+* 临终面包屑（18:31:06）：load 4.32；top CPU = **java 100% / idea 77% / Xorg / java / VS Code**；
+  **没有 Chrome**；`MemAvailable 5.4G`；`Dirty 352kB / Writeback 108kB`；`usb-storage` 在 18:31:01 短暂 D。
+* **没有 coredump**（boot -1 只有 17:10 我做验证用的 bash core）；`libsrv_um_inno/GLSL` 命中 0。
+* **没有 panic / oops / LOCKUP；`/var/crash` 无 vmcore；pstore 今天为空**（`/var/lib/systemd/pstore` 最新 9/24）。
+* 硬件健康：NVMe（YMTC PC300）`media_errors=0 / num_err_log_entries=0`、temp 53°C、spare 100%；
+  CPU（AMD k10temp）Tctl 45°C；**ECC disabled**（`EDAC: DRAM ECC disabled`）；BIOS `XWH_1001_A028`（2024-08-26）。
+* 结论：**GPU 崩溃只解释 4 次里的 2 次**；18:31 这次是 IDE/JVM 重负载、无 Chrome 时发生。
+  **四次共同点：整机静默死透 + 非正常断电 + 无任何内核痕迹。**
+* 下一步：**下次死机先别按电源**，等 1~2 分钟让 agent 试 SSH；能连就 `echo t > /proc/sysrq-trigger`
+  抓全部任务栈（唯一还没试、最可能给出答案的手段）；连不上则坐实"整机真死"。
+  另议：netconsole 把 printk 送到 Windows（断电不丢）；以及 `nomodeset` 隔离 `innogpu` 做判别实验。
+
+### 65.10 netconsole 已上线（2026-10-08 18:5x）—— 死机时内核日志实时发到 Windows
+
+用户实测「死机时 SSH 不通」→ 只能让内核把 printk 主动发出去。已架好并验证：
+
+* **麒麟 → Windows（热点 `<热点网关IP>:6666` UDP）**
+  * `otilink-netconsole.service`（oneshot，`After=network-online.target`）→ `/usr/local/bin/otilink-netconsole-up.sh`
+    用 `<AIC网卡接口>`（AIC 网卡）以**不带源 IP** 的写法加载 `netconsole`：
+    `netconsole=6666@/<AIC网卡接口>,6666@<热点网关IP>/<网关MAC>`（DHCP 换 IP 也不怕）。
+    **AIC WiFi 驱动的 netpoll 是好的**（`netconsole: network logging started`），实测有数据。
+  * ⚠️ **最大的坑**：内核命令行 `quiet loglevel=0` → 运行时 `console_loglevel=4`，而 netconsole 是一个
+    **console**，**级别 >4 的 printk 全被过滤掉**（第一轮测试就是因此"看着没通"）。已加
+    `kernel.printk = 7 4 1 7`；另补 `hardlockup_all_cpu_backtrace=1`。
+* **Windows 侧监听**
+  * `C:\Users\Public\netconsole-listen.ps1`（UDP 6666 → `C:\Users\Public\netconsole.log`）
+  * 开机自启：`...\Startup\OTiLinkNetconsole.vbs`（用户级，免提权）
+  * 防火墙：`OTiLink-netconsole-6666` 入站 UDP 允许（提权加的，可删）
+  * 验证：麒麟 `echo "<0>OTILINK-…" > /dev/kmsg` → Windows 日志秒到；普通 UDP 也通。
+
+**下次死机的正确姿势**：发现卡死后**等 3~4 分钟再按电源**——`hung_task_timeout_secs=120`，
+hung task / NMI / RCU / sysrq 的输出会经 netconsole **实时**到 Windows `netconsole.log`（断电也不丢）。
+然后按电源，把日志尾巴贴回来。
+
+**回滚**：麒麟 `systemctl disable --now otilink-netconsole`；Windows 删 Startup 里的 vbs + 防火墙规则。
+
+### 65.11 第五次死机（2026-10-08 19:22）—— netconsole 通道随 USB 网卡一起死
+
+* boot -1（18:34:34）→ **19:22:48 硬死** → 一直冻到 **10-09 08:27** 用户长按重启（冻结约 13 小时）。
+* 面包屑：**19:22:56.489 那一格完整且 `sync` 成功**，下一格（~19:23:01）再没来；journald 最后一条 **19:22:46**。
+  死前负载低（load 1.1；IDEA 104% / VS Code / Xorg / java）；**最后几个块没有 D-state**；
+  19:22:36 出现过一次 `!!D-state: 437:usb-storage`（`usb_stor_msg_common`/`usb_sg_wait`）但**已恢复**。
+* **刚装的 netconsole 什么都没收到**（Windows 日志停在 18:52 的配置信息，19:22 前后一条都没有）。
+* **原因（重要）**：Kylin 的无线网卡是 **USB 的（AIC8800）**。机器一死（若涉及 USB 总线），网卡也死 →
+  热点无客户端自动释放 → **netconsole 的发送通道与故障同归于尽**。所以"没抓到"既可能是内核没打印，
+  也可能是打印了但通道已断 —— **无法区分**。
+* **结论**：无线 netconsole 对"涉及 USB 的死机"天生不可靠，必须落到 **有线 `enp2s0`（PCIe，不经 USB）**。
+  但 Kylin 有线（<麒麟有线网段>）与 Windows WLAN（<WSL网段>）**不在同一 L2**（路由走 WiFi 网关，实测 ping 不通），
+  需要把 Windows 的网口接到 Kylin 那条有线网、或两端**直连**（静态 IP）。这一步等用户物理接线。
+* 另：本 boot 起来后 `otilink-netconsole.service` **自动恢复**（08:27:48 重新 `network logging started`）。
+
+### 65.12 内核日志改为（同时）落 Kylin 本地盘（2026-10-09）
+
+用户问「不能让日志就保存在 kylin 吗」——可以，已加：
+
+* `/usr/local/bin/kmsg-to-disk.sh` + `kmsg-to-disk.service`：`dmesg --follow --time-format iso` 持续把内核
+  printk 追加到 `/var/log/kernel-live.log`，**每秒 `sync -d` 一次**；超过 20 万行截到 5 万行。
+* 意义：它**不经 USB 网卡、不经网络**，不会再出现 §65.11 那种「取证通道随故障一起死」。
+* 局限（必须写清）：若内核在冻结瞬间**没有产生任何 printk**，磁盘上也不会有。它能证明的是
+  「到最后一刻为止内核到底打印了什么/没打印什么」，从而把 §65.11 的「打印了但通道断」排除掉。
+* 下次死机后：`tail -40 /var/log/kernel-live.log`（内核日志）+ `/var/log/freeze-breadcrumb.log`（任务态）。
+
+### 65.13 内核日志再加固：镜像到 /data + 开机归档上一 boot（2026-10-09）
+
+* `kmsg-to-disk.sh` 现在**同时写** `/var/log/kernel-live.log` 与 `/data/otilink-logs/kernel-live.log`
+  （两个分区，根分区 IO 卡住时 `/data` 仍可能保住；两处都每秒 `sync`）。⚠️ `/data` 已用 **94%**（剩约 2G），
+  日志有 20 万行截断上限，够用；别再往 `/data` 塞大东西。
+* 新增 `otilink-archive-boot.service`（每次开机、`Before=kmsg-to-disk`）：把上一 boot 的
+  `kernel-live.log` / `freeze-breadcrumb.log` / `gpu-crash-snapshot.log` 各 `tail -500` +
+  `journalctl -b -1 -n 3000` + `ls /var/crash` 归到 `/var/log/otilink-archive/<时间戳>/`，只留最近 10 份。
+* **死机后的标准取证（一条）**：`d=$(ls -1dt /var/log/otilink-archive/*/ | head -1); ls -la "$d";`
+  再读 `$d/kernel-live.log.tail` 与 `$d/freeze-breadcrumb.log.tail`。
 
 
 ---
@@ -4091,3 +4227,482 @@ systemd-journald: File .../system.journal corrupted or uncleanly shut down, rena
   即 GitHub 官方的 **noreply 邮箱**（`<数字ID>+<用户名>@users.noreply.github.com`），提交会挂到账号名下，
   且仓库历史里**不含真实邮箱**。首个快照最初误用了 `otilink-local <otilink@localhost>` 占位身份，
   已 `rebase --root --exec 'git commit --amend --reset-author'` 重写后强推。
+
+## 67 第 52 轮：现场报障「文件和图片复制失败」—— 定层与三个可复现缺口（2026-10-09）
+
+> 用户原话：「对拷线文件和图片复制失败」。按 `RUNBOOK §19` 先定层，**未改任何产品代码**。
+
+**现场基线**：`--pre` PASS=22 / FAIL=0 / WARN=3（KySec 标签比 otikm 新，属已知）。标准回归全绿：
+* `clipreg.sh` **17/17**（小文本 / 大文本 69991 与 200010 / 图片 240x160 / 文件，双向）；
+* `xferreg.sh` 64MB 双向 **md5 一致**（W→L 6MB/s、L→W 2.4MB/s）；
+* 真机历史日志里有一笔**用户的真实大文件**：`dismodelingservice-1.0.0.RELEASE.jar`
+  **302812732 字节 / 4732 片，L→W 106.7 秒，✔ 接收完成**
+  （`C:\Users\<你的用户名>\AppData\Local\Temp\otilink_files_001c37cb\…`）。
+
+**结论：常规「文件 / 图片」路径本身没坏**。失败属于回归**没覆盖到**的三种形态（均已复现，含证据行）：
+
+| # | 形态 | 现象 | 证据 |
+|---|---|---|---|
+| ① | 麒麟看图软件复制 **JPEG**（剪贴板只有 `image/jpeg`、无 `text/uri-list`） | 被当**文本**发出（对端「已应用远端剪贴板 4231 字节」，不是「**图片**」；麒麟重发无 ACK 放弃） | `otikm`: `[warn] 剪贴板 4231 字节重发 3 次仍无确认（对端在吗？），放弃`；`clip.log`: `CLIP 已应用远端剪贴板 4231 字节` |
+| ② | **图片 >8 MiB** | 直接丢弃（有告警，用户只看到"没过去"） | `clip.log`: `[warn] 剪贴板内容超过上限（16555491 字节 > 8MB）——本次不发送` |
+| ③ | **文件夹** | W→L **完全静默**（无任何日志）；L→W 退化成 30 字节 uri-list 文本 | W→L 期间 clip.log 无新行；L→W 只有 `CLIP 已应用远端剪贴板 30 字节` |
+
+**真因（代码定位，未改）**：
+* ① `re/otilink/oticlip.c:361` 只探测 `image/png`，找不到就落到 `oticlip.c:447` 的无 `-t` 兜底
+  → 把图片原始字节当**文本**发。修法：追加 `image/jpeg|bmp|gif` 探测并按魔数仍发 format 2
+  （Windows 侧 `ClipImg::SetPng` 走 GDI+ `new Bitmap`，JPEG/BMP/GIF 都能解）——**属协议语义放宽，
+  需同步 `PROTOCOL.md` + 两端 + `clipreg` 新增 JPEG 用例**（见 `AGENTS §5`）。
+* ② `windows/otiagent.ps1:3116-3121` 与 `otikm.c` 的 `clip_max`：>8MiB 一律不发。
+  要真修得把大图并到 `otixfer` 流式路（同大文件），改动面大。
+* ③ `windows/otiagent.ps1:3077` `[IO.File]::ReadAllBytes($f)` 对目录抛异常，被 :3092 的空 catch 吞掉；
+  至少应**显式告警**，或递归打包（feature）。
+* 附带：`clip.log` 被 `ROLE: peer state=…` 诊断刷屏（2.29MB / 5306 行），现场读日志先被噪声淹没。
+
+**链路不稳的历史证据（已自愈，不代表当前）**：上一轮 otikm 会话里有一段
+`设备连续读取失败，尝试重连 \\.\H:`（十几条）+ `会话自愈：… 重开线缆设备`；
+`otikm` 于 09:08:59 重启（boot `88e2b76c`）后不再出现。**若用户报障发生在重启之前，
+「文件+图片一起失败」就是链路会话坏了**，与内容形态无关。
+
+**未完成 / 待用户确认**：① 用户具体复制的是哪种（文件夹 / 大图 / JPEG / 普通文件）；
+② 修复优先级；③ 修 ① 要动协议语义，必须先 `--pre` + 改 `PROTOCOL.md` + 两端同版本 + `--hw-clip`。
+**本轮副作用**：回归与复现改写了两侧剪贴板内容；临时件（`C:\Users\Public\otilink_*.ps1`、
+`C:\Users\Public\otitest\rl`、麒麟 `/tmp/rltest`）已删除。
+
+### 67.1 用户补充后的定案与修复（2026-10-09，同一轮）
+
+**用户补充**：① 麒麟**桌面**上的东西复制不到 Windows；② `/data2/下载` 的**图片**可以；
+③ 同目录的 `dismodelingservice-1.0.0.RELEASE.jar`（302MB）复制不到，且**鼠标移动变慢**。
+
+**真因 A（桌面）＝ KySec 标签过期（L6），不是复制逻辑**：
+* `/home/kylin/桌面`、`/home/kylin/文档` 带 `security.ksip="none:none:trusted:1"`（**受保护目录**）；
+  `/data2/下载` **无** ksip（所以图片能读）—— 正好解释"桌面不行、/data2 可以"。
+* otikm 二进制时间 `13:20:03` > `.kysec-stamp` `13:19:34`（重编译后没重打标签），
+  `kysec_get -n exectl ~/otilink/otikm` = **unknown**（不可信）→ 读受保护目录 `fopen` EACCES。
+* **修法**：`cd re/tools && ./gate.sh --deploy-kylin`（同步→编译→`label-kysec.sh`→写戳）；
+  **标签在 exec 时生效 → 必须重启 otikm**（`pkill -x otikm; sg input -c "DISPLAY=:0 nohup ~/otilink/run-kylin.sh …"`）。
+  修后 `kysec_get … = trusted`，`--pre` **PASS=24 FAIL=0 WARN=1**（原来的 KySec WARN 消失）。
+* **验证（真机）**：桌面 `新建文本文档.txt`(1832B) → Windows `CLIP 已应用远端**文件** 1 个`；
+  受保护的 `/home/kylin/图片/屏幕截图 2025-09-30 102319.png`（名字带空格）也成功。
+
+**真因 B（jar）＝ 能传，用户看到的是"慢 + 鼠标卡"**：
+* 本轮两次真机复现：`302812732 字节 / 4732 片`，**122.0s** 与 **123.4s**（≈2.4 MB/s），
+  Windows 均 `✔ 接收完成`；收完 20MB 干净用例确认 `HAS_HDROP=True`（**可粘贴**）。
+  即**不是"复制不到"**，而是 302MB 要 ~2 分钟、其间鼠标不跟手，被当成失败。
+* 鼠标变慢的位置（**代码定位**）：`otixfer.c:377` 每轮最多 16 片（≈1MB）**背靠背**发，
+  `otikm.c:1587` 的 clip 线程轮间 `continue` **不睡**；每片 `oti_tr_send_wait` →
+  `cable_pump_once` 拿 `t->lock` + `otilink_cable_io_lock` 做一次设备往返。
+  同进程里直接发 HID 的 `otilink_send_hid`（`otilink.c:220`）也要 `cable_io_lock`
+  → 大文件期间输入路径被挤。
+* ⚠️ **`hidlat` 量不到这条竞争**：它是**独立进程**，`g_cable_io` 是进程内静态锁 →
+  实测传输中 `MAXGAP=97ms` == 基线 `98ms`，"无卡顿"是**假阴性**。
+  真正可判定的真机档是 `xferreg` 第 3 步（HID 推 Windows 光标）：修好重定向后
+  **Δ=683px PASS**（单包能过，但连续跟手速率仍未覆盖）。
+* **未做（留给下一轮，属 L8「键鼠」关键路径）**：给传输节流（每片后让一次锁/`usleep` 或按需让路），
+  验收要 `--hw-xfer` + `--hw-lat` + **真人连续移动鼠标体感**。
+
+**顺带修掉的真 bug（测试侧，本轮已改）**：`hwtest.sh:47,63`、`xferreg.sh:97,103` 里
+`>/dev/null 2> /dev/sg3 >/dev/null 2>&11` 是把设备路径写成了重定向 ——
+`/dev/sg3` 现在不存在（quirk=s 后只剩 `sg2`）→ **重定向失败 → 整条命令不执行** → HID 包没发、
+光标不动 → `--hw-xfer` 第 3 步假 FAIL（`bash: /dev/sg3: 权限不够`）。
+`otiprobe` 本来就按 VID/PID 自动发现设备，改成 `>/dev/null 2>&1` 即可。
+修后 `./gate.sh --hw-xfer` = **PASS=12 FAIL=0**（之前 10/1）。
+
+**本轮副作用 / 回滚**：
+* 麒麟：`label-kysec.sh`（13 个二进制打 trusted）+ 重启 otikm（pid 变化，KM/剪贴板短暂中断）。
+  回滚：标签不影响功能（只是更信任）；要恢复用 `kysec_set -n exectl -v untrusted <file>`。
+* 测试改写了剪贴板；临时件（`/tmp/otilink_test20.bin`、`/tmp/*_uri.txt`、`/tmp/hidlat`）已删；
+  Windows `%TEMP%\otilink_files_*` 里的接收副本按产品语义保留。
+
+## 68 第 53 轮：现场「设置窗口闪烁 / Kylin 键盘输入不了 / IDEA Ctrl+Alt+← 无效 / 鼠标没到边就切」——四条独立真因（2026-10-09）
+
+现场报障逐步收敛为四件事：① 麒麟「设置」窗口一直闪；② 按 Ctrl+Alt+← 后键盘在 Kylin 上输入不了；
+③ 关掉 otikm 热键后 IDEA 里 Ctrl+Alt+←/→ 仍无反应；④ 鼠标左移没到边就切到 Windows。
+
+### 真因①：设置闪烁 = ukui-control-center 卡在重绘循环（与对拷线无关）
+* 现象：`ukui-control-center` 主线程 26–28% CPU；`~/.xsession-errors` 被
+  `QPainter::begin: Paint device returned engine == 0, type: 3` 刷 395 行 +
+  `QXcbConnection: XCB error: 3 (BadWindow) … GetWindowAttributes/ChangeWindowAttributes`；
+  `~/.log/ukui-control-center.log` 反复 `Cannot set the target window on a shadow …` 与显示页 QML
+  `Binding loop detected for property "height"/"width"`。
+* 结论：设置窗口在往已销毁的 X 窗口上反复重画（BadWindow→引擎 0→重画），**与 otikm/热键无关**。
+* 处理：重启 `ukui-control-center` 即恢复（0.3% CPU，395 行不再增长）。属麒麟/innogpu 侧问题。
+
+### 真因②：键盘输入不了 + "回本机→3s 又抓走"乒乓 = 默认热键撞 IDEA
+* otikm 默认 `hotkey_to_local=ctrl+alt+left` / `hotkey_to_remote=ctrl+alt+right`；IDEA 的「后退/前进」
+  恰好就是这两个键 → 一按导航键，otikm 就切换控制权并 `EVIOCGRAB` 独占键盘，Kylin 桌面收不到按键。
+  日志实证：`已独占 SIGMACHIP USB Keyboard（驱动侧…）` → `HID 模式：指针交给对端` 反复出现。
+* 处理：`~/.config/otilink/kvm.conf` 四个 `hotkey_* = none`（备份 `~/.config/otilink/kvm.conf.bak.*`），重启 otikm；
+  静置 35s **0 次抢占**。
+
+### 真因③：IDEA 仍无反应 = **窗管**也占了 Ctrl+Alt+←/→
+* `~/.config/kglobalshortcutsrc` 的 `[ukui-kwin]`：
+  `Switch One Desktop to the Left 1=Ctrl+Alt+Left` / `…Right 1=Ctrl+Alt+Right`（切换工作区）。
+  即使 otikm 热键关掉，窗管仍抢这两个全局键，IDEA 收不到。
+* 处理（**顺序重要**）：
+  1. `dbus-send … org.kde.KGlobalAccel.setShortcut array:string:"ukui-kwin","Switch One Desktop to the Left 1" array:int32: uint32:0`
+     只清"活动键"**无效**：`getGlobalShortcutsByKey` 仍报它（窗管又抢回）。
+  2. 把配置写成 `none,none,…` 并**重启 `kglobalaccel5`** 才真正释放。
+  3. ⚠️ 副作用：单独重启 `kglobalaccel5` 后窗管**其它**全局快捷键（`Show Desktop`、`Meta+Ctrl+Left`…）
+     不会自动重注册；必须 `ukui-kwin_x11 --replace` 重启窗管（带原会话环境）才拉回。
+  4. 验证：`getGlobalShortcutsByKey` 对 Ctrl+Alt+Left/Right 返回**空**；`Meta+D`/`Meta+Ctrl+Left` 仍注册；
+     面板/设置守护/窗管均正常、窗管日志无错误。
+
+### 真因④：鼠标没到边就切 = 状态机积分与 X 加速光标漂移
+* otikm 只用 evdev 原始位移积分，真实指针走 X 加速曲线 → 越漂越远。日志实证：
+  `光标校准：状态机 317,94 → 真实 818,280（漂移 501,186）`、`… 315,105 → 494,233（漂移 179,128）`。
+  漂移让状态机以为已到边 → 提前切到 Windows。
+* 处理（`otikm.c handle_local()`）：主控端本机态、**每个鼠标事件**用 `XQueryPointer` 把状态机坐标对齐到真实光标，
+  并 `core.mx = px - m->dx`（减掉本次位移，避免核心再加一次而提前 |dx| 像素判边）。
+  已 `make` + `coretest`(45/0) + `--static`(80/0) + 麒麟重编译 + KySec 重打标签 + 重启。
+
+### 新坑速查
+* **SSH 重启 otikm 必须带 `DISPLAY=:0 XAUTHORITY=~/.Xauthority`**：否则启动日志是
+  `屏幕: …（来源 DRM sysfs）` 而非 `X11/XRandR`，`otix11_pos` 失效 → 真实光标校准与回程落点全部降级。
+  AGENTS §4.1 那条 `ssh … 'pkill -x otikm; ./run-kylin.sh'` 在本机就是坑，应给 `run-kylin.sh` 补默认 DISPLAY。
+* `pgrep -x <名字>`：内核 `comm` 截断到 15 字符，`ukui-control-center`→`ukui-control-ce`、
+  `ukui-settings-daemon`→`ukui-settings-d` 会**假 MISSING/假成功**；用 `pgrep -a` 或 `ps -eo comm`。
+* 清 `kglobalshortcutsrc` 的重复动作（`… 1`）光改文件/`setShortcut` 不够；要么重启快捷键守护+窗管，
+  要么走 UKUI「设置→快捷键」GUI。
+
+### 未完成 / 待办
+* **`gate.sh --hw-kmb` 未跑**：改的是主控端本地边判据，属拓扑 B 关键路径；本轮用户在机器上，未动真实光标。机器空闲时补跑。
+* 仓库默认配置 `kvm.conf` 的热键仍会撞 IDE；是否把默认改成不冲突组合（如 `ctrl+alt+shift+left`）留待决策
+  （L8：不能既关热键又无回程兜底）。
+
+### 副作用 / 回滚
+* 麒麟改了 `~/.config/otilink/kvm.conf`（备份 `~/.config/otilink/kvm.conf.bak.*`）与
+  `~/.config/kglobalshortcutsrc`（备份 `/tmp/kglobalshortcutsrc.bak`）；重启过 `kglobalaccel5`、
+  `ukui-kwin_x11 --replace`、`otikm`。
+  回滚：`cp /tmp/kglobalshortcutsrc.bak ~/.config/kglobalshortcutsrc` 后重启窗管+快捷键守护；
+  kvm.conf 用备份覆盖后重启 otikm。
+* 麒麟源码：`otikm.c` 已同步；KySec 已重打（`otikm: none:none:trusted:999`）。
+
+---
+
+## 69 第 54 轮：现场「键盘不能在 Kylin 上打字」= 撞边把控制权交给 Windows（无热键，收回只能靠回程手势）
+
+**报障**（2026-10-10 14:42）：用户原话「键盘现在不能在 Kylin 上打字」；并明确「不要热键，把 L8 删了」。
+
+### 现场证据（改动前）
+* 麒麟 `/tmp/otikm.log`：`已独占 SIGMACHIP USB Keyboard（驱动侧…）` → `HID 模式：指针交给对端`；
+  独立 `EVIOCGRAB` 探针 `kbd BUSY / mouse BUSY`；真实光标 `x:0`（停在朝 Windows 的左出口边）。
+  → 控制权在 Windows，本地键盘被独占：敲键盘全经线缆发给 Windows，麒麟桌面收不到。
+* `gate.sh --pre`：PASS=24 FAIL=0（线缆 `0ea0:2213`、otikm 1 个、无厂商、剪贴板代理在跑）。
+* 日志 14:41–14:42 反复 `指针交给对端 ↔ 指针拉回本机`（撞边切换太敏感）。
+
+### 真因
+* 主控端 `edges = left,right` + `switch_modifier =`（空）：光标贴到左边缘 4px 内就立即把控制权交给
+  Windows；用户在桌面左侧操作时极易误触 → 控制权被抢走、键盘被 `EVIOCGRAB`，表现为「在 Kylin 上打不了字」。
+* 第 53 轮为避开 IDEA 的 `Ctrl+Alt+←/→` 把四个 `hotkey_*` 全关成 `none` → 没有任何键盘方式能立刻拉回
+  （L8 的"收回来"只剩鼠标回程手势）。
+
+### 处置（本轮）
+* 机器侧 `~/.config/otilink/kvm.conf`：`edges = left`（麒麟在 Windows 右边，只有左边界朝 Windows，
+  右出口是误切来源）+ `switch_modifier = shift`（撞边必须按住 Shift 才切换 = 防误触，**不是热键**）。
+* 重启 otikm；验证：探针 `KBD FREE`、光标居中、日志 `撞边切换: 部分边，需按住修饰键`、无 `指针交给对端`。
+* **规范变更（用户指令）**：`AGENTS.md` L8 去掉"急救热键"要求 → "回程判据 + 看门狗，不使用热键"；
+  仓库默认 `otilink/kvm.conf` 的 `hotkey_*` 全改 `none` + `switch_modifier = shift`；
+  `RUNBOOK` / `AGENTS §8` 里所有"按 Ctrl+Alt+←/→"的急救说明改为"回程手势 / `pkill -x otikm`"。
+
+### 用法（背下来）
+* 在 Kylin 打字：正常用；误触左边缘不会再切走（要按住 **Shift** 再推到左边缘才切）。
+* 切到 Windows：按住 **Shift** + 把鼠标推到**左**边缘。
+* 从 Windows 回 Kylin：把鼠标往**右**推（回程手势，无需修饰键）；拿不回就 `pkill -x otikm`。
+
+### 未完成 / 待观察
+* Shift+撞边的手感未由真人复测；机器空闲时补跑 `--hw-kmb` / `--hw-kbdexcl`。
+* `kbdexcl.sh` 的回程断言注释已改为通用「指针拉回本机」（不再假设热键）。
+
+---
+
+## 70 第 55 轮：现场「键盘不能在 Kylin 打字 / 鼠标过不去 Windows」= 纯鼠标切换阈值太灵敏 + 意外起了两个 otikm 主控
+
+**报障**（2026-10-10 15:00）：用户原话「kylin还是打不了字，鼠标也移动不到windows」，
+并明确「**不要按键配合，只通过鼠标移动换边**」。问要不要拔插键鼠。
+
+### 证据
+* **键盘设备是好的，不用拔插**：容器内直接读 `/dev/input/by-id/usb-SIGMACHIP_USB_Keyboard-event-kbd`
+  60s，用户按 a/s/d/f 收到 `EV_KEY code=30/31/32/33 val=1/0`（80 条）。
+* **鼠标不漂移**：手离开键鼠 12s，G304(event5) `sum_dx=0 sum_dy=0`、线缆 HID 鼠标(event3) 也为 0，
+  otikm 无任何状态迁移 → 不是硬件抖动、不是回环。
+* **真因①（切换太灵敏）**：纯鼠标切换下，主控端回程阈值 `need = edge_px*4 = 16` 计数（约 0.3mm），
+  回程落点 `edge_px+8 = 12px`。在 Windows 上用鼠标时稍微往右一动就被拉回 Kylin →
+  日志 1~2 秒一次 `指针交给对端 ↔ 指针拉回本机`，每次 remote 都 `EVIOCGRAB` 键盘 →
+  用户「打不了字 / 过不去 Windows」。
+* **真因②（两个 otikm 主控）**：我重启 otikm 时用 `pkill -x otikm`（SIGTERM），但它**没有立刻退出**
+  （卡在设备 read/线程 join），`sleep 2` 后就起了新进程 → 曾有 **两个 otikm 同时抓同一套设备**
+  （`ps` 实证：旧进程 parent 是一个还挂着的 ssh bash，新进程 parent=1）。两个主控互相抢设备，
+  行为更不可预测。违反 L17「任何时刻只能一个主控」。只有 `pkill -9` 才杀掉。
+
+### 处置（本轮）
+* `otilink/otikm_core.c`：回程阈值 `need = max(100, edge_px*12)`（原 max(8, edge_px*4)）；
+  回程落点改用新函数 `otikm_core_return_inset()`，至少 `edge_px+8 = 60px`（原 12px）。
+  `otilink/otikm.c` 的 `return_landing_xy` 同步用该函数；`coretest` 期望值同步更新 → **45/45**。
+* 机器侧 `~/.config/otilink/kvm.conf`：`edges = left`，`switch_modifier =`（**空**，用户要求纯鼠标，
+  不要 Shift/热键）。防误触完全靠上面的阈值 + 角部死区。
+* **重启姿势修正（新坑）**：必须先确认旧进程真的没了再起新的——
+  `pkill -x otikm; sleep 3; pgrep -x otikm && pkill -9 -x otikm; sleep 1; pgrep -x otikm || echo 全停`；
+  启动用 `setsid -f nohup ./run-kylin.sh`（`-f` 强制脱离，避免挂在 ssh bash 下）。
+  跑起来后 `pgrep -x otikm | wc -l` **必须等于 1**。AGENTS §4.1/§9、RUNBOOK 的重启命令已同步。
+* 门禁：`--static` 80/0、`--deploy-kylin` 3/0（麒麟重编译 + KySec 重打）、`coretest` 45/45。
+
+### 用法（当前）
+* Kylin 打字：直接打（一个 otikm，本地态，键盘不被独占）。
+* 去 Windows：把鼠标推到**左**边缘（朝 Windows 那侧）。
+* 回 Kylin：把鼠标**明确往右推回去**（现在要推 ~100 计数，不像以前一碰就回）。
+* 出不来：`pkill -9 -x otikm`（立即释放独占），再按上面的安全姿势重启。
+
+### 未完成 / 待观察
+* `gate.sh --hw-kmb` / `--hw-kbdexcl` 未跑（用户在机器上；它们会合成手势/短暂停 otikm）。
+* otikm 对 SIGTERM 不立即退出本身是个可修的点（信号里只 release grab + 置 running=false，
+  若主循环卡在设备 read/线程 join 就不会退出）；建议后续加"第二次信号直接 _exit()"或超时兜底。
+
+---
+
+## 71 第 56 轮：2026-10-10「麒麟蓝屏」= AIC8800 USB 网卡驱动 oops + `panic_on_oops=1` 升级成全机 panic（Kylin SOS rescue 卡死 console）
+
+**报障**：2026-10-10 15:30 用户「kylin 蓝屏」；SSH 还能连，但 `chvt`/`systemctl reboot` 全部卡死，最后人工强制重启。
+
+### 症状与机制
+* 内核 ring buffer：`[73963.553] PANIC: SOS rescue timeout! No feedback from userspace.`（约 15:17:28）→
+  之后 `console_callback`/`agetty` 在 `console_lock` 上 D 态 >600s（hung_task），**活动 VT 停在空白 `tty5`**
+  （X 仍在 `tty7`，桌面没崩）。→ "蓝屏"其实是"VT 被切到空控制台 + console 子系统死锁"。
+* `SOS rescue` = Kylin 内置 `kysos_key`（`CONFIG_INPUT_KYSOS_KEY=y`，builtin；开机创建
+  `SOS Rescue Virtual Device`），**不可卸载**；panic 进入该路径后卡死。
+
+### 真因（本地 pstore 实证）
+`/var/lib/systemd/pstore/179024356/dmesg.txt`（10-08）与 `.../179150757/dmesg.txt`（10-09）两次记录**完全一致**：
+```
+BUG: kernel NULL pointer dereference, address: 0000000000000060
+Oops: 0000 [#1] SMP NOPTI
+RIP: 0010:device_del+0x1e/0x390
+Call Trace: usb_disconnect → hub_port_connect → port_event → hub_event
+           aicwf_usb_disconnect / aicwf_bus_deinit / rwnx_platform_deinit … [aic8800_fdrv]
+```
+* 崩溃在 **AIC8800 USB 无线网卡驱动 `aic8800_fdrv`**（`taint=OE`，out-of-tree + 未签名；
+  设备 `1-4.1.4`，`a69c:8d83` "AIC 8800D80"）**运行中 USB 掉线**的 disconnect/deinit 路径。
+* **`kernel.panic_on_oops=1`** 把这个 oops 升级成全机 panic；该值来自 **kdump-tools**
+  （`/usr/sbin/kdump-config` 默认 `KDUMP_SYSCTL="kernel.panic_on_oops=1"`），目的是让 kdump 抓 vmcore。
+* → panic → Kylin SOS rescue → `console_lock` 死锁 → 蓝屏。
+* **GPU（`innogpu`）不在故障栈里**；§65 的 Chrome GPU 崩溃是另一条独立线索。
+
+### 处置（本轮，2026-10-10 16:2x）
+1. **`kernel.panic_on_oops=0`**：
+   * `/etc/default/kdump-tools` 追加 `KDUMP_SYSCTL="kernel.panic_on_oops=0"`（备份 `.bak.*`）；
+   * 运行时 `sysctl -w kernel.panic_on_oops=0`；`kdump-config show` 已确认 `KDUMP_SYSCTL: kernel.panic_on_oops=0`。
+   * 效果：AIC 再 oops **只杀那个 kworker，整机不再 panic/蓝屏**；代价：oops 不再产生 vmcore
+     （dmesg / EFI pstore 仍留证）。
+2. **USB 禁 autosuspend**：`/etc/udev/rules.d/99-otilink-usb-no-autosuspend.rules`
+   （`ACTION=="add", SUBSYSTEM=="usb", TEST=="power/control", ATTR{power/control}="on"`），已 `udevadm control --reload-rules`。
+3. **待用户做**：把 AIC 网卡从两级 Hub（`1-4.1.4`）换到**主板直连 USB 口**；若不需要无线可停用该驱动
+   （注意：默认路由与 tailscale 都走这块 WiFi，停用会断网/断 SSH）。
+4. 本地留档现状：**EFI pstore + `pstore-archive.service` 已在本地归档**（`/var/lib/systemd/pstore/`，9/17–10/9 有记录）；
+   `ramoops` 已加载但 `mem_size=0`（未配内存区）。**故意没动 grub 加 ramoops**：需要 `memmap=` 预留内存，
+   地址选错会内存损坏/起不来，而 EFI pstore 已能留档，风险大于收益。
+
+### 未完成 / 待观察
+* 换 USB 口后是否还会掉线（观察 `dmesg | grep aic8800` 与 pstore）。
+* 下次 AIC oops 验证 `panic_on_oops=0` 是否真的只杀 kworker 而不蓝屏。
+* `--hw-kmb` / `--hw-kbdexcl` 仍未跑（键鼠改动）。
+
+### 补充（2026-10-10 16:46–17:10）：进一步定位到"重复 deinit"，并补第 4 个补丁
+
+* 重载尝试（`modprobe -r aic8800_fdrv`）**复现了崩溃**，pstore 新归档 `179162200` 记录：
+  ```
+  BUG: kernel NULL pointer dereference, address: 0000000000000060
+  RIP: 0010:device_del+0x1e/0x390
+  Call Trace: aicwf_usb_exit+0x135 [aic8800_fdrv] ← rwnx_mod_exit ← module_exit
+              → rwnx_platform_deinit → rwnx_cfg80211_deinit → … → device_del
+  ```
+  即这次是**模块卸载路径**（`aicwf_usb_exit`），不是拔插路径——但两者都调用 `rwnx_platform_deinit()`。
+* **根因**：`rwnx_platform_deinit()` **不幂等**（只调 `rwnx_cfg80211_deinit`），而 `g_rwnx_plat->enabled`
+  **从不置回 false**（只在 `rwnx_main.c:9033` 置 true）。`aicwf_bus_deinit()`（拔插）与
+  `aicwf_usb_exit()`（卸载）各调一次 → **第二次 `rwnx_cfg80211_deinit` 里 `device_del` 空指针**。
+* 该次重载的后果：旧模块没卸干净 + 卡住的 modprobe 占住内核模块加载串行锁 →
+  用户"插新网卡也没反应"（任何驱动都加载不进去）；只能重启恢复。
+* **补丁 4**：`rwnx_platform_deinit()` 开头加幂等保护：
+  `if (g_rwnx_plat) { if (!g_rwnx_plat->enabled) return; g_rwnx_plat->enabled = false; }`
+  重编后 `srcversion=59FC3CEF19D248068B065F7`（前 3 个补丁版是 `8715F94B…`，原始是 `A2149798…`）。
+* 备份/回滚：原模块二进制 `/tmp/aic8800_fdrv.ko.bak`；补丁说明
+  `/usr/src/aic8800-kylin-6.4.3.0/OTILINK-DEFENSIVE-NOTES.txt`；重编命令
+  `make -C drivers/aic8800 KDIR=/lib/modules/<kver>/build` + `cp` 到 `updates/dkms/` + `depmod`。
+* **待验证**：重启加载 `59FC3CEF…` 后，**拔插 AIC 网卡**看是否还 oops（这是对"拔插崩溃"的最终真机测试）；
+  另可测 `modprobe -r` 是否还会崩（模块卸载路径）。
+* 注：驱动源码是第三方 fork（ronnyf/AIC8800-Linux-Driver），上游 main 的 disconnect 代码与本地相同，
+  **没有可用更新**；本次是本地防御性修复。
+
+### 最终处置（2026-10-10 17:20）：放弃修 AIC，改用 Kylin 自带 rtl8821cu 网卡
+
+* **真机拔插结论**：4 个补丁（probe vfree / disconnect intfdata+g_rwnx_plat+sem / bus_deinit guard /
+  rwnx_platform_deinit 幂等）之后，**拔掉 AIC 网卡仍然把整机卡死**——而且这次是 **hang（D 态死等）而不是 oops**，
+  所以 `panic_on_oops=0` 也救不了（它只挡 oops→panic，挡不住死等）。
+  结论：**AIC8800 这个 out-of-tree fork 的 disconnect/deinit 死锁，无法低成本修好**。
+* 用户换了一张 **Realtek RTL8821CU**（USB `0bda:c811`，先枚举成 `0bda:1a2b` U 盘模式再切到 WiFi），
+  Kylin 内核自带模块 **`8821cu`**（`/lib/modules/<kver>/kernel/kylin/rtl8821cu/8821cu.ko`，
+  `v5.12.0-16-g5229e7f95.20210118...`，GPL）→ 界面 `<旧网卡接口>`，正常拿 IP 并成为默认路由。
+* **停用 AIC（防再次卡死）**：
+  * `/etc/udev/rules.d/60-aic8800.rules` → `.disabled`（原文件备份 `.bak.<ts>`）；
+  * 新增 `/etc/modprobe.d/aic8800-block.conf`：`install aic8800_fdrv /bin/false` +
+    `install aic_load_fw /bin/false`（连显式/autoload 一并挡）；`udevadm control --reload-rules`。
+  * 验证：`modprobe --show-depends aic8800_fdrv` 显示 `install /bin/false`；重启后 `lsmod | grep aic` 应为空。
+* 防御补丁仍留在源码+模块（`59FC3CEF…`），但默认不再加载；原始模块二进制备份 `/tmp/aic8800_fdrv.ko.bak`。
+  回滚：删 `/etc/modprobe.d/aic8800-block.conf`、把 udev 规则改回 `.rules` 即可。
+* **教训**：第三方 out-of-tree USB WiFi 驱动的 disconnect/deinit 一旦**死锁**，`panic_on_oops=0` 兜不住；
+  **换一颗由内核/发行版维护的网卡**（本例 Kylin 自带 `8821cu`）比继续修驱动划算得多。
+
+### 更正 + 收尾（2026-10-10 18:0x）：`KDUMP_SYSCTL` 是无效改法；第三张网卡仍是 RTL8821CU
+
+> **⚠️ 更正上文「处置 1」**：`/etc/default/kdump-tools` 里的 `KDUMP_SYSCTL="kernel.panic_on_oops=0"` **不起作用**。
+> `/usr/sbin/kdump-config` 在最后一步**无条件**把值设回 1（两处：446–449 与 565–568）：
+> ```
+> 446:# Last step: make sure panic_on_oops is enabled
+> 447:PANIC_ON_OOPS=`sysctl kernel.panic_on_oops`
+> 449:    sysctl -w kernel.panic_on_oops=1
+> ```
+> 它只保证"开"，不保证"关"。之前"已确认 `KDUMP_SYSCTL: ...=0`"只说明**配置被读到**，不代表**运行时生效**。
+> 本 boot 实测 `sysctl -n kernel.panic_on_oops` = **1**，坐实了这一点。
+
+**正确做法（已落地，2026-10-10 18:03）**
+* **早**：`/etc/sysctl.d/99-otilink-crashcapture.conf` 增 `kernel.panic_on_oops = 0`。
+* **晚**：新增 `/etc/systemd/system/otilink-panic-on-oops.service`
+  （oneshot + `RemainAfterExit=yes`，`After=kdump-tools.service` / `Wants=kdump-tools.service`，
+  `ExecStart=/bin/sh -c '/sbin/sysctl -w kernel.panic_on_oops=0'`），`systemctl enable --now`。
+* **验证（可复跑）**：`sysctl -w kernel.panic_on_oops=1` → `systemctl restart kdump-tools.service otilink-panic-on-oops.service`
+  → `sysctl -n kernel.panic_on_oops` = **0**；`systemctl show -p After otilink-panic-on-oops.service` 含 `kdump-tools.service`。
+* **代价**：oops 不再触发 kdump vmcore（dmesg / EFI pstore 仍留证）。**回滚**：
+  `systemctl disable --now otilink-panic-on-oops.service` + 删 sysctl.d 里那行。
+* 注意：`panic_on_oops=0` 只挡 **oops→panic**，**挡不住 AIC 的 disconnect/deinit 死锁（hang）** —— 所以 AIC 必须靠
+  `install /bin/false` + udev `.disabled` 彻底挡住，两者缺一不可。
+
+**第三张网卡（2026-10-10 18:0x）**：用户又插了一张 —— 仍是 **Realtek RTL8821CU（USB `0bda:c811`）**，
+同一颗芯片、同一个内核自带驱动 **`rtl8821cu`**（`ethtool -i` 报 `v5.12.0-16-g5229e7f95.20210118_`，firmware `24.8`，
+GPL），界面 `<新网卡接口>`（MAC `<新网卡MAC>`），5GHz ch149 / 80MHz（SSID `<SSID>`），
+`<麒麟热点IP>/24`，唯一默认路由（metric 600），tailscale 正常。
+USB 路径 `1-4.1.4`（**仍挂在两级 Hub 下**，但内核驱动稳定，未见异常）。
+**结论：这张卡可直接用**，与上一张 `<旧网卡接口>` 同级；同时只插一张即可（旧 RTL 现已不在位）。
+
+**netconsole 修好**：`/usr/local/bin/otilink-netconsole-up.sh` 原先**写死** AIC 接口名 `<AIC网卡接口>`
+→ 换卡后每次开机报 `netconsole: <AIC网卡接口> doesn't exist, aborting`。已改为**自动探测**
+默认路由网卡 + 网关 IP/MAC（`ip route show default` + `ip neigh`）。重启服务实测：
+`dev=<新网卡接口> gw=<热点网关IP> mac=<网关MAC>` —— **网关 MAC 与旧记录相同**
+（`NOTES §65.10` 写的就是 `<网关MAC>`），所以 Windows 监听端与防火墙规则都不用改。
+禁用：`systemctl disable --now otilink-netconsole.service`。
+
+**清尾**：删掉 `/etc/default/` 下 `sed -i` 残留的 `sed3iWR3C` / `sedYxumfw` / `sedeDU9q1`
+（内容 = 原始 `kdump-tools`，已 `diff` 确认，安全删除）。
+
+**本 boot 收尾状态（证据）**
+* `uptime` 8 分钟 = 已重启；`lsmod | grep -i aic` = **空** → AIC 三重封堵（blacklist + `install /bin/false` + udev `.disabled`）**持久化生效**。
+* `kernel.panic_on_oops` = **0**（sysctl）；`otilink-panic-on-oops.service` enabled+active；`otilink-netconsole.service` active。
+* 唯一 WiFi 接口 `<新网卡接口>`（RTL8821CU）承载默认路由与 tailscale。
+
+### 附带查明：`ssh 127.0.0.1:2222` 为什么不通 = Windows 热点 relay 里写死了 AIC 的 MAC
+
+用户报"ssh 连接 127.0.0.1:2222 不通"。查明（**与对拷线无关，是换网卡的连带故障**）：
+
+* 开发机 WSL 是 **`mirrored` 网络模式**（`/etc/wsl.conf` 里 `mirrored`），所以 WSL 里的
+  `127.0.0.1:2222` 打到的是 **Windows 侧的监听**。
+* Windows 上跑着常驻 relay：`C:\Users\<你的用户名>\dsh-kylin-relay.ps1`（PowerShell，PID 28016，
+  由 **HKCU Run** 键 `dsh-kylin-relay` 在登录时拉起），监听 `127.0.0.1:2222`，转发到**麒麟热点 IP 的 22**。
+  它靠 Windows 邻居表（ARP）**按 MAC 定位**麒麟当前 IP（热点是 DHCP）。
+* **根因**：脚本里 `$mac = '<AIC网卡MAC>'` —— 这是**AIC 网卡**的 MAC（旧接口名 `<AIC网卡接口>`）；
+  `$fallbackIp = '<麒麟旧热点IP>'` 是 AIC 的旧 IP。我们把 AIC 挡掉、换到新卡
+  （`<新网卡MAC>` @ `<麒麟热点IP>`）后，relay 仍拿 `.187` 去连 → 无人应答 →
+  `$client.Close()` → 客户端看到 **`kex_exchange_identification: read: Connection reset by peer`**。
+  （Windows ARP 里 `.187 8C-3D-...` 和 `.205 40-A5-...` 都是残留的 `Permanent` 静态条目，新卡 `.92` 也在表里，只是脚本不看它。）
+* **修法（已落地 2026-10-10 18:12）**：
+  * `$macList = '<新网卡MAC>,<备用网卡MAC>,<AIC网卡MAC>'`（**新卡在前**，多 MAC 兼容旧卡）；
+  * `$fallbackIp = '<麒麟热点IP>'`；候选按 MAC 顺序逐个尝试（每个 2.5s 超时），最后兜底 fallback IP；
+  * 重启 relay：`relay-stop.ps1`（杀旧进程）→ `cscript //B //NoLogo relay-start.vbs`（隐藏启动）。
+  * 备份：`dsh-kylin-relay.ps1.bak-20261010-181234`（原脚本）。
+* **验证（证据）**：
+  * `netstat -ano | findstr :2222` → 新 PID `35612` LISTENING；
+  * relay 日志 `2026-10-10T18:12:53 listening 127.0.0.1:2222 pid=35612 macs=<新网卡MAC>,... fallback=<麒麟热点IP>`；
+  * `ssh kylin 'hostname'`（config 别名 → `127.0.0.1:2222`）→ `RELAY_OK / kylin-pc`，且看到
+    新网卡 `<新网卡接口> inet <麒麟热点IP>/24`；`ssh kylin-ts 'hostname'`（tailscale）→ `TS_OK / kylin-pc`。
+* **日常建议**：用 `ssh kylin-ts`（tailscale，`<tailscale-IP>`）更稳，relay 坏了也不影响；
+  relay 只是让 **Windows/同热点设备**（不必装 tailscale）也能 `ssh kylin`。换卡后要更新 MAC 见 `RUNBOOK §21`。
+
+**本轮动过的系统对象（副作用 + 回滚）**
+* 麒麟：新增 `/etc/systemd/system/otilink-panic-on-oops.service`（回滚 `systemctl disable --now`）、
+  `/etc/sysctl.d/99-otilink-crashcapture.conf` 加一行、改 `/usr/local/bin/otilink-netconsole-up.sh`、
+  删 `/etc/default/sed*` 残留；**未动** AIC 封堵与对拷线。
+* Windows：改 `C:\Users\<你的用户名>\dsh-kylin-relay.ps1`（备份 `.bak-20261010-181234`），
+  新增 `C:\Users\Public\relay-stop.ps1`（`relay-start.vbs` 原本就有）；重启了 relay 进程。
+
+**tailscale 是"中转"还是"直连"？实测：走 DERP 中转（2026-10-10 18:16）**
+* 本机 `tailscale ping kylin-pc` → `pong ... via DERP(hkg)`，末行 **`direct connection not established`**；
+  Kylin 侧 `tailscale ping <本机>` → `via DERP(nue)`，同样 `direct connection not established`。
+  `tailscale status --json`：本机看到的 peer `CurAddr=`（空）、`Relay=hkg`；Kylin 看到 <本机> `relay "nue"`。
+* **为什么建不起直连**：本机 WSL 的 tailscale 节点只有 `eth1 <WSL内网IP>/24` + `tailscale0`，
+  **没有 `<热点网段>`** —— WSL mirrored 模式**不镜像 Windows 的"移动热点"适配器**，因此看不见
+  麒麟所在的 `<热点网段>`；而两端 `netcheck` 报的公网 IP 都是 `<公网IP>`、`PortMapping:` 为空
+  → 无直连路径，回落到 DERP。（另有 HTTP 代理 `127.0.0.1:7897` 被 tailscale 的 tshttpproxy 用于控制面。）
+* **实测代价**：`ssh <host> true` 各 3 次 —— 经 relay（LAN 直连）**1.7–2.1s**，
+  经 tailscale（DERP hkg/nue，~430ms RTT）**5.3–8.1s**。
+* **结论**：**交互式用 `ssh kylin`（relay）**，tailscale 只在 relay 失效/跨网时兜底。
+* 若想让 tailscale 也直连：在 **Windows 主机**上装/跑 tailscale（它与麒麟同在热点 L2，
+  可建 `<热点网关IP> ↔ <麒麟热点IP>` 直连），或让 WSL 能看到热点网段（bridged 等）。**未实施。**
+
+---
+
+## 72 第 57 轮：现场「麒麟→Windows 复制失败」= `xclip -o` 无超时把 `clip_thread` 永久卡死（2026-10-14）
+
+用户原话：**「对拷线 kylin->windows 复制失败」**。现场方向性极强：**W→L 一直正常，L→W 一条都发不出**，
+拔插（按历史经验）无效。
+
+### 72.1 取证（先定层，别按记忆改代码）
+
+* **Kylin `/tmp/otikm.log`**：最后一条 `CLIP 发送` 停在 `[29696.523]`（= otikm 启动后 ~8h15m ≈ 10-12 17:05），
+  之后 **41 小时没有任何 `CLIP 发送` / `重发` / `放弃`**；而 `CLIP 应用远端`（接收方向）最近仍在 `[78940]`。
+* **Kylin `ps`**：otikm（pid 4030）名下挂着一个**活了 149048 秒（41.4 小时）的**
+  `sh -c xclip -selection clipboard -t text/uri-list -o 2>/dev/null`（pid 1208735）+ 其子 `xclip`（1208736）：
+
+      sh    : wchan=do_wait              （在等 xclip 退出）
+      xclip : wchan=poll_schedule_timeout（在等 X 选区所有者回 SelectionNotify，**永不返回**）
+      otikm 线程 4694: wchan=pipe_wait   （就是它 popen 了这个子进程，阻塞在 read_stream 的管道读上）
+
+* 结论：`clip_thread` 卡在 `popen("xclip … -o")` 的管道里，**再也不读本地剪贴板**
+  → 本地复制的内容永远不会被发出去。RX 是另一条线程，所以 W→L 正常；日志里连「对端在吗/放弃」都没有，
+  因为**根本没走到发送**。卡的是**进程内管道**、不是设备会话，所以「拔插无效」。
+
+### 72.2 真因
+
+`re/otilink/oticlip.c` 里 5 处「读剪贴板」的 `popen("xclip … -o")` **没有任何超时**。
+xclip 是「同步请求器」：当选区所有者不响应、或不提供被请求的目标（这里是 `text/uri-list`）时，
+它会一直等 SelectionNotify —— 于是 `read_stream` 永不返回。
+
+### 72.3 修法（已落地）
+
+新增 `xclip_read_popen()`，把所有**读**路径统一成 `timeout 3 xclip …`
+（`timeout` 不存在时回退旧行为，不引入新硬依赖）。**写**路径（`-i`）不受影响：
+xclip 写完 stdin 即退出，没有这个风险。
+
+### 72.4 验证
+
+* 恢复：先 `kill` 卡死的 `sh`/`xclip`，再按 `AGENTS §4.1` 重启 otikm（确认旧进程没了、新实例唯一）。
+  定向探针（写一段唯一文本进麒麟剪贴板）：Windows 立刻实收、日志出现 `CLIP 发送 17 字节`；反向同样通过。
+* 新二进制部署后：`gate.sh --static` **80 PASS / 0 FAIL**、`--deploy-kylin` **3 PASS**、
+  `coretest` **45/45**；真机 `gate.sh --hw-clip` 见本节末「本轮报告」。
+
+### 72.5 一个必须记住的「假失败」（本轮踩了）
+
+第一次跑 `clipreg.sh` 时**各方向都 FAIL**，但那是**执行环境 PATH 里没有 `powershell.exe`**
+（`./clipreg.sh: line 38: powershell.exe: command not found`）造成的，不是对拷线的问题 ——
+`gate.sh --pre` 的 Windows 侧 5 项 FAIL 同源。**在 DSH 的 `run_code` 里跑这些脚本，必须先
+`export PATH="$PATH:/mnt/c/Windows/System32/WindowsPowerShell/v1.0"`**，否则 Windows 侧判定全部被污染。
+
+### 72.6 副作用 / 回滚
+
+* 只改 `re/otilink/oticlip.c`（+ 麒麟 `~/otilink/` 同步编译并重打 KySec 标签）；回滚 = 还原该文件重部署。
+* 清理过一个卡死 41h 的 `xclip` 探测进程并重启了 otikm（会顺带释放/重抓键鼠，无持久副作用）。
+
+> 一句话给下次：**「某一方向剪贴板彻底不通、日志里连发送都没有」→ 先看 otikm 名下有没有活得很久的
+> `xclip … -o` 子进程（`ps --ppid $(pgrep -x otikm)`）；有就是本 bug，重启 otikm 立即恢复，根治靠
+> `timeout` 包住读路径。**
+
+
+
+
+
+
