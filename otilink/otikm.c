@@ -1318,6 +1318,18 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                （2026-10-27 真机：用户被锁在桌面外，只能 SSH 解锁）。见 L8。 */
             if (a->screen_locked) {
                 say(a, "[warn] 屏幕已锁定/屏保 → 不接管（键盘必须留给锁屏）");
+                /* 2026-11-03 16:15 现场（Windows 解锁后鼠标回 Kylin 无法输入）：
+                   核心在边缘检测里已经把 have_control 置 0；这里只 break 会留下“状态 remote”，
+                   下一轮“驱动期维持独占”看门狗就重新 grab 键盘 → 锁屏密码框收不到键
+                   （日志：`不接管` 与 `已独占` 交替刷屏，键盘始终在 otikm 手里）。
+                   这里把核心拉回本机并释放独占 —— 这是一次**本机→对端**的交接尝试，
+                   不是把对端正在用的一侧抢回来，不违反“锁屏不抢”。 */
+                pthread_mutex_lock(&a->lock);
+                otikm_core_force_local(&a->core);
+                a->core.mx = (int16_t)(a->cfg.screen_w / 2);
+                a->core.my = (int16_t)(a->cfg.screen_h / 2);
+                pthread_mutex_unlock(&a->lock);
+                apply_grab(a, 0);
                 break;
             }
             otihid_kbd_reset(&a->kbd);        /* 新的一段转发，从干净状态开始 */
@@ -1420,6 +1432,13 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
         /* 锁屏/屏保期间绝不接管（同 HID 路径）：密码框必须收得到键 */
         if (a->screen_locked) {
             say(a, "[warn] 屏幕已锁定/屏保 → 不接管（键盘必须留给锁屏）");
+            /* 同 HID 路径：核心已置 remote，必须拉回本机并释放独占，否则看门狗会重新 grab。 */
+            pthread_mutex_lock(&a->lock);
+            otikm_core_force_local(&a->core);
+            a->core.mx = (int16_t)(a->cfg.screen_w / 2);
+            a->core.my = (int16_t)(a->cfg.screen_h / 2);
+            pthread_mutex_unlock(&a->lock);
+            apply_grab(a, 0);
             break;
         }
         /* W4：对端静默时不交出去（同 HID 路径） */

@@ -64,6 +64,9 @@
 > coretest 51/51、selftest_proto 新增 CURSOR 全过；`--static` 仅剩工作树布局导致的
 > `re/` 路径检查失败（与本次无关）。**仓库已顺带同步现网 10-27 的锁屏看护/sim 修正/return_inset 96**
 > （公开 HEAD 10-14 落后于现网），详见 `NOTES §73`。
+> **回归修复（16:15 现场）**：锁屏拒绝交接后核心仍 remote → 看门狗重 grab 键盘 → 锁屏无法输入；
+> 两个 `screen_locked` 守卫已改为 `force_local + apply_grab(0)`（真 remote 会话锁屏仍不抢），
+> 现场日志 `已独占` 计数 0，详见 `NOTES §73.8`。
 >
 > **第 53 轮（现场，2026-10-09）**：一次收敛四条独立真因 —— ①设置窗口闪烁=`ukui-control-center` 重绘循环（与对拷线无关）；
 > ②Kylin 键盘输入不了 + 「回本机→3s 又抓走」乒乓=`hotkey_to_local/remote` 撞 IDEA 的 Ctrl+Alt+←/→（已关成 `none`）；

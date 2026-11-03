@@ -4805,3 +4805,28 @@ Windows 光标在回程时 = **2559**（右边缘；归一化 4479），再推 8
   `windows/otiagent.ps1` 后按同一路径重编译/重部署；协议新增 type=11 旧端会忽略，不致命。
 * 未验证：Windows 代理**停掉**时的回退路径（理论上退回旧计数判据；本次用 sim 的无回传路径
   `kmbret` 覆盖）；多显示器不同 DPI 下的归一化（本机 4480x1440 已验证坐标=3236/4479）。
+
+### 73.8 回归修复（2026-11-03 16:15 现场）：「Windows 解锁后鼠标回 Kylin 无法输入」= 锁屏拒绝交接后核心仍 remote，看门狗重新 grab 键盘
+
+**报障原话**（用户）：「windows刚解锁，鼠标移到kylin无法输入」。
+
+**现场**：`/tmp/otikm.log` 每秒交替出现
+```
+[warn] 屏幕已锁定/屏保 → 不接管（键盘必须留给锁屏）
+已独占 SIGMACHIP USB Keyboard（驱动侧，避免本地与远端双重输入）
+```
+Kylin 锁屏对话框（`ukui-screensaver-dialog --lock`）在位，键盘一直被 otikm grab → 密码框收不到键。
+
+**真因**：`otikm_core_local_mouse()` 的撞边检测**先**把 `have_control` 置 0，`handle_local()` 的
+`screen_locked` 守卫**后**才拒绝并只 `break` → 核心留在 remote；`run_capture()` 的
+“驱动期维持独占”（`drv = !have_control`）每 500ms 重新 `apply_grab(1)`。上一版按“不抢”删掉锁屏时的
+`force_local + apply_grab(0)` 后，没有别处回滚这次**本机→对端**的失败交接。
+
+**修法**：两个 `screen_locked` 守卫（HID 路径 + 协议路径）拒绝时：
+`otikm_core_force_local()` + `apply_grab(0)` + `mx/my` 回屏幕中心。
+这是本机发起的交接尝试被拒绝，不是抢回对端正用的一侧，符合“锁屏不抢”。锁屏瞬间对**真正 remote**
+的会话仍不 `force_local`（保留用户“不抢”语义）。
+
+**现场处置 / 验证**：先 `pkill -x otikm` 释放键盘让用户输入密码；部署修复版后日志只有
+`屏幕已锁定/屏保 → 不抢控制权（保持当前所在侧；仅拒绝再交出去）`，`已独占` 计数 = 0；
+`coretest` 51/51。后续用户解锁后确认键盘可输入。
