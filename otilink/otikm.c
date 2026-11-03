@@ -1314,24 +1314,11 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                 say(a, "[warn] 角色未确认为 master（对端尚未让位）→ 暂不接管（I1）");
                 break;
             }
-            /* 锁屏/屏保期间绝不接管：键盘一被独占，锁屏密码框就从内核层收不到键
-               （2026-10-27 真机：用户被锁在桌面外，只能 SSH 解锁）。见 L8。 */
-            if (a->screen_locked) {
-                say(a, "[warn] 屏幕已锁定/屏保 → 不接管（键盘必须留给锁屏）");
-                /* 2026-11-03 16:15 现场（Windows 解锁后鼠标回 Kylin 无法输入）：
-                   核心在边缘检测里已经把 have_control 置 0；这里只 break 会留下“状态 remote”，
-                   下一轮“驱动期维持独占”看门狗就重新 grab 键盘 → 锁屏密码框收不到键
-                   （日志：`不接管` 与 `已独占` 交替刷屏，键盘始终在 otikm 手里）。
-                   这里把核心拉回本机并释放独占 —— 这是一次**本机→对端**的交接尝试，
-                   不是把对端正在用的一侧抢回来，不违反“锁屏不抢”。 */
-                pthread_mutex_lock(&a->lock);
-                otikm_core_force_local(&a->core);
-                a->core.mx = (int16_t)(a->cfg.screen_w / 2);
-                a->core.my = (int16_t)(a->cfg.screen_h / 2);
-                pthread_mutex_unlock(&a->lock);
-                apply_grab(a, 0);
-                break;
-            }
+            /* 2026-11-03 用户现场：Kylin 锁屏后鼠标要能主动推到 Windows。
+               锁屏期间**不再拒绝本机→对端的交接**（旧守卫会把用户困在锁屏上）。
+               “不抢”仍然成立：锁屏**瞬间**不会 force_local 把对端正在用的一侧拉回来；
+               用户主动推边交出去后，键盘会随交接独占（这是用户明确要的动作），
+               要回麒麟照常走回程手势，回程会释放独占。 */
             otihid_kbd_reset(&a->kbd);        /* 新的一段转发，从干净状态开始 */
             /* 告诉对端"我接管了，你回到被动"：只有对端是**厂商/零软件端**时才需要 F24 令牌。
                对端跑我们的 agent 时它不驱动 KM，令牌纯属浪费 —— 而且真机实测线缆的键盘接口
@@ -1429,18 +1416,8 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
         }
         break;
     case OTI_ACT_SWITCH_TO_REMOTE:
-        /* 锁屏/屏保期间绝不接管（同 HID 路径）：密码框必须收得到键 */
-        if (a->screen_locked) {
-            say(a, "[warn] 屏幕已锁定/屏保 → 不接管（键盘必须留给锁屏）");
-            /* 同 HID 路径：核心已置 remote，必须拉回本机并释放独占，否则看门狗会重新 grab。 */
-            pthread_mutex_lock(&a->lock);
-            otikm_core_force_local(&a->core);
-            a->core.mx = (int16_t)(a->cfg.screen_w / 2);
-            a->core.my = (int16_t)(a->cfg.screen_h / 2);
-            pthread_mutex_unlock(&a->lock);
-            apply_grab(a, 0);
-            break;
-        }
+        /* 锁屏期间允许主动推到对端（同 HID 路径，2026-11-03 用户现场）；
+           “不抢”只表示锁屏瞬间不 force_local 拉回对端正用的一侧。 */
         /* W4：对端静默时不交出去（同 HID 路径） */
         if (peer_is_silent(a)) {
             say(a, "[warn] 对端已 %ldms 没有任何消息 → 不交出去（W4）", now_ms() - a->per_ms);
