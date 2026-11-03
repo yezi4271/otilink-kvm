@@ -430,6 +430,10 @@ public static class Oti
     // 整个虚拟桌面（所有显示器）的尺寸；绝对坐标模式用它，才能到达副屏。
     public static int VirtW() { return GetSystemMetrics(SM_CXVIRTUALSCREEN); }
     public static int VirtH() { return GetSystemMetrics(SM_CYVIRTUALSCREEN); }
+    // 虚拟桌面左上角（副屏在主屏左侧/上方时是负数）。回传光标时要减去它，
+    // 归一化到 0..VirtW-1，远端主控端才能直接用 rem_w/rem_h 和边缘比较。
+    public static int VirtX() { return GetSystemMetrics(SM_XVIRTUALSCREEN); }
+    public static int VirtY() { return GetSystemMetrics(SM_YVIRTUALSCREEN); }
 
     // x,y 是"对端屏幕"（主显示器）坐标系下的像素位置；MOUSEEVENTF_ABSOLUTE 用的是
     // 整个虚拟桌面并归一化到 0..65535，所以这里要按虚拟桌面换算。
@@ -1917,6 +1921,7 @@ $script:quit = $false
 
 $script:peerW = 0; $script:peerH = 0
 $lastHello = [DateTime]::MinValue
+$lastCursorTx = [DateTime]::MinValue
 function Send-Hello {
     # 把本机屏幕几何告诉对端：主控端据此把指针位置换算到本机坐标系
     $pl = New-Object byte[] 4
@@ -1934,6 +1939,28 @@ function Send-Hello {
         [void](TxBody $body)
         [void](TxBody $mbody)
     }
+}
+
+# 回传本机光标真实位置（OTI_MSG_CURSOR=11）：麒麟侧（主控）用它判断
+# “回程手势是否真的到了屏幕边缘”。为什么需要：HID 鼠标只有相对计数，而 Windows 的
+# “提高指针精确度”会让净计数与像素位置漂移 —— 真机实测：快左移 + 慢右移后净计数 +100，
+# 光标却还离右边缘 1068px，于是提前回程（用户报障“没到边就到 kylin”）。
+# 坐标归一化到虚拟桌面左上角（减 SM_X/YVIRTUALSCREEN），与 HELLO 的 VirtW/H 同系。
+function Send-Cursor {
+    $p = New-Object Oti+POINT
+    if (-not [Oti]::GetCursorPos([ref]$p)) { return }
+    $x = $p.X - [Oti]::VirtX()
+    $y = $p.Y - [Oti]::VirtY()
+    if ($x -lt 0) { $x = 0 } elseif ($x -gt 32767) { $x = 32767 }
+    if ($y -lt 0) { $y = 0 } elseif ($y -gt 32767) { $y = 32767 }
+    $pl = New-Object byte[] 8
+    [BitConverter]::GetBytes([int16]$x).CopyTo($pl, 0)
+    [BitConverter]::GetBytes([int16]$y).CopyTo($pl, 2)
+    # 带上虚拟桌面尺寸：不依赖 HELLO 的 10s 节奏，otikm 刚重启后的第一次交接也能立刻判边。
+    [BitConverter]::GetBytes([uint16][Oti]::VirtW()).CopyTo($pl, 4)
+    [BitConverter]::GetBytes([uint16][Oti]::VirtH()).CopyTo($pl, 6)
+    $body = [Oti]::Encode(11, 0, $pl, 8)
+    if ($useCable) { $script:txq.Enqueue($body) } else { [void](TxBody $body) }
 }
 
 # ============================ 角色协商（OTI_MSG_ROLE=10）============================
@@ -2786,6 +2813,13 @@ while ($true) {
     if (((Get-Date) - $lastHello).TotalSeconds -ge 10) {
         $lastHello = Get-Date
         Send-Hello
+    }
+
+    # 0.1) 回传本机光标真实位置（2026-11-03）。目标周期 <=1s；cable 模式主循环
+    #      受取帧阻塞影响约 1.3s/轮，所以实际约 1.3s 一条（麒麟侧 TTL 2.5s）。
+    if (((Get-Date) - $lastCursorTx).TotalMilliseconds -ge 500) {
+        $lastCursorTx = Get-Date
+        Send-Cursor
     }
 
     # 0.6) 角色协商：本机输入探测（每 3s）/ 决策与起停 otiagent2（每 1s，I1/I4/L4）

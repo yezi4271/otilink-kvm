@@ -276,6 +276,29 @@ int oti_decode_hello(const uint8_t *payload, uint32_t len, oti_hello_evt *out)
     return 0;
 }
 
+size_t oti_encode_cursor(uint32_t seq, const oti_cursor_evt *e, uint8_t *out, size_t cap)
+{
+    uint8_t pl[8];
+    int16_t x = e->x, y = e->y;
+    uint16_t w = e->w, h = e->h;
+    memcpy(pl + 0, &x, 2);
+    memcpy(pl + 2, &y, 2);
+    memcpy(pl + 4, &w, 2);
+    memcpy(pl + 6, &h, 2);
+    return oti_encode(OTI_MSG_CURSOR, 0, seq, pl, sizeof(pl), out, cap);
+}
+
+int oti_decode_cursor(const uint8_t *payload, uint32_t len, oti_cursor_evt *out)
+{
+    if (len < 8)
+        return -1;
+    memcpy(&out->x, payload + 0, 2);
+    memcpy(&out->y, payload + 2, 2);
+    memcpy(&out->w, payload + 4, 2);
+    memcpy(&out->h, payload + 6, 2);
+    return 0;
+}
+
 size_t oti_encode_mouse_mode(uint32_t seq, uint8_t mode, uint8_t *out, size_t cap)
 {
     return oti_encode(OTI_MSG_MOUSE_MODE, 0, seq, &mode, 1, out, cap);

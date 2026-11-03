@@ -12,4 +12,10 @@ const char *otix11_status(void);
    —— 换一台机器（2560x1440 / 1366x768 / 笔记本内屏）判据就偏了。
    返回 0 成功（w/h 出参已填），-1 失败（没有可用 X 显示）。 */
 int otix11_screen(int *w, int *h);
+/* 锁屏/屏保是否在前台：1=是，0=否，-1=判断不了（没有 X / 缺符号）。
+   用途（2026-10-27 真机事故）：otikm 独占键盘时，**锁屏密码框从内核层就收不到按键**
+   （键被转成 HID 发给对端）→ 用户被锁在自己的桌面外面。锁屏期间必须让出键盘。
+   判据 = 输入焦点窗口（向上找到顶层）的 WM_CLASS 含 screensaver / lock-screen，
+   只认 WM_CLASS 不认标题（避免把 lock.txt 这类普通窗口误判成锁屏）。 */
+int otix11_lock_screen_active(void);
 #endif

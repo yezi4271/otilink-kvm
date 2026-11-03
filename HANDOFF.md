@@ -54,6 +54,17 @@
 > 读路径统一 `timeout 3 xclip …`；重启 otikm 后双向恢复，`--static` 80 PASS、`coretest` 45/45。
 > 详见 `NOTES §72`。
 >
+> **第 58 轮（现场，2026-11-03）**：用户报「鼠标在 Windows 时右移没到边就回 Kylin」。
+> 真因 = 回程判据只看**未缩放 HID 计数**，而 Windows 指针加速让净计数与像素漂移
+> （实测：park 到 2559 后快左移 500 计数、慢右移 608 计数，净 +100 触发回程时 Windows 光标
+> 只有 **1491**，离右边缘 **1068px**）。修法 = Windows 剪贴板代理回传真实光标
+> （新增 `OTI_MSG_CURSOR=11`，PROTOCOL §6.2），主控端要求“回传确认在入口边 + 再外推 8 计数”
+> 才回程；无回传/过期退回旧计数判据。同轮按用户指令把锁屏看护改成**不抢控制权**
+> （只拒绝再交出去）。真机正向验证回程时 Windows 光标 = 2559、负向停在 1499 不回。
+> coretest 51/51、selftest_proto 新增 CURSOR 全过；`--static` 仅剩工作树布局导致的
+> `re/` 路径检查失败（与本次无关）。**仓库已顺带同步现网 10-27 的锁屏看护/sim 修正/return_inset 96**
+> （公开 HEAD 10-14 落后于现网），详见 `NOTES §73`。
+>
 > **第 53 轮（现场，2026-10-09）**：一次收敛四条独立真因 —— ①设置窗口闪烁=`ukui-control-center` 重绘循环（与对拷线无关）；
 > ②Kylin 键盘输入不了 + 「回本机→3s 又抓走」乒乓=`hotkey_to_local/remote` 撞 IDEA 的 Ctrl+Alt+←/→（已关成 `none`）；
 > ③IDEA 仍无反应=`ukui-kwin` 的 `kglobalshortcutsrc`（`...Left 1`/`...Right 1`）也占着这两个键

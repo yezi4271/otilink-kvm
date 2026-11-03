@@ -19,6 +19,13 @@
 
 #include "otiproto.h"
 
+/* 对端光标回传（OTI_MSG_CURSOR）的新鲜度窗口：Windows 剪贴板代理的主循环
+   约 1.3s/轮（取帧阻塞），2.5s 内仍算新鲜；超时退回旧的计数判据，
+   兼容没回传 / 旧版 Windows agent。 */
+#define OTI_REM_CURSOR_TTL_MS 2500
+/* 回传确认"在入口边"之后，还要再往外推多少计数才回程（防抖/防误触）。 */
+#define OTI_REM_CURSOR_PUSH   8
+
 typedef enum {
     OTI_ACT_LOCAL = 0,          /* 本地消费（不发送） */
     OTI_ACT_TO_REMOTE,          /* 转发给对端 */
@@ -90,6 +97,16 @@ typedef struct {
        未缩放的计数正好是**我们真发给对端的 HID 位移**：推出去多少、推回来多少，
        与远端几何无关，也不会被整数截断吃掉对称性（coretest 1d 回归）。 */
     int      drv_x, drv_y;
+    /* 对端光标的**真实**位置（2026-11-03，OTI_MSG_CURSOR 回传）：
+       HID 路径只有相对计数；Windows 的“提高指针精确度”会让净计数与像素位置漂移
+       （真机实测：快左移 + 慢右移后净计数 +100，Windows 光标却还离右边缘 1068px）。
+       有回传时用它判回程；超过 OTI_REM_CURSOR_TTL_MS 没更新则退回 drv_* 计数判据。 */
+    int      rem_cur_x, rem_cur_y;   /* 已归一化到远端虚拟桌面左上角：0..w-1 */
+    int      rem_cur_w, rem_cur_h;   /* 回传自带的虚拟桌面尺寸（不依赖 HELLO 的 10s 节奏） */
+    long     rem_cur_ms;             /* 收到回传的时刻（本地单调毫秒） */
+    int      rem_cur_valid;
+    long     rem_cur_anchor_ms;      /* 最近一次“回传确认在入口边”的时刻（用于重锚 drv_*） */
+    long     now_ms;                 /* 本次事件时刻，由调用方（handle_local/coretest）写入 */
     int      edge_px;          /* 触边阈值（像素/单位位移） */
     int16_t  mx, my;           /* 本地指针位置（本地控制时跟踪） */
     uint16_t hotkey_code;      /* 抢回控制权的 evdev 键码，0 = 关闭 */
@@ -112,6 +129,11 @@ const char *otikm_hotkey_name(const otikm_hotkey *hk, char *buf, size_t cap);
 void otikm_core_set_hotkey(otikm_core *c, uint16_t code, int only_hotkey);
 /* 对端上报屏幕几何（0 表示未知，忽略） */
 void otikm_core_set_remote_screen(otikm_core *c, int w, int h);
+/* 对端回传的真实光标位置（已归一化到远端虚拟桌面：0..rem_w-1）。
+   now 用本地单调毫秒；超过 TTL 后自动退回计数判据。 */
+void otikm_core_set_remote_cursor(otikm_core *c, int x, int y, int w, int h, long now);
+/* 写入本次鼠标事件的时刻（handle_local 每次调用前设置；coretest 直接写 c->now_ms 也可） */
+void otikm_core_set_now(otikm_core *c, long now);
 
 /* 本地鼠标事件 → 动作；发生切换时填 sw */
 otikm_act otikm_core_local_mouse(otikm_core *c, const oti_mouse_evt *m, oti_switch_evt *sw);
