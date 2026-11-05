@@ -53,6 +53,15 @@
 > **欠账**：① 真人复测（推到 Windows 打字，看是否还重复）；② `re/portable/build.sh` 重建
 > `dist/`（`--portable` 现在 2 FAIL：包内指纹过期，与本次修复无关）；③ §61.3 键盘改走帧管道（根治丢包）。
 >
+> **第 60 轮（现场，2026-11-05，PR 待并）**：用户报「鼠标在 Windows 一卡一卡，Kylin 正常」。
+> 拓扑 B：G304 1000Hz × REL_X/REL_Y 两事件 ≈ **2000 次 HID 设备写/秒**，而线缆单队列实测上限
+> ~**1078 次/秒**（hidrate，与 otikm 并发；空载 maxsend=1ms）→ 捕获线程积压/evdev 丢事件。
+> 修法：`otikm.c` HID 直发也按 **4ms 合并**（按键变化立即发、poll 超时补尾包、交接清空），
+> 设备写降到 ≤250/秒。已部署（static 81 PASS、coretest 51/51、deploy-kylin PASS）。
+> **待办**：真人复测手感（sim 手势串行，复现不出积压）；若仍卡，下一刀查剪贴板大帧堵 HID
+> （`--hw-lat` 在 653KB 图片同步期间 MAXGAP=319~502ms）与 Windows 代理主循环 90% CPU/秒级慢轮。
+> 详见 `NOTES §75`。
+>
 > **第 57 轮（现场，2026-10-14）**：用户报「kylin→Windows 复制失败」。真因 = `oticlip.c` 的
 > `popen("xclip … -o")` **无超时**，遇到不响应的选区所有者时 `clip_thread` 被**永久卡死**
 > （现场一个 `xclip -t text/uri-list -o` 子进程活了 41 小时）→ 本地剪贴板再也不被读取 →

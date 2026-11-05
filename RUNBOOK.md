@@ -1095,6 +1095,7 @@ powershell.exe -NoProfile -Command 'Get-Content C:\Users\Public\km.log  -Tail 20
 | | ⑤ 键盘被独占但键送不出去（"死了"，本机也打不了） | 日志有 `已独占 <键盘>` 但 Windows 收不到、本机也收不到 | `NOTES §61`（根治看 §61.3） |
 | **「两机同时打字」（双重输入）** | 判据挂错通道 → 纯键盘没独占 | `grep -a "已独占\|键盘不独占" /tmp/otikm.log`：要看到 **`已独占 <你的键盘>`**；独立探针应 EBUSY(16) | `NOTES §63`、`§18.1`、`gate.sh --hw-kbdexcl` |
 | **「键鼠过几秒卡一下」** | 保活 dummy 帧（64KB）堵住单队列设备 ~1.3s | `gate.sh --hw-lat`：`MAXGAP` 必须 ≤200ms | `NOTES §61.1` |
+| **「鼠标在 Windows 移动一卡一卡，Kylin 正常」** | ① HID 直发逐事件写：1000Hz×2 轴≈2000 写/秒 > 线缆 ~1078/秒 → 捕获积压/evdev 丢事件；② 剪贴板/大帧在单队列上堵 HID（300~500ms 停顿） | 看 `/tmp/otikm.log` 是否 `HID 模式：指针交给对端`；`grep -a "CLIP 发送\|CLIP 应用远端"` 同一时段有没有大帧；`hidrate`（与 otikm 并发）的 rate/maxsend | `NOTES §75`、`§61.1` |
 | **「剪贴板单向／双向不通」** | ① Windows 剪贴板代理没跑（重启后最常见） | 查进程：`Get-CimInstance Win32_Process \| ? { $_.CommandLine -like '*otiagent.ps1*' }` 为空 → `deploy.sh --restart` | `§18.2` |
 | | ② 设备侧会话卡死（用久了/拔插无效） | 麒麟 `重发 3 次仍无确认…放弃` + `clip.log` `设备连续读取失败，尝试重连` | `§15.13.7` |
 | | ③ 厂商 XML 通知抢发送授权 | 麒麟日志 `已通知厂商端交还控制权` 每 1.5 秒刷屏 | `NOTES §49` |

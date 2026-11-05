@@ -4883,3 +4883,69 @@ PANIC: SOS rescue timeout! No feedback from userspace.
 * 用户实际按键路径未复现（无法确认他按的就是 Win+H；但内核日志明确是 LEFTMETA+H，且这是 kysos_key 唯一认的组合）。
 * 是否还有其它 SOS 触发源（内核串里只有 LEFTMETA+H 一个）。
 * `gate.sh --hw-sos` 首跑：envcheck PASS=23 FAIL=0 WARN=2、sosreg PASS=9 FAIL=0（2026-11-05 10:36，现网）。
+
+## 75 第 60 轮：现场「鼠标在 Windows 移动一卡一卡，Kylin 正常」= HID 直发逐事件写单队列设备（2026-11-05）
+
+**报障**（2026-11-05 17:38）：用户在 Windows 桌面上移动鼠标"一卡一卡"，同一只鼠标在 Kylin 上正常。
+拓扑是 **B**（物理键鼠插在 Kylin）：`otikm --auto` 日志里有 `已独占 Logitech G304（驱动侧…）`、
+`HID 模式：指针交给对端`，Windows 侧只跑剪贴板代理、键鼠零软件，所以 Windows 上的移动完全由
+麒麟侧的 **HID 直发**（每事件一条 16 字节 CDB）驱动。
+
+### 75.1 取证：需求 2000 次设备写/秒，而线缆单队列上限约 1078 次/秒
+
+* G304 是 **1000Hz** 鼠标；evdev 把一次物理报告拆成 `REL_X`、`REL_Y` 两个事件，`handle_local()`
+  对**每个事件**各调一次 `otilink_send_hid()` → 斜向移动约 **2000 次 SCSI 写/秒**（直线也 1000/秒）。
+* 真机实测（`/tmp/hidrate`，与在跑的 otikm **并发**，1500~2000 包，2026-11-05 17:47/18:04）：
+  ```
+  N=1500 elapsed=1392ms rate=1078/s maxsend=1ms fails=0   ← 空载、无大帧时
+  N=2000 elapsed=1842ms rate=1086/s maxsend=209ms fails=0
+  ```
+  即这条单队列设备在"otikm 的 RX 泵同时在轮询"时只有 **~1.0–1.1k 次写/秒** 的吞吐。
+  需求 2k/秒 > 上限 ⇒ 捕获线程永远追不上，内核 evdev 环形缓冲（64 事件）几十毫秒就溢出丢事件，
+  用户看到的正是"一卡一卡"；麒麟本地是原生指针，不经过这条设备，所以正常。
+* 同一时间窗还量到：只要链路上有大帧（剪贴板 653KB 图片重发/回传）或 Windows 侧帧操作，
+  `maxsend` 会到 **300–500ms**（`gate.sh --hw-lat` 在剪贴板大图同步期间 MAXGAP=319~502ms）——
+  这是 NOTES §61.1 记的"大块设备写堵 HID"，与本节是叠加关系，不是同一个修法。
+
+### 75.2 修法：HID 直发也按 4ms 合并位移
+
+`otilink/otikm.c` 的 HID 分支（`peer_hid` 且 `driving_now`）原来是逐事件直接写：
+
+```
+otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otilink_send_hid()
+```
+
+改成与协议路径 `pend_*` 相同的策略：
+
+* 累积 `hid_pend_dx/dy/wheel/buttons`，**每 4ms 或按键变化**时用 `hid_flush_mouse()` 发**一条**包；
+  一条包同时带 X/Y（也避免 Windows 对两个单轴包分别做指针加速）；
+* `poll(pf, 4ms)` 超时也 flush 尾包（`run_capture` 的 `pr == 0` 分支），保证最后一段位移不滞留；
+* 交接（SWITCH_TO_REMOTE / SWITCH_TO_LOCAL）时清空合并缓冲，避免把上一段的位移当"幽灵位移"
+  发给对端；`hid_flush_mouse()` 在锁外发送前用 `a->lock` 读一次 `have_control`，已收回本机就丢弃。
+
+效果：正常 1000Hz 鼠标的设备写从 **~2000 次/秒降到 ≤250 次/秒**（4ms 一包），
+为剪贴板/看门狗等大帧留出单队列余量。
+
+### 75.3 验证与未完成
+
+* 本地：`make otikm` 无错；`coretest` **51/51**；`gate.sh --static` **81 PASS / 0 FAIL**；
+  `gate.sh --deploy-kylin` PASS（麒麟侧编译 + KySec 标签重打）；部署后 otikm 恰好 1 个实例。
+* HID 方向独立探针（不经过 otikm）：`hidmove 40 10` → 返回 `fails=0`，Windows 光标从 -266 移到 566
+  （+832px，含 Windows 指针加速）—— 证明线缆 HID 鼠标通道本身是通的。
+* **`gate.sh --hw-lat` 未通过（MAXGAP 319ms）**，但两次失败都发生在**剪贴板大图正在同步/回传**
+  （otikm 日志同一时段有 `CLIP 发送 653143 字节` / `CLIP 应用远端剪贴板 653143 字节`）或
+  **用户正在真实移动鼠标**时；空载 hidrate 的 `maxsend=1ms`。这属于 §61.1 的大帧堵 HID，
+  不能算本次合并的回归，但也不能当作"卡顿已根治"的证据。
+* **未完成（关键）**：`--sim-input` 的合成手势是**串行**的（`run_sleep(1ms)` → 处理 → 下一条），
+  模拟不出"内核独立 1000Hz 到达、处理线程追不上"的积压；旧/新二进制在同一手势下都只送出 143 个包
+  （被剪贴板大帧堵住），A/B 不可判定。**真人复测**（鼠标在 Windows 上连续移动是否还卡）仍是最终判据。
+* 独立问题（不在本次改动内）：Windows 侧剪贴板代理主循环约 90% 单核 CPU、日志里有
+  `LOOP 慢轮…C[取帧] 1.3–3.9s`；`usb-storage` 仍有一个 D 态线程自开机挂住。若真人复测仍卡，
+  下一刀先查这两处与 §61.1 的大帧互斥。
+
+### 75.4 副作用 / 回滚
+
+* 只改 `otilink/otikm.c`；部署方式 `gate.sh --deploy-kylin` + 重启 otikm（已做，当前 1 个实例）。
+* 回滚：`git revert` 本提交 → `gate.sh --deploy-kylin` → 重启 otikm。
+* 现场临时文件：Kylin `/tmp/otikm-old`、`/tmp/merge-gesture.txt`、`/tmp/merge-*.log`、`/tmp/hidrate`、
+  `/tmp/hidmove`（调试用，可删）；Windows 剪贴板代理重启过一次（`restart-clip.vbs`，单实例守卫正常）。

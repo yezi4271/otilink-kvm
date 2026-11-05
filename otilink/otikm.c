@@ -132,6 +132,15 @@ struct app {
     int   pend_dx, pend_dy, pend_wheel, pend_buttons;
     int   pend_abs_x, pend_abs_y, pend_dirty, sent_buttons;
     long  last_mouse_tx_ms;
+    /* HID 直发（拓扑 B）的鼠标位移合并。每个 evdev 事件都发一次 SCSI 写：
+       G304 是 1000Hz，且 REL_X / REL_Y 是两个独立事件 → 2000 次设备写/秒，
+       而实测线缆 HID 写上限约 1000 次/秒（hidrate：956~1086/s，偶发 200~340ms
+       的大停顿）→ 捕获线程积压、evdev 环形缓冲溢出 → 用户看到"在 Windows 上
+       移动一卡一卡"（麒麟本地是原生指针，所以正常）。
+       按 4ms 合并（与协议路径 pend_* 的间隔一致）；按键变化立即发。 */
+    int   hid_pend_dx, hid_pend_dy, hid_pend_wheel, hid_pend_buttons;
+    int   hid_pend_dirty, hid_sent_buttons;
+    long  hid_flush_ms;               /* 上次真正发 HID 鼠标包的时刻 */
     int abs_last_x, abs_last_y, abs_have;  /* 收到绝对坐标时换算相对位移用 */
     long hello_last_ms;               /* 上次发 HELLO 的时间 */
     struct oti_clip clip;
@@ -779,6 +788,45 @@ static void flush_mouse(struct app *a)
     a->last_mouse_tx_ms = now_ms();
 }
 
+/* HID 直发模式的鼠标合并发送（与 flush_mouse 的区别：载体是**设备 HID 包**，
+   不是协议帧）。为什么必须合并：见 struct 里 hid_pend_* 的注释 ——
+   逐个 evdev 事件写设备会把线缆单队列打满，输入线程追不上 1000Hz 鼠标。
+   ⚠️ 只在"仍在对端驱动中"时发：交接/看门狗可能已经把控制权收回，
+   这时发出去的就是"幽灵位移"（对端光标乱跳）。 */
+static void hid_flush_mouse(struct app *a)
+{
+    if (!a->hid_pend_dirty)
+        return;
+    a->hid_pend_dirty = 0;
+    int dx = a->hid_pend_dx, dy = a->hid_pend_dy, wheel = a->hid_pend_wheel;
+    int buttons = a->hid_pend_buttons;
+    a->hid_pend_dx = a->hid_pend_dy = a->hid_pend_wheel = 0;
+    a->hid_sent_buttons = buttons;
+    a->hid_flush_ms = now_ms();
+    pthread_mutex_lock(&a->lock);
+    int local_now = a->core.have_control;
+    pthread_mutex_unlock(&a->lock);
+    if (local_now)
+        return;                            /* 已经回到本机：丢弃这段位移 */
+    struct otilink_dev *cd = oti_tr_cable_dev(a->tx);
+    if (!cd)
+        return;
+    /* 描述符每轴只有 1 字节有符号 → 大位移必须拆成多包 */
+    uint8_t pk[8 * OTI_HID_PKT_LEN];
+    int np = otihid_mouse_packets(buttons, dx, dy, wheel, pk, 8);
+    for (int i = 0; i < np; i++) {
+        int hrc = otilink_send_hid(cd, OTI_HID_TYPE_MOUSE, pk + i * OTI_HID_PKT_LEN);
+        note_send_result(a, hrc);
+        if (hrc == 0) {
+            a->n_hid++;
+            a->hid_fail_streak = 0;
+            a->hid_last_ok_ms = now_ms();
+        } else {
+            a->hid_fail_streak++;
+        }
+    }
+}
+
 /*
  * 把控制权交还给"厂商 Windows 端"。
  * 实测：Windows→麒麟 的转发是**厂商程序**做的（我们自己的 agent 日志显示一个包都没发），
@@ -1261,20 +1309,17 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                         }
                     }
                 }
-                /* 描述符每轴只有 1 字节有符号 → 大位移必须拆成多包 */
-                uint8_t pk[8 * OTI_HID_PKT_LEN];
-                int np = otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8);
-                for (int i = 0; i < np; i++) {
-                    int hrc = otilink_send_hid(cd, OTI_HID_TYPE_MOUSE, pk + i * OTI_HID_PKT_LEN);
-                    note_send_result(a, hrc);
-                    if (hrc == 0) {
-                        a->n_hid++;
-                        a->hid_fail_streak = 0;
-                        a->hid_last_ok_ms = now_ms();
-                    } else {
-                        a->hid_fail_streak++;
-                    }
-                }
+                /* 合并位移后再写设备：HID 鼠标只有相对位移，4ms 内把 REL_X/REL_Y
+                   （以及按钮/滚轮）合成**一条**包；否则 1000Hz 鼠标每轴一个事件，
+                   每秒 2000 次设备写会把单队列打满（见 struct 里 hid_pend_*）。 */
+                a->hid_pend_dx += m->dx;
+                a->hid_pend_dy += m->dy;
+                a->hid_pend_wheel += m->wheel;
+                a->hid_pend_buttons = m->buttons;
+                a->hid_pend_dirty = 1;
+                if (m->buttons != a->hid_sent_buttons ||
+                    now_ms() - a->hid_flush_ms >= 4)
+                    hid_flush_mouse(a);
             } else {
                 send_key_frame(a, cd, k->code, k->value);
             }
@@ -1320,6 +1365,11 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                用户主动推边交出去后，键盘会随交接独占（这是用户明确要的动作），
                要回麒麟照常走回程手势，回程会释放独占。 */
             otihid_kbd_reset(&a->kbd);        /* 新的一段转发，从干净状态开始 */
+            /* 上一段驱动里没来得及发的合并位移不能算到这一段（否则一切过去就跳一下） */
+            a->hid_pend_dirty = 0;
+            a->hid_pend_dx = a->hid_pend_dy = a->hid_pend_wheel = 0;
+            a->hid_sent_buttons = a->mouse_buttons;
+            a->hid_flush_ms = now_ms();
             /* 告诉对端"我接管了，你回到被动"：只有对端是**厂商/零软件端**时才需要 F24 令牌。
                对端跑我们的 agent 时它不驱动 KM，令牌纯属浪费 —— 而且真机实测线缆的键盘接口
                每个会话只送得动**几条**报表，这 6 条 F24 会把额度吃掉，导致随后用户按键全丢
@@ -1338,6 +1388,11 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
             }
             break;
         case OTI_ACT_SWITCH_TO_LOCAL: {
+            /* 合并缓冲里若还有位移/按键，属于"对端那段"；切回本机后由释放包统一松开，
+               不再补发（补发 = 本机光标被幽灵位移带跑）。 */
+            a->hid_pend_dirty = 0;
+            a->hid_pend_dx = a->hid_pend_dy = a->hid_pend_wheel = 0;
+            a->hid_sent_buttons = 0;
             request_release_all(a);           /* 关键：避免对端卡键（泵线程先发这个） */
             /* 告诉对端"我放手了"：对端据此恢复自己的键鼠（否则它会一直吞着） */
             request_token(a);
@@ -2652,6 +2707,7 @@ static void run_capture(struct app *a)
             continue;
         if (pr == 0) {
             flush_mouse(a);
+            hid_flush_mouse(a);             /* 尾包：4ms 内没有新事件也要把合并的位移发出去 */
             continue;
         }
         for (int i = 0; i < a->ncap; i++) {
