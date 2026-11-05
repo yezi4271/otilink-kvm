@@ -162,6 +162,10 @@ struct app {
     int         send_reset_tries;     /* W5：连续"写侧故障窗口"次数（2 次就升级到 USB 复位） */
     long        send_hint_ms;         /* W5：无权限提示的节流时刻 */
     long        last_return_ms;      /* 被驱动侧撞边交还的节流时刻 */
+    /* 锁屏/屏保看护（2026-10-27）：屏幕锁定时**绝不独占键盘**，否则密码框收不到键。
+       由 RX（消息泵）线程每 500ms 探测一次并写；捕获线程只读这个标志（不碰 X）。 */
+    volatile int screen_locked;
+    long        lock_probe_ms;
     volatile int want_vendor_return; /* 撞边后请求主线程去通知厂商端（避免与消息泵抢授权） */
     volatile int want_token;         /* 请求消息泵线程发 F24 回程令牌（捕获线程自己发会被吞） */
     volatile int want_release_all;   /* 请求消息泵线程发"全零释放包"（切回本地前，先于令牌） */
@@ -373,7 +377,11 @@ static void role_apply_pending(struct app *a)
             int px, py;
             pthread_mutex_lock(&a->lock);
             a->core.have_control = 1;          /* 指针归我：本地原生用，推到边缘才交出去 */
-            if (otix11_pos(&px, &py) == 0) { a->core.mx = (int16_t)px; a->core.my = (int16_t)py; }
+            /* 同上：sim 模式不拿真实光标校准，core 起点固定=屏幕中心（手势文件按它设计） */
+            if (!a->cfg.sim_input && otix11_pos(&px, &py) == 0) {
+                a->core.mx = (int16_t)px;
+                a->core.my = (int16_t)py;
+            }
             pthread_mutex_unlock(&a->lock);
             say(a, "ROLE 生效：master（键鼠在本机，抓取已切到本机设备）");
         } else {
@@ -706,13 +714,21 @@ static void return_landing_store(struct app *a, int *ox, int *oy)
 static void return_landing_warp(struct app *a, int tx, int ty)
 {
     int px = -1, py = -1;
+    /* sim 模式（无硬件回归）不碰真实光标：虚拟指针与桌面光标无关，
+       拿真实光标校准会把合成手势的坐标抹掉（见 handle_local 里的同款说明）。 */
+    if (a->cfg.sim_input)
+        return;
     if (otix11_pos(&px, &py) != 0)
         return;
     /* 只在真实光标**贴在出口边**（grab 期间它不会动，回程时通常就在那儿）时，
        才把它挪到落点；如果它在别处（多屏/用户刚动过），挪动就会变成
        "光标跳一大截"（用户报障：从 Windows 回来时光标跳动、移位）。
-       这时改为**用真实光标校准状态机**，谁都不动。 */
-    int m = a->core.edge_px + 8;
+       这时改为**用真实光标校准状态机**，谁都不动。
+       2026-10-27（#3）：安全区从 edge+8(=12px) 提高到 return_inset(=96px)。
+       原来 12px 太小：真实光标在 20~90px 时既不挪动、core 又停在落点，
+       用户回程后手指的惯性尾巴（十几像素）就能再次撞边被交出去
+       （日志实证：拉回本机后 2~3 秒又"交给对端"）。 */
+    int m = otikm_core_return_inset(&a->core);
     int near = 0;
     switch (a->core.edge) {
     case OTI_EDGE_LEFT:   near = px <= m; break;
@@ -721,13 +737,15 @@ static void return_landing_warp(struct app *a, int tx, int ty)
     default:              near = py >= a->core.screen_h - 1 - m; break;
     }
     if (near && (px != tx || py != ty) && otix11_warp(tx, ty) == 0) {
-        say(a, "回程落点 %d,%d：真实光标 %d,%d → 已同步", tx, ty, px, py);
+        say(a, "回程落点 %d,%d：真实光标 %d,%d 贴出口边 → 已挪到安全区（离边 %dpx）",
+            tx, ty, px, py, m);
     } else if (!near) {
         pthread_mutex_lock(&a->lock);
         a->core.mx = (int16_t)px;
         a->core.my = (int16_t)py;
         pthread_mutex_unlock(&a->lock);
-        say(a, "回程：真实光标在 %d,%d（不贴出口边）→ 不挪动，按它校准", px, py);
+        say(a, "回程：真实光标在 %d,%d（离出口边 >%dpx）→ 不挪动，核心坐标已按它校准",
+            px, py, m);
     }
 }
 
@@ -1052,7 +1070,12 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
        为什么要对齐：本机指针走 X 的加速曲线，而状态机按 evdev 原始位移积分，
        两者会漂移；用户报障“鼠标还没推到边就切到 Windows”（漂移让状态机以为已到边）。
        ~60Hz 对齐一次（16ms）：压住漂移，又不给每个鼠标事件都加一次 X 往返。仅主控端本地态做。 */
-    if (is_mouse && !a->cfg.return_on_edge) {
+    /* 2026-10-27：`--sim-input`（无硬件回归）时**不做光标校准**。
+       合成手势没有 X 加速，真实光标也不会动（--no-grab），拿真实光标校准等于
+       每 16ms 把模拟位移抹掉一次 —— kmbret 会因此"推不到边、永远不切换"
+       （实测：状态机被钉在 860，24 次 -50 全被吃掉）。这也解释了它过去为什么
+       时好时坏：真实光标恰好贴在出口边时校准反而帮了忙，鼠标在中间时就不行。 */
+    if (is_mouse && !a->cfg.return_on_edge && !a->cfg.sim_input) {
         long nw = now_ms();
         if (nw - a->cursor_sync_ms >= 16) {
             int px = -1, py = -1;
@@ -1169,6 +1192,7 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
             return;                     /* 被驱动侧永不接管、永不转发 */
         }
         pthread_mutex_lock(&a->lock);
+        otikm_core_set_now(&a->core, now_ms());
         otikm_act act = is_mouse ? otikm_core_local_mouse(&a->core, m, &sw)
                                  : otikm_core_local_key(&a->core, k, &sw);
         int driving_now = !a->core.have_control;
@@ -1205,9 +1229,6 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                 /* 回程判据诊断（节流 1s，只在"用户正往入口边推"时打）：
                    下次再遇到"回不来"，日志里就有证据（推回多少 / 阈值 / 入口在哪边）。 */
                 if (driving_now) {
-                    int need = a->core.edge_px * 4;
-                    if (need < 8)
-                        need = 8;
                     int prog = 0;
                     if (drv_ex == 1) prog = drv_x;
                     else if (drv_ex == 0) prog = -drv_x;
@@ -1216,8 +1237,28 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                     long nw = now_ms();
                     if (prog > 0 && nw - a->drive_log_ms >= 1000) {
                         a->drive_log_ms = nw;
-                        say(a, "回程判据：已把推出去的位移推回 %d/%d（入口边 x=%d y=%d）",
-                            prog, need, drv_ex, drv_ey);
+                        int cur_fresh = a->core.rem_cur_valid && a->core.rem_cur_w > 0 &&
+                                        nw - a->core.rem_cur_ms >= 0 &&
+                                        nw - a->core.rem_cur_ms <= OTI_REM_CURSOR_TTL_MS;
+                        if (cur_fresh) {
+                            /* 2026-11-03：回程改成"对端真实光标在入口边 + 再外推 8 计数"，
+                               不再用净计数阈值（Windows 指针加速会让净计数与像素漂移）。 */
+                            int at = 0, e = a->core.edge_px > 1 ? a->core.edge_px : 1;
+                            if (drv_ex == 1) at = a->core.rem_cur_x >= a->core.rem_cur_w - 1 - e;
+                            else if (drv_ex == 0) at = a->core.rem_cur_x <= e;
+                            else if (drv_ey == 1) at = a->core.rem_cur_y >= a->core.rem_cur_h - 1 - e;
+                            else if (drv_ey == 0) at = a->core.rem_cur_y <= e;
+                            say(a, "回程判据：对端光标 (%d,%d)%s（%ldms 前回传；入口边 x=%d y=%d）",
+                                a->core.rem_cur_x, a->core.rem_cur_y,
+                                at ? " 已在入口边" : " 未到入口边", nw - a->core.rem_cur_ms,
+                                drv_ex, drv_ey);
+                        } else {
+                            int need = a->core.edge_px * 12;
+                            if (need < 100)
+                                need = 100;
+                            say(a, "回程判据（无光标回传，退回计数）：已把推出去的位移推回 %d/%d（入口边 x=%d y=%d）",
+                                prog, need, drv_ex, drv_ey);
+                        }
                     }
                 }
                 /* 描述符每轴只有 1 字节有符号 → 大位移必须拆成多包 */
@@ -1273,6 +1314,11 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                 say(a, "[warn] 角色未确认为 master（对端尚未让位）→ 暂不接管（I1）");
                 break;
             }
+            /* 2026-11-03 用户现场：Kylin 锁屏后鼠标要能主动推到 Windows。
+               锁屏期间**不再拒绝本机→对端的交接**（旧守卫会把用户困在锁屏上）。
+               “不抢”仍然成立：锁屏**瞬间**不会 force_local 把对端正在用的一侧拉回来；
+               用户主动推边交出去后，键盘会随交接独占（这是用户明确要的动作），
+               要回麒麟照常走回程手势，回程会释放独占。 */
             otihid_kbd_reset(&a->kbd);        /* 新的一段转发，从干净状态开始 */
             /* 告诉对端"我接管了，你回到被动"：只有对端是**厂商/零软件端**时才需要 F24 令牌。
                对端跑我们的 agent 时它不驱动 KM，令牌纯属浪费 —— 而且真机实测线缆的键盘接口
@@ -1317,6 +1363,7 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
 
     pthread_mutex_lock(&a->lock);
     int locked_before = a->core.locked;
+    otikm_core_set_now(&a->core, now_ms());
     otikm_act act = is_mouse ? otikm_core_local_mouse(&a->core, m, &sw)
                              : otikm_core_local_key(&a->core, k, &sw);
     int land = 0, land_tx = 0, land_ty = 0;             /* 回程落点（锁外再同步真实光标） */
@@ -1369,6 +1416,8 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
         }
         break;
     case OTI_ACT_SWITCH_TO_REMOTE:
+        /* 锁屏期间允许主动推到对端（同 HID 路径，2026-11-03 用户现场）；
+           “不抢”只表示锁屏瞬间不 force_local 拉回对端正用的一侧。 */
         /* W4：对端静默时不交出去（同 HID 路径） */
         if (peer_is_silent(a)) {
             say(a, "[warn] 对端已 %ldms 没有任何消息 → 不交出去（W4）", now_ms() - a->per_ms);
@@ -1932,6 +1981,38 @@ static void *rx_thread(void *arg)
             }
         }
         maybe_send_role(a, 0);
+        /* ---- 锁屏/屏保看护（2026-10-27 真机事故）----
+           屏幕 18:02 自动锁定，而 otikm 正把键鼠交给 Windows（键盘 EVIOCGRAB），
+           用户在锁屏密码框里怎么打都没反应（键被转成 HID 发去对端了），最后只能 SSH 解锁。
+           规矩：**锁屏期间键盘必须留在本机**（L8 "交出去的能力必须收得回来" 的最硬一种）：
+             · 已锁定且正在驱动对端 → force_local + 释放独占 + 通知对端放手；
+             · 锁屏期间捕获线程看到 SWITCH_TO_REMOTE 会拒绝（见 handle_local）。
+           探测失败（-1，无 X）保持原行为。 */
+        if (now_ms() - a->lock_probe_ms >= 500) {
+            a->lock_probe_ms = now_ms();
+            int lk = otix11_lock_screen_active();
+            static int lock_probe_logged;
+            if (!lock_probe_logged) {
+                lock_probe_logged = 1;
+                say(a, "锁屏看护: %s（每 500ms 看焦点窗口 WM_CLASS；锁屏期间不独占键盘）",
+                    lk < 0 ? "**不可用**（无 X / 读不到焦点）——锁屏时仍可能抢键盘"
+                           : "已启用");
+            }
+            if (lk >= 0 && lk != a->screen_locked) {
+                a->screen_locked = lk;
+                if (lk) {
+                    /* 2026-11-03（用户指令）：锁屏**不抢控制权**。
+                       旧行为在锁屏瞬间 force_local + 释放独占 + 通知对端放手，
+                       用户正在 Windows 上操作时会突然被拉回麒麟（现场报障）。
+                       现在只置标志：不抢；捕获线程看到 SWITCH_TO_REMOTE 仍会拒绝
+                       （锁屏期间不把键盘独占走，密码框收得到键）。
+                       用户要回麒麟解锁，照常走鼠标回程手势 —— 回程本身会释放独占。 */
+                    say(a, "屏幕已锁定/屏保 → 不抢控制权（保持当前所在侧；仅拒绝再交出去）");
+                } else {
+                    say(a, "屏幕已解锁（撞边切换恢复正常）");
+                }
+            }
+        }
         /* 回程令牌 / 释放包：必须由**本线程（消息泵所在线程）**发。
            捕获线程自己发会跟这里抢同一条帧管道上的授权消息与应答，实测令牌被吞
            → 对端收不到"交还控制权"，指针永远回不来。顺序：先松手，再发令牌。 */
@@ -2082,6 +2163,17 @@ static void *rx_thread(void *arg)
                 a->remote_h = he.height;
                 if (a->cfg.verbose)
                     say(a, "RECV HELLO 对端屏幕 %ux%u（绝对坐标按此换算）", he.width, he.height);
+            }
+            break;
+        }
+        case OTI_MSG_CURSOR: {
+            oti_cursor_evt ce;
+            if (oti_decode_cursor(pl, h.len, &ce) == 0) {
+                pthread_mutex_lock(&a->lock);
+                otikm_core_set_remote_cursor(&a->core, ce.x, ce.y, ce.w, ce.h, now_ms());
+                pthread_mutex_unlock(&a->lock);
+                if (a->cfg.verbose)
+                    say(a, "RECV CURSOR 对端光标 %d,%d（虚拟桌面坐标）", ce.x, ce.y);
             }
             break;
         }

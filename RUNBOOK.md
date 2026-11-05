@@ -769,6 +769,13 @@ pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkill -9 -x otikm; sleep 1
 4. 主控侧（**键鼠插在这一侧**，例如拓扑 B 的麒麟）：在对端屏幕上**继续往外推**（§15.14）。
    要点：推出去多少、就得推回来多少，再多推一点 —— 回程判据累计的是**未缩放的位移**，
    所以小步慢推（每个事件 1~3 个计数）照样会触发；另外落点会同步真实光标（不会停在边上）。
+   **2026-11-03 起（第 58 轮）**：回程判据优先用 Windows 代理回传的**真实光标位置**
+   （`OTI_MSG_CURSOR`）：必须等回传确认光标在入口边、再外推 8 计数才回程；回传不在边时
+   **不会**按计数提前回（修掉 Windows 指针加速导致的"净计数 +100、光标还差 1068px"）。
+   所以 Windows 剪贴板代理必须跑着（`cd re/windows && ./deploy.sh --restart`）；没跑/回传过期时
+   自动退回旧的计数判据。日志证据：`回程判据：对端光标 (x,y) 已在入口边` / `未到入口边`。
+   锁屏看护也改为**不抢控制权**：锁屏时不会把你从 Windows 拉回麒麟；要解锁就照常回程到麒麟。
+   注意：锁屏期间仍会**拒绝再交出去**（保护密码框），先解锁再切 Windows。
    仍回不来时：在**有键盘的那侧**把鼠标推向**回程边**（回程手势）；或 `pkill -x otikm` 立即释放独占，
    或看 /tmp/otikm.log 有没有 "HID 模式：指针拉回本机"。
 5. 拓扑 B 专项回归（自动，不需人推鼠标）：cd re/tools && KY=kylin ./gate.sh --hw-kmb
@@ -1200,3 +1207,39 @@ $fallbackIp = '<麒麟热点IP>'
 实测 `ssh <host> true`（各 3 次）：**relay（LAN 直连）1.7–2.1s** vs **tailscale（DERP）5.3–8.1s**。
 > 结论：**交互用 `ssh kylin`（relay，快）；relay 失效或跨网时用 `ssh kylin-ts`（稳但慢）**。
 > 想让 tailscale 也直连：在 **Windows 主机**上跑 tailscale（它与麒麟同在热点 L2），或让 WSL 能看见热点网段。
+
+---
+
+## 22. 【第 59 轮】麒麟「蓝屏 / 键盘输入不了」= Win+H 误触发内置 SOS 救援（`kysos_key`）
+
+**症状**：桌面看着像死机/蓝屏，键盘鼠标全没反应；SSH 还能连。
+**一句判据**（SSH 里跑）：
+```bash
+cat /sys/class/tty/tty0/active      # 不是 tty7（常见 tty5）→ 就是本条
+cat /sys/kos_rescue/stats           # Timeout count 增加、Current state: IDLE（已超时）
+dmesg | grep -A6 'PANIC: SOS rescue' # 看到 SOS rescue timeout 即确诊
+```
+**真因**（NOTES §74）：麒麟内核 `kysos_key` 把**左 Meta+H** 当 SOS 组合键，20s 内没有用户态
+写 `/sys/kos_rescue/rescue_feedback=1` 确认，就切 VT 到 tty5 并拉起 `getty@tty5` →
+`console_lock` 死锁 → Xorg 摘掉全部输入设备。**Windows 上 Win+H 是"语音输入"**，共享键盘时
+误触即中招（EVIOCGRAB 挡不住内核 input handler）。
+
+**修法（已装）**：`otilink-sosguard.service`（`/usr/local/bin/sosguard.sh`）在超时前写
+`rescue_feedback=1` 取消救援；`install-kylin.sh` 第 6 步会装。
+```bash
+systemctl status otilink-sosguard          # 应 active
+tail -5 /var/log/otilink-sosguard.log      # 触发时会有「SOS 组合键（左 Meta+H）已被取消」
+```
+
+**已经死锁了怎么办**：`console_lock` 卡住时 `chvt`/`fgconsole`/`systemctl reboot` 都会卡，
+只能硬重启（`sync; sudo reboot -f`，或长按电源）。重启后确认：
+```bash
+cat /sys/class/tty/tty0/active                 # tty7
+DISPLAY=:0 xinput list | grep -c '\[slave'     # 设备都挂回 master（没有 floating）
+pgrep -x otikm | wc -l                         # 1
+```
+
+**回归**：`cd re/tools && ./gate.sh --hw-sos`（`otilink/sosreg.sh`，注入一次左 Meta+H，断言
+守卫取消、VT 不变、X 键盘不掉）。**守卫没在跑时该脚本会中止、不会注入**。
+
+**回滚**：`sudo systemctl disable --now otilink-sosguard && sudo rm /etc/systemd/system/otilink-sosguard.service /usr/local/bin/sosguard.sh`。

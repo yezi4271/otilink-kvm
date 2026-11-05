@@ -196,12 +196,15 @@ static void remote_reset_disp(otikm_core *c)
 
 /* 回程落点：离出口边多远（px）。必须足够远，否则回程后的一点惯性/抖动又会立刻推出去。
    真机（2026-10-10，纯鼠标切换）：落点 edge+8=12px，用户在 Windows 上用鼠标 1~2 秒就
-   回程一次 → 键盘被反复 EVIOCGRAB，"在 Kylin 上打不了字"。现在至少 60px。 */
+   回程一次 → 键盘被反复 EVIOCGRAB，"在 Kylin 上打不了字"。2026-10-27 起至少 96px。 */
 int otikm_core_return_inset(const otikm_core *c)
 {
+    /* 2026-10-27（#3）：60 → 96。60px 在 1080p 上只有约 1.4cm，回程手势的惯性尾巴
+       就能把光标再送进 edge 区（日志实证：拉回本机后 2~3 秒又"交给对端"，
+       用户感知是"刚能在麒麟打字又没了"）。96px 留出余量，又不会让落点跳得太远。 */
     int m = c->edge_px + 8;
-    if (m < 60)
-        m = 60;
+    if (m < 96)
+        m = 96;
     return m;
 }
 
@@ -294,6 +297,36 @@ void otikm_core_set_remote_screen(otikm_core *c, int w, int h)
         c->rem_x = (int16_t)(w - 1);
     if (c->rem_y > h - 1)
         c->rem_y = (int16_t)(h - 1);
+    /* 回传的光标坐标同一坐标系：几何变了就夹紧，避免旧值越界误判"在边缘"。 */
+    if (c->rem_cur_x > w - 1)
+        c->rem_cur_x = w - 1;
+    if (c->rem_cur_y > h - 1)
+        c->rem_cur_y = h - 1;
+}
+
+void otikm_core_set_remote_cursor(otikm_core *c, int x, int y, int w, int h, long now)
+{
+    if (w > 0)
+        c->rem_cur_w = w;
+    if (h > 0)
+        c->rem_cur_h = h;
+    if (x < 0)
+        x = 0;
+    if (y < 0)
+        y = 0;
+    if (c->rem_cur_w > 0 && x > c->rem_cur_w - 1)
+        x = c->rem_cur_w - 1;
+    if (c->rem_cur_h > 0 && y > c->rem_cur_h - 1)
+        y = c->rem_cur_h - 1;
+    c->rem_cur_x = x;
+    c->rem_cur_y = y;
+    c->rem_cur_ms = now;
+    c->rem_cur_valid = 1;
+}
+
+void otikm_core_set_now(otikm_core *c, long now)
+{
+    c->now_ms = now;
 }
 
 /* 交出去：把远端坐标放到**进来的那条边**上，并记住是哪条边。
@@ -315,6 +348,9 @@ static void enter_remote(otikm_core *c, int exit_edge)
     c->rem_entry_x = -1;
     c->rem_entry_y = -1;
     remote_reset_disp(c);
+    /* 新一段驱动：上一段的对端光标位置已无意义，等新的回传。 */
+    c->rem_cur_valid = 0;
+    c->rem_cur_anchor_ms = 0;
     if (exit_edge == OTI_EDGE_RIGHT || exit_edge == OTI_EDGE_LEFT) {
         int from_right = (exit_edge == OTI_EDGE_RIGHT);
         c->rem_x = (int16_t)(from_right ? 0 : (rw > 0 ? rw - 1 : 0));
@@ -477,6 +513,24 @@ otikm_act otikm_core_local_mouse(otikm_core *c, const oti_mouse_evt *m, oti_swit
         int rh = c->rem_h > 0 ? c->rem_h : c->screen_h;
         int lw = c->local_w > 0 ? c->local_w : 1920;
         int lh = c->local_h > 0 ? c->local_h : 1080;
+        /* 对端真实光标回传：新鲜 + 远端几何已知才敢用。 */
+        int cur_fresh = c->rem_cur_valid && c->now_ms > 0 &&
+                        c->rem_cur_w > 0 && c->rem_cur_h > 0 &&
+                        c->now_ms - c->rem_cur_ms >= 0 &&
+                        c->now_ms - c->rem_cur_ms <= OTI_REM_CURSOR_TTL_MS;
+        int cur_at_edge = 0;
+        if (cur_fresh) {
+            int e = c->edge_px > 1 ? c->edge_px : 1;
+            int cw = c->rem_cur_w, ch = c->rem_cur_h;
+            if (c->rem_entry_x == 1)
+                cur_at_edge = c->rem_cur_x >= cw - 1 - e;
+            else if (c->rem_entry_x == 0)
+                cur_at_edge = c->rem_cur_x <= e;
+            else if (c->rem_entry_y == 1)
+                cur_at_edge = c->rem_cur_y >= ch - 1 - e;
+            else if (c->rem_entry_y == 0)
+                cur_at_edge = c->rem_cur_y <= e;
+        }
         int dx = (int)((long)m->dx * rw / lw);
         int dy = (int)((long)m->dy * rh / lh);
         if (dx == 0 && m->dx)
@@ -500,23 +554,58 @@ otikm_act otikm_core_local_mouse(otikm_core *c, const oti_mouse_evt *m, oti_swit
                （真机实测"同一手势时好时坏"，见 otikm_core_set_remote_screen 注释）。
            阈值 max(8, edge_px*4)：与积分判据一致，贴着入口边抖 ±1px 不会误判。 */
         {
+            if (cur_fresh) {
+                if (cur_at_edge) {
+                    /* 新的“在入口边”回传 → 以它为零点重锚计数。
+                       同一毫秒的重复回传不重锚（否则用户推的位移一直被抹掉）。 */
+                    if (c->rem_cur_ms != c->rem_cur_anchor_ms) {
+                        c->rem_cur_anchor_ms = c->rem_cur_ms;
+                        c->drv_x = c->drv_y = 0;
+                    }
+                } else {
+                    /* 对端光标**不在**入口边：计数与像素已漂移，清零；
+                       这一段不按计数回程（等下一次回传确认真到边）。 */
+                    c->drv_x = c->drv_y = 0;
+                    c->rem_cur_anchor_ms = 0;
+                }
+            }
             c->drv_x += m->dx;
             c->drv_y += m->dy;
-            /* 纯鼠标切换：回程必须是一个"明确的推回"动作，不能一碰就回。
-               原来是 edge_px*4=16 计数（约 0.3mm）→ 在 Windows 上稍微一动就被拉回来，
-               表现成"过不去 Windows / 键盘在两机之间跳"（2026-10-10 真机）。 */
-            int need = c->edge_px * 12;
-            if (need < 100)
-                need = 100;
             int back = 0;
-            if (c->rem_entry_x == 0 && c->drv_x <= -need)
-                back = 1;
-            else if (c->rem_entry_x == 1 && c->drv_x >= need)
-                back = 1;
-            else if (c->rem_entry_y == 0 && c->drv_y <= -need)
-                back = 1;
-            else if (c->rem_entry_y == 1 && c->drv_y >= need)
-                back = 1;
+            if (cur_fresh) {
+                /* 精确判据（2026-11-03）：必须收到"在入口边"的回传，
+                   并且之后再往外推 OTI_REM_CURSOR_PUSH 个计数。
+                   这修掉 Windows 指针加速导致的"净计数 +100、光标还差 1000px"早切。 */
+                if (cur_at_edge) {
+                    int push = 0;
+                    if (c->rem_entry_x == 1)
+                        push = c->drv_x;
+                    else if (c->rem_entry_x == 0)
+                        push = -c->drv_x;
+                    else if (c->rem_entry_y == 1)
+                        push = c->drv_y;
+                    else if (c->rem_entry_y == 0)
+                        push = -c->drv_y;
+                    if (push >= OTI_REM_CURSOR_PUSH)
+                        back = 1;
+                }
+            } else {
+                /* 旧判据（没有回传 / 回传过期）：兼容零软件端与旧 agent。
+                   纯鼠标切换：回程必须是一个"明确的推回"动作，不能一碰就回。
+                   原来是 edge_px*4=16 计数（约 0.3mm）→ 在 Windows 上稍微一动就被拉回来，
+                   表现成"过不去 Windows / 键盘在两机之间跳"（2026-10-10 真机）。 */
+                int need = c->edge_px * 12;
+                if (need < 100)
+                    need = 100;
+                if (c->rem_entry_x == 0 && c->drv_x <= -need)
+                    back = 1;
+                else if (c->rem_entry_x == 1 && c->drv_x >= need)
+                    back = 1;
+                else if (c->rem_entry_y == 0 && c->drv_y <= -need)
+                    back = 1;
+                else if (c->rem_entry_y == 1 && c->drv_y >= need)
+                    back = 1;
+            }
             if (back) {
                 /* 指针放回"当初出去的那条边"往里一点点：
                    既让用户一眼看到指针回来了，又不会因为惯性立刻又推出去。 */

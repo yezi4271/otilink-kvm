@@ -1,7 +1,7 @@
 #!/bin/sh
 # install-kylin.sh —— 麒麟/Ubuntu 端一次性安装（需要 sudo 密码）
 #
-# 做五件事：
+# 做六件事：
 #   1) 装 udev 规则：允许普通用户抓取键鼠、创建 uinput 注入设备、访问对拷线 sg 设备，
 #      并抑制对拷线两个 LUN 的自动挂载（厂商传输前提是 UnmountMedia）
 #   2) 装 usb-storage 复位标志（/etc/modprobe.d/otilink-quirks.conf，quirks=0ea0:2213:s）：
@@ -11,6 +11,7 @@
 #   3) 把当前用户加入 input,disk 组（注销重登后生效）
 #   4) 加载 uinput 模块
 #   5) 安装默认配置文件 ~/.config/otilink/kvm.conf（已存在则不覆盖）
+#   6) 安装 SOS 守卫（麒麟内置「左 Meta+H」SOS 救援会切 VT 死锁 console，见 NOTES §74）
 #
 # 运行：sudo sh install-kylin.sh
 set -e
@@ -23,13 +24,13 @@ fi
 TARGET=${SUDO_USER:-$USER}
 HOME_DIR=$(getent passwd "$TARGET" | cut -d: -f6)
 
-echo "== 1/5 安装 udev 规则 =="
+echo "== 1/6 安装 udev 规则 =="
 [ -f "$D/99-otilink.rules" ] || { echo "缺少 $D/99-otilink.rules"; exit 1; }
 cp "$D/99-otilink.rules" /etc/udev/rules.d/
 udevadm control --reload
 udevadm trigger
 
-echo "== 2/5 安装 usb-storage 复位标志（只枚举 LUN0，隐藏假光盘）=="
+echo "== 2/6 安装 usb-storage 复位标志（只枚举 LUN0，隐藏假光盘）=="
 if [ -f "$D/otilink-quirks.conf" ]; then
     cp "$D/otilink-quirks.conf" /etc/modprobe.d/otilink-quirks.conf
     echo "    已装 /etc/modprobe.d/otilink-quirks.conf"
@@ -42,14 +43,14 @@ else
     echo "    缺少 $D/otilink-quirks.conf（跳过）"
 fi
 
-echo "== 3/5 把 $TARGET 加入 input,disk 组 =="
+echo "== 3/6 把 $TARGET 加入 input,disk 组 =="
 usermod -aG input,disk "$TARGET"
 
-echo "== 4/5 加载 uinput 模块 =="
+echo "== 4/6 加载 uinput 模块 =="
 modprobe uinput 2>/dev/null || true
 echo 'uinput' > /etc/modules-load.d/otilink.conf
 
-echo "== 5/5 安装默认配置 =="
+echo "== 5/6 安装默认配置 =="
 mkdir -p "$HOME_DIR/.config/otilink"
 if [ -f "$HOME_DIR/.config/otilink/kvm.conf" ]; then
     echo "    已存在 $HOME_DIR/.config/otilink/kvm.conf，保持不动"
@@ -59,6 +60,18 @@ elif [ -f "$D/kvm.conf" ]; then
     echo "    已安装到 $HOME_DIR/.config/otilink/kvm.conf"
 else
     echo "    未找到 kvm.conf 模板（将使用内置默认值）"
+fi
+
+echo "== 6/6 安装 SOS 守卫（取消麒麟 Win+H 救援，避免切 VT 死锁 console）=="
+if [ -d /sys/kos_rescue ] && [ -f "$D/sosguard.sh" ] && [ -f "$D/otilink-sosguard.service" ]; then
+    cp "$D/sosguard.sh" /usr/local/bin/sosguard.sh
+    chmod 755 /usr/local/bin/sosguard.sh
+    cp "$D/otilink-sosguard.service" /etc/systemd/system/otilink-sosguard.service
+    systemctl daemon-reload
+    systemctl enable --now otilink-sosguard
+    echo "    已启用 otilink-sosguard（日志 /var/log/otilink-sosguard.log）"
+else
+    echo "    跳过（内核没有 /sys/kos_rescue，或缺少 sosguard.sh / otilink-sosguard.service）"
 fi
 
 cat <<EOF

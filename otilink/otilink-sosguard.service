@@ -1,0 +1,16 @@
+# 安装：sudo cp sosguard.sh /usr/local/bin/ && sudo cp otilink-sosguard.service /etc/systemd/system/
+#        sudo systemctl daemon-reload && sudo systemctl enable --now otilink-sosguard
+# 作用与背景见 sosguard.sh 注释与 NOTES §74。
+[Unit]
+Description=otilink SOS guard —— 取消麒麟 Win+H SOS 救援（它会死锁 console）
+Documentation=file:/usr/local/share/otilink/README.md
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sosguard.sh
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

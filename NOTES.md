@@ -4706,3 +4706,180 @@ xclip 写完 stdin 即退出，没有这个风险。
 
 
 
+
+---
+
+## 73 第 58 轮：现场「鼠标在 Windows 时右移没到边就回 Kylin」= 指针加速让计数≠像素；改为回传真实光标 + 锁屏不抢（2026-11-03）
+
+**报障原话**（用户）：「鼠标在windows时，有时候右移没到边就到了kylin」。
+**决策**（用户）：走 A（Windows 剪贴板代理回传真实光标位置）；锁屏看护「不抢」。
+
+### 73.1 复现（真机线缆 + 合成手势；先证明 park 没问题）
+
+用 `--sim-input --no-grab` 合成手势，Windows 侧用 DPI-aware `GetCursorPos` 读物理光标：
+- 交接 + `hid_park_remote_pointer` 后 Windows 光标确实到 **2559**（虚拟桌面右边缘，vright=2559）——
+  park 本身是好的（从 -1500 / 1316 各跑 3 次都到边）。
+- 然后**快左移 500 计数**（5×-100，10ms 间隔）、**慢右移 608 计数**（+2/30ms）。
+- 净计数 +100 时回程判据触发，此时 Windows 光标只有 **1491**，离右边缘还差 **1068px**。
+  麒麟日志：`回程判据：已把推出去的位移推回 68/16` → `HID 模式：指针拉回本机`
+  （`16` 是诊断里的旧阈值；真实阈值是 `max(100, edge_px*12)=100`，诊断值不一致也一并修了）。
+- 证据：`/tmp/acctest.out`（W_end=1491, vright=2559）、`/tmp/acc-gesture.txt`、麒麟 `/tmp/acc.log`。
+
+### 73.2 根因：回程判据用**未缩放 HID 计数**，而 Windows 对 HID 鼠标做指针加速
+
+本机注册表 `HKCU\Control Panel\Mouse`：`MouseSensitivity=10`、`MouseSpeed=1`、
+`MouseThreshold1/2=6/10`（“提高指针精确度”开）。快左移 + 慢右移后：
+计数净 +100，但像素位置由加速曲线决定，可能还差上千像素。park 只把**交接瞬间**的起点钉在边上，
+治不了路径相关的漂移。加大 park 或阈值都不能保证（实测净 +100 差 1068px；要保证到边得用接近
+整屏宽度的阈值，手感不可接受）——**必须有对端真实光标位置反馈**。
+
+### 73.3 修法
+
+1. **新协议消息 `OTI_MSG_CURSOR = 11`**（`PROTOCOL.md §6.2`）：Windows 代理（被驱动侧）
+   每个主循环回传 `GetCursorPos`，坐标减去 `SM_X/YVIRTUALSCREEN` 归一化到虚拟桌面
+   （0..VirtW-1），载荷 `i16 x, i16 y, u16 w, u16 h`（带虚拟桌面尺寸，不依赖 HELLO 的
+   10s 节奏，otikm 刚重启后的第一次交接也能立刻判边）。
+2. **Windows 代理**（`windows/otiagent.ps1`）：新增 `VirtX()/VirtY()`、`Send-Cursor`，
+   主循环里每 ≥500ms 发一条（cable 模式实测约 0.3~0.5s/条）。
+3. **主控端核心**（`otikm_core.c`）：回传 2.5s 内新鲜且远端几何已知 → **精确判据**：
+   只有回传确认光标在入口边（容差 edge_px），并且之后再往外推
+   `OTI_REM_CURSOR_PUSH=8` 个计数才回程；回传“不在入口边”时**不按计数回程**（计数清零重锚）。
+   回传缺失/过期 → 退回旧的 `max(100, edge_px*12)` 计数判据（兼容零软件端/旧 agent）。
+4. **锁屏看护改为“不抢”**（用户指令）：锁屏瞬间不再 `force_local + 释放独占 + 通知对端放手`；
+   只置 `screen_locked` 标志并打日志。捕获线程看到 `SWITCH_TO_REMOTE` 仍会拒绝
+   （锁屏期间不把键盘独占走，密码框收得到键）；要回麒麟解锁照常走鼠标回程，回程本身会释放独占。
+5. **诊断修正**：回程判据日志不再打 `edge_px*4=16` 的旧阈值；有回传时打
+   `对端光标 (x,y) 已在/未到入口边（Nms 前回传）`。
+
+### 73.4 真机验证（新代码 + 新 agent，真实线缆）
+
+**负向（修掉的现象）**：park 到 2559 后快左移 500 计数、慢右移 608 计数：
+```
+[67709.369] 回程判据：对端光标 (3358,750) 未到入口边（304ms 前回传）
+```
+Windows 光标停在 **1499**（离边 1060px），**没有回程**（旧代码在这里就切回 Kylin 了）。
+
+**正向（到边才回）**：同样的 park + 快左移，慢右移 1100 次（足够走回边缘）：
+```
+[67821.030] 回程判据：对端光标 (4439,750) 未到入口边（523ms 前回传）
+[67821.642] RECV CURSOR 对端光标 4479,750（虚拟桌面坐标）
+[67821.742] HID 模式：指针拉回本机（落点 96,540；…）
+```
+Windows 光标在回程时 = **2559**（右边缘；归一化 4479），再推 8 计数后 100ms 回程。
+**锁屏不抢**：
+```
+[67618.287] 锁屏看护: 已启用（每 500ms 看焦点窗口 WM_CLASS；锁屏期间不独占键盘）
+[67618.287] 屏幕已锁定/屏保 → 不抢控制权（保持当前所在侧；仅拒绝再交出去）
+```
+（旧日志是 `控制权拉回本机并释放独占`。）
+
+### 73.5 门禁 / 自测
+
+* `coretest` **51/51**（新增 1e：回传不在边不回程、到边再推 8 计数回程、回传过期退回计数）。
+* `selftest_proto` 全过（新增 CURSOR 组包/解包 3 项）。
+* `tools/psparse.ps1` 解析 `otiagent.ps1`：`ERRS=0`；`deploy.sh --restart` 已部署并重启剪贴板代理。
+* `--static`：77 PASS；唯一失败是 `doccheck` 的 **AGENTS.md `re/` 路径检查**在该工作树（根目录不叫
+  `re/`）下必然失败 —— 与本次改动无关（在原始 `re/` 布局下应通过；待 CI/仓库布局确认）。
+* 真机锁屏：Kylin 的 `ukui-screensaver-dialog` 自 11:32 起一直开着；新 otikm 启动日志确认“不抢”。
+* 真机 `--hw-kmb`：合成实例改为 `env -u DISPLAY`（无 X → 锁屏看护不可用，避免“锁屏拒绝交出去”
+  挡住纯回程逻辑回归）；Windows agent 在跑时 sim 也会收到 CURSOR，精确路径同样被覆盖。
+
+### 73.6 仓库与现网源码不一致（本轮顺带同步）
+
+公开仓库 HEAD（448fd60，10-14）落后于麒麟现网 `~/otilink`（10-27）：
+现网有未入库的**锁屏看护**（`otix11_lock_screen_active` + 500ms 探测）、`--sim-input` 不校准真实光标、
+`return_inset 60→96`。本轮把这批差异**一并入库**（否则 `gate.sh --deploy-kylin` 会用旧源码覆盖现网，
+把锁屏看护/sim 修正回退掉），再加 CURSOR/不抢。
+* 现网部署没有用 `--deploy-kylin`（它会 scp 全部脚本，覆盖现网更新的 `kmbret.sh`/`coretest.c`），
+  而是只 scp 7 个源文件 + `make otikm` + `label-kysec.sh` + 重启；仓库里的 kmbret 已改为 sim 不接 X。
+* 若以后从本仓库 `--deploy-kylin`，先确认现网的 `earlyoom-kylin.sh`/`kwin-guard.sh`/`watchdogreg.sh`
+  等未入库脚本是否需要保留（它们不在本次 PR 范围）。
+
+### 73.7 副作用 / 回滚
+
+* 麒麟：同步 7 个源文件、重编译 otikm、重打 KySec 标签、重启 otikm（键鼠/剪贴板短暂中断）；
+  生产实例已恢复为 `./otikm --auto --transport cable --keepalive 5000 --config …`，1 个进程。
+* Windows：`deploy.sh --restart` 重写 `C:\Users\yezi4\otilink\*.ps1` 并重启剪贴板代理（PID 变化，
+  剪贴板短暂中断）；`km.log`/`clip.log` 保留。
+* 回滚：还原 `otilink/{otikm.c,otikm_core.c,otikm_core.h,otiproto.c/h,otix11.c/h}` 与
+  `windows/otiagent.ps1` 后按同一路径重编译/重部署；协议新增 type=11 旧端会忽略，不致命。
+* 未验证：Windows 代理**停掉**时的回退路径（理论上退回旧计数判据；本次用 sim 的无回传路径
+  `kmbret` 覆盖）；多显示器不同 DPI 下的归一化（本机 4480x1440 已验证坐标=3236/4479）。
+
+### 73.8 回归修复（2026-11-03 16:15 现场）：「Windows 解锁后鼠标回 Kylin 无法输入」= 锁屏拒绝交接后核心仍 remote，看门狗重新 grab 键盘
+
+**报障原话**（用户）：「windows刚解锁，鼠标移到kylin无法输入」。
+
+**现场**：`/tmp/otikm.log` 每秒交替出现
+```
+[warn] 屏幕已锁定/屏保 → 不接管（键盘必须留给锁屏）
+已独占 SIGMACHIP USB Keyboard（驱动侧，避免本地与远端双重输入）
+```
+Kylin 锁屏对话框（`ukui-screensaver-dialog --lock`）在位，键盘一直被 otikm grab → 密码框收不到键。
+
+**真因**：`otikm_core_local_mouse()` 的撞边检测**先**把 `have_control` 置 0，`handle_local()` 的
+`screen_locked` 守卫**后**才拒绝并只 `break` → 核心留在 remote；`run_capture()` 的
+“驱动期维持独占”（`drv = !have_control`）每 500ms 重新 `apply_grab(1)`。上一版按“不抢”删掉锁屏时的
+`force_local + apply_grab(0)` 后，没有别处回滚这次**本机→对端**的失败交接。
+
+**修法**：两个 `screen_locked` 守卫（HID 路径 + 协议路径）拒绝时：
+`otikm_core_force_local()` + `apply_grab(0)` + `mx/my` 回屏幕中心。
+这是本机发起的交接尝试被拒绝，不是抢回对端正用的一侧，符合“锁屏不抢”。锁屏瞬间对**真正 remote**
+的会话仍不 `force_local`（保留用户“不抢”语义）。
+
+**现场处置 / 验证**：先 `pkill -x otikm` 释放键盘让用户输入密码；部署修复版后日志只有
+`屏幕已锁定/屏保 → 不抢控制权（保持当前所在侧；仅拒绝再交出去）`，`已独占` 计数 = 0；
+`coretest` 51/51。后续用户解锁后确认键盘可输入。
+
+---
+
+## 74 第 59 轮：2026-11-05「Windows 解锁后回 Kylin 键盘输入不了」= 麒麟内置 SOS 救援被 Win+H 误触发（`kysos_key`）
+
+**报障**：用户「windows解锁后，移动到kylin，键盘输入不了」（10:06，与 11-03「kylin蓝屏了」同一现象再现）。
+
+### 现场（SSH 仍通，桌面已死）
+* `cat /sys/class/tty/tty0/active` = **`tty5`**（X 在 `tty7`）→ 活动 VT 被切到空控制台。
+* `xinput list`：master 上只剩 XTEST，**所有**真实设备（SIGMACHIP 键盘 9/10/11、G304 8、AT Raw 14、线缆 HID 12/13）都是 `floating slave` → 桌面收不到任何输入。
+* `/var/log/Xorg.0.log`：`[149638] event* … device removed` ×11 → `AIGLX: Suspending AIGLX clients for VT switch`，之后再没回来。
+* `dmesg`：`[149638.542] PANIC: SOS rescue timeout! No feedback from userspace.` / `SOS count: 1, Feedback count: 0, Timeout count: 1` / `fb: framebuffer at …`；`getty@tty5` 同一秒启动。
+* `kworker/9:0`（`console_callback`）与 `(agetty)` 在 `console_lock` 上 D 态 >480s；`fgconsole` 也卡在 `tty_open` → `console_lock` 死锁（与 §71「蓝屏」同一层，但这次不是 panic 升级）。
+
+### 真因（从内核镜像里挖出来的）
+`/usr/src/linux-headers-*/scripts/extract-vmlinux` 解出 vmlinux 后 `strings`，kysos_key 的日志串：
+```
+KYSOS-KEY: SOS combination triggered: LEFTMETA+H
+KYSOS-KEY: SOS event reported to userspace
+PANIC: SOS rescue timeout! No feedback from userspace.
+```
+* 麒麟内核内置 `kysos_key`（`CONFIG_INPUT_KYSOS_KEY=y`，builtin，`/sys/kos_rescue/` 是它的接口），注册 `sos-handler` 挂在**所有**输入设备上（`/proc/bus/input/devices` 每个设备的 Handlers 都有 `sos-handler`）。
+* 它把**左 Meta + H** 当 SOS 组合键：触发后等 20s（`/sys/kos_rescue/rescue_delay`，范围 1000–60000），等用户态写 `/sys/kos_rescue/rescue_feedback=1` 确认；**没人确认就"救援"**：切 VT 到 tty5 + `getty@tty5` → `console_lock` 死锁 → X 摘掉全部输入设备。
+* 这台机器**没有**麒麟的用户态 SOS 处理器（`dpkg -l | grep -i sos` 只有 libfyba 的 SOSI；systemd 无对应 unit），所以每次触发必超时。
+* **为什么是"Windows 解锁后"**：键盘物理接在麒麟，otikm 用 EVIOCGRAB 抓它转发给 Windows —— 但 EVIOCGRAB 只挡其它 evdev 客户端，**挡不住内核 input handler**，所以用户在 Windows 上按 **Win+H（Windows 的"语音输入"快捷键）** 时，麒麟内核照样看到 `LEFTMETA+H` → 触发 SOS。11-03 16:20 那次「蓝屏」的 dmesg 也是同一串（`SOS rescue timeout`），两次是同一真因。
+
+### 修法（现场已部署 + 已回归）
+* 新增 `otilink/sosguard.sh` + `otilink/otilink-sosguard.service`：轮询 `/sys/kos_rescue/stats`，状态一离开 `IDLE`（`WAITING`）就写 `rescue_feedback=1`，救援被取消、不切 VT。代价：SOS 救援在本机不再生效 —— 它在本机只会死锁（§71/本条），保留没有收益。
+* `install-kylin.sh` 第 6 步安装/启用；`otilink/sosinject.c`（`make sosinject`）注入一次左 Meta+H 用于回归；新增门禁档 `gate.sh --hw-sos`（`otilink/sosreg.sh`）。
+* **现场验证**（10:28）：
+  ```
+  $ ./sosinject --wait 1        # 注入左 Meta+H
+  $ cat /sys/kos_rescue/stats
+  SOS triggered: 1
+  Feedback received: 1
+  Timeout count: 0
+  Current state: IDLE
+  $ cat /sys/class/tty/tty0/active
+  tty7
+  # /var/log/otilink-sosguard.log
+  2026-11-05 10:28:48 SOS 组合键（左 Meta+H）已被取消，state=WAITING
+  ```
+  → 内核收到了组合键，但守卫在超时前取消；VT 仍是 tty7，X 设备未动。
+* 现场处置：console_lock 死锁无法在线恢复（`chvt`/`fgconsole` 都卡），`sync; reboot -f` 重启；重启后 `tty7`、11 个输入设备全部挂回 master、otikm 正常。
+
+### 副作用 / 回滚
+新增 root systemd unit `otilink-sosguard`（只读 `/sys/kos_rescue`、写 `rescue_feedback`）。
+卸载：`systemctl disable --now otilink-sosguard && rm /etc/systemd/system/otilink-sosguard.service /usr/local/bin/sosguard.sh`。
+
+### 未完成 / 待观察
+* 用户实际按键路径未复现（无法确认他按的就是 Win+H；但内核日志明确是 LEFTMETA+H，且这是 kysos_key 唯一认的组合）。
+* 是否还有其它 SOS 触发源（内核串里只有 LEFTMETA+H 一个）。
+* `gate.sh --hw-sos` 首跑：envcheck PASS=23 FAIL=0 WARN=2、sosreg PASS=9 FAIL=0（2026-11-05 10:36，现网）。
