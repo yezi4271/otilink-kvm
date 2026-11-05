@@ -12,6 +12,12 @@
 > AIC 驱动用 `install /bin/false` + udev `.disabled` **挡死**（重启后 `lsmod | grep aic` 为空）；
 > `panic_on_oops=0` 用 **late unit** `otilink-panic-on-oops.service`（`After=kdump-tools.service`）落地 ——
 > **只改 `KDUMP_SYSCTL` 无效**（`kdump-config` 末尾强制设回 1）。**与对拷线无关**。
+> **⚠️ 2026-11-05 更新（NOTES §74）：「蓝屏 / 键盘输入不了」还有第二个真因** —— 麒麟内核内置
+> `kysos_key` 把**左 Meta+H** 当 SOS 组合键，20s 无用户态确认就切 VT 到 `tty5` → `console_lock` 死锁 →
+> X 摘掉全部输入设备。**Windows 上 Win+H 是"语音输入"**，共享键盘（otikm EVIOCGRAB 挡不住内核 input
+> handler）时误触即中招。已装 `otilink-sosguard.service`（`otilink/sosguard.sh`）在超时前写
+> `/sys/kos_rescue/rescue_feedback=1` 取消救援；回归 `gate.sh --hw-sos`（`otilink/sosreg.sh`）。
+> 已死锁只能硬重启（`chvt`/`systemctl reboot` 都会卡在 console_lock）。
 > **⚠️ 换无线网卡会打断 Windows 热点 relay**：`127.0.0.1:2222`（`ssh kylin` 别名）按写死的 MAC
 > 找麒麟 IP，换卡后报 `Connection reset by peer`。已改成多 MAC 列表（新卡在前）+ IP fallback；换卡后
 > 记得更新 `C:\Users\<你的用户名>\dsh-kylin-relay.ps1` 并重启 relay（`RUNBOOK §21`）。实测：**`ssh kylin`（relay）是 LAN 直连 1.7–2.1s；`ssh kylin-ts`（tailscale）在本机走 DERP 中转 5.3–8.1s** —— 交互用前者、容错用后者。

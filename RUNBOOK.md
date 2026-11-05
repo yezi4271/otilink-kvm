@@ -1207,3 +1207,39 @@ $fallbackIp = '<麒麟热点IP>'
 实测 `ssh <host> true`（各 3 次）：**relay（LAN 直连）1.7–2.1s** vs **tailscale（DERP）5.3–8.1s**。
 > 结论：**交互用 `ssh kylin`（relay，快）；relay 失效或跨网时用 `ssh kylin-ts`（稳但慢）**。
 > 想让 tailscale 也直连：在 **Windows 主机**上跑 tailscale（它与麒麟同在热点 L2），或让 WSL 能看见热点网段。
+
+---
+
+## 22. 【第 59 轮】麒麟「蓝屏 / 键盘输入不了」= Win+H 误触发内置 SOS 救援（`kysos_key`）
+
+**症状**：桌面看着像死机/蓝屏，键盘鼠标全没反应；SSH 还能连。
+**一句判据**（SSH 里跑）：
+```bash
+cat /sys/class/tty/tty0/active      # 不是 tty7（常见 tty5）→ 就是本条
+cat /sys/kos_rescue/stats           # Timeout count 增加、Current state: IDLE（已超时）
+dmesg | grep -A6 'PANIC: SOS rescue' # 看到 SOS rescue timeout 即确诊
+```
+**真因**（NOTES §74）：麒麟内核 `kysos_key` 把**左 Meta+H** 当 SOS 组合键，20s 内没有用户态
+写 `/sys/kos_rescue/rescue_feedback=1` 确认，就切 VT 到 tty5 并拉起 `getty@tty5` →
+`console_lock` 死锁 → Xorg 摘掉全部输入设备。**Windows 上 Win+H 是"语音输入"**，共享键盘时
+误触即中招（EVIOCGRAB 挡不住内核 input handler）。
+
+**修法（已装）**：`otilink-sosguard.service`（`/usr/local/bin/sosguard.sh`）在超时前写
+`rescue_feedback=1` 取消救援；`install-kylin.sh` 第 6 步会装。
+```bash
+systemctl status otilink-sosguard          # 应 active
+tail -5 /var/log/otilink-sosguard.log      # 触发时会有「SOS 组合键（左 Meta+H）已被取消」
+```
+
+**已经死锁了怎么办**：`console_lock` 卡住时 `chvt`/`fgconsole`/`systemctl reboot` 都会卡，
+只能硬重启（`sync; sudo reboot -f`，或长按电源）。重启后确认：
+```bash
+cat /sys/class/tty/tty0/active                 # tty7
+DISPLAY=:0 xinput list | grep -c '\[slave'     # 设备都挂回 master（没有 floating）
+pgrep -x otikm | wc -l                         # 1
+```
+
+**回归**：`cd re/tools && ./gate.sh --hw-sos`（`otilink/sosreg.sh`，注入一次左 Meta+H，断言
+守卫取消、VT 不变、X 键盘不掉）。**守卫没在跑时该脚本会中止、不会注入**。
+
+**回滚**：`sudo systemctl disable --now otilink-sosguard && sudo rm /etc/systemd/system/otilink-sosguard.service /usr/local/bin/sosguard.sh`。

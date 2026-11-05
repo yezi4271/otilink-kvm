@@ -144,7 +144,7 @@ if [ -f "$RE_DIR/AGENTS.md" ]; then
     else bad "AGENTS.md 引用了不存在的路径："; echo "$MISSING" | sed 's/^/      /'; fi
 else bad "缺 re/AGENTS.md（agent 运行规范入口）"; fi
 # 2) 回归脚本必须被 gate.sh 注册
-for s in clipreg.sh xferreg.sh hwtest.sh kmbret.sh kbdexcl.sh hidlat.sh xferlocal.sh coretest; do
+for s in clipreg.sh xferreg.sh hwtest.sh kmbret.sh kbdexcl.sh hidlat.sh sosreg.sh xferlocal.sh coretest; do
     if [ -e "$OTI_DIR/$s" ]; then
         grep -q "$s" "$RE_DIR/tools/gate.sh" && ok "$s 已注册进门禁" || bad "$s 没被 gate.sh 注册（新验证脚本不许漏注册）"
     else warn "缺少回归脚本 $s"; fi

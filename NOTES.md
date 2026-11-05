@@ -4830,3 +4830,56 @@ Kylin 锁屏对话框（`ukui-screensaver-dialog --lock`）在位，键盘一直
 **现场处置 / 验证**：先 `pkill -x otikm` 释放键盘让用户输入密码；部署修复版后日志只有
 `屏幕已锁定/屏保 → 不抢控制权（保持当前所在侧；仅拒绝再交出去）`，`已独占` 计数 = 0；
 `coretest` 51/51。后续用户解锁后确认键盘可输入。
+
+---
+
+## 74 第 59 轮：2026-11-05「Windows 解锁后回 Kylin 键盘输入不了」= 麒麟内置 SOS 救援被 Win+H 误触发（`kysos_key`）
+
+**报障**：用户「windows解锁后，移动到kylin，键盘输入不了」（10:06，与 11-03「kylin蓝屏了」同一现象再现）。
+
+### 现场（SSH 仍通，桌面已死）
+* `cat /sys/class/tty/tty0/active` = **`tty5`**（X 在 `tty7`）→ 活动 VT 被切到空控制台。
+* `xinput list`：master 上只剩 XTEST，**所有**真实设备（SIGMACHIP 键盘 9/10/11、G304 8、AT Raw 14、线缆 HID 12/13）都是 `floating slave` → 桌面收不到任何输入。
+* `/var/log/Xorg.0.log`：`[149638] event* … device removed` ×11 → `AIGLX: Suspending AIGLX clients for VT switch`，之后再没回来。
+* `dmesg`：`[149638.542] PANIC: SOS rescue timeout! No feedback from userspace.` / `SOS count: 1, Feedback count: 0, Timeout count: 1` / `fb: framebuffer at …`；`getty@tty5` 同一秒启动。
+* `kworker/9:0`（`console_callback`）与 `(agetty)` 在 `console_lock` 上 D 态 >480s；`fgconsole` 也卡在 `tty_open` → `console_lock` 死锁（与 §71「蓝屏」同一层，但这次不是 panic 升级）。
+
+### 真因（从内核镜像里挖出来的）
+`/usr/src/linux-headers-*/scripts/extract-vmlinux` 解出 vmlinux 后 `strings`，kysos_key 的日志串：
+```
+KYSOS-KEY: SOS combination triggered: LEFTMETA+H
+KYSOS-KEY: SOS event reported to userspace
+PANIC: SOS rescue timeout! No feedback from userspace.
+```
+* 麒麟内核内置 `kysos_key`（`CONFIG_INPUT_KYSOS_KEY=y`，builtin，`/sys/kos_rescue/` 是它的接口），注册 `sos-handler` 挂在**所有**输入设备上（`/proc/bus/input/devices` 每个设备的 Handlers 都有 `sos-handler`）。
+* 它把**左 Meta + H** 当 SOS 组合键：触发后等 20s（`/sys/kos_rescue/rescue_delay`，范围 1000–60000），等用户态写 `/sys/kos_rescue/rescue_feedback=1` 确认；**没人确认就"救援"**：切 VT 到 tty5 + `getty@tty5` → `console_lock` 死锁 → X 摘掉全部输入设备。
+* 这台机器**没有**麒麟的用户态 SOS 处理器（`dpkg -l | grep -i sos` 只有 libfyba 的 SOSI；systemd 无对应 unit），所以每次触发必超时。
+* **为什么是"Windows 解锁后"**：键盘物理接在麒麟，otikm 用 EVIOCGRAB 抓它转发给 Windows —— 但 EVIOCGRAB 只挡其它 evdev 客户端，**挡不住内核 input handler**，所以用户在 Windows 上按 **Win+H（Windows 的"语音输入"快捷键）** 时，麒麟内核照样看到 `LEFTMETA+H` → 触发 SOS。11-03 16:20 那次「蓝屏」的 dmesg 也是同一串（`SOS rescue timeout`），两次是同一真因。
+
+### 修法（现场已部署 + 已回归）
+* 新增 `otilink/sosguard.sh` + `otilink/otilink-sosguard.service`：轮询 `/sys/kos_rescue/stats`，状态一离开 `IDLE`（`WAITING`）就写 `rescue_feedback=1`，救援被取消、不切 VT。代价：SOS 救援在本机不再生效 —— 它在本机只会死锁（§71/本条），保留没有收益。
+* `install-kylin.sh` 第 6 步安装/启用；`otilink/sosinject.c`（`make sosinject`）注入一次左 Meta+H 用于回归；新增门禁档 `gate.sh --hw-sos`（`otilink/sosreg.sh`）。
+* **现场验证**（10:28）：
+  ```
+  $ ./sosinject --wait 1        # 注入左 Meta+H
+  $ cat /sys/kos_rescue/stats
+  SOS triggered: 1
+  Feedback received: 1
+  Timeout count: 0
+  Current state: IDLE
+  $ cat /sys/class/tty/tty0/active
+  tty7
+  # /var/log/otilink-sosguard.log
+  2026-11-05 10:28:48 SOS 组合键（左 Meta+H）已被取消，state=WAITING
+  ```
+  → 内核收到了组合键，但守卫在超时前取消；VT 仍是 tty7，X 设备未动。
+* 现场处置：console_lock 死锁无法在线恢复（`chvt`/`fgconsole` 都卡），`sync; reboot -f` 重启；重启后 `tty7`、11 个输入设备全部挂回 master、otikm 正常。
+
+### 副作用 / 回滚
+新增 root systemd unit `otilink-sosguard`（只读 `/sys/kos_rescue`、写 `rescue_feedback`）。
+卸载：`systemctl disable --now otilink-sosguard && rm /etc/systemd/system/otilink-sosguard.service /usr/local/bin/sosguard.sh`。
+
+### 未完成 / 待观察
+* 用户实际按键路径未复现（无法确认他按的就是 Win+H；但内核日志明确是 LEFTMETA+H，且这是 kysos_key 唯一认的组合）。
+* 是否还有其它 SOS 触发源（内核串里只有 LEFTMETA+H 一个）。
+* `gate.sh --hw-sos` 首跑记录待补。
