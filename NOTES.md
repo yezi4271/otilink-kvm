@@ -4882,4 +4882,4 @@ PANIC: SOS rescue timeout! No feedback from userspace.
 ### 未完成 / 待观察
 * 用户实际按键路径未复现（无法确认他按的就是 Win+H；但内核日志明确是 LEFTMETA+H，且这是 kysos_key 唯一认的组合）。
 * 是否还有其它 SOS 触发源（内核串里只有 LEFTMETA+H 一个）。
-* `gate.sh --hw-sos` 首跑记录待补。
+* `gate.sh --hw-sos` 首跑：envcheck PASS=23 FAIL=0 WARN=2、sosreg PASS=9 FAIL=0（2026-11-05 10:36，现网）。
