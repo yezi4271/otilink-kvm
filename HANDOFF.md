@@ -168,7 +168,13 @@
 > * 新门禁：`--hw-clipstall`（hidduringclip.sh）、`--hw-freeze`（winfreeze.sh）。
 > 真机数据：`hidlat MAXGAP=15ms`（旧 372~482ms，650KB 剪贴板突发期间）、`kmbret PASS=21 FAIL=0 WARN=4`
 > （小步回程成功、park 37 包、**交接耗时 15ms**；现场真人日志还有一次 `交接耗时 35ms`）、麒麟 `SLOWOP=0`；
-> 剪贴板双向已由 win-pump 在解锁后手测互通。**⚠️ 2026-11-06 13:1x 解锁后正式回归（残活）**：
+> 剪贴板双向已由 win-pump 在解锁后手测互通。
+> **⚠️ 2026-11-06 15:40 文件剪贴板进展（用户报"文件不行"）**：`test.jpg`(1.6MB) 麒麟→Windows **已通**；
+> `test.jar`(302MB) 从 22% → **93%**（修了泵限流 2 帧/授权、加接收背压、CURSOR 降频、队列 64→256），
+> 但最后 ~250 片卡住：Windows 反复回"缺片位图"，麒麟收不到 → **Windows→麒麟方向的 CLIP 帧仍在丢**
+> （小帧能到、PS 入队 CLIP 帧不到，同早前 ENQ/TXF/RXF 观测）。已加 ACK×3、DONE 5s 重发、裁决 120s、
+> 接收超时 180s 兜底；`--hw-lat` PASS=5。详见 NOTES §76.7。
+> **⚠️ 2026-11-06 13:1x 解锁后正式回归（残活）**：
 > 鼠标/交接指标保持达标；但 `clipreg` 最佳 **PASS=15 FAIL=2**（多次跑 12~15 跳动），失败全是
 > **内容乱序/陈旧覆盖**（收到上一笔旧内容），帧解码无失败；`clipshort` 7/7 过。
 > 逐帧 trace 定位：ACK **迟到**（`RECV ACK … active=0`；`ENQ type=6→TXF` 间隔 ~1.1s；同期 `SLOWOP` 250~330ms）——
