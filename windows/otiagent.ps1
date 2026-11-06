@@ -82,7 +82,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 # BuildTag：改本文件必须 bump（日志证据行/部署核对用；与 otiagent2.cs 的 BuildTag 分开）。
 #   pump-throttle-1 → nativepump-1：线缆 I/O 从 PowerShell 主循环搬进 Add-Type 的 C# 后台泵线程。
 #   nativepump-2：锁屏时 Set-Clipboard 抛 ExternalException 会把代理整个带走 —— CLIP 文本应用加 catch（2026-11-06 真机）。
-$script:BuildTag = 'nativepump-2'
+$script:BuildTag = 'nativepump-12'
 
 # ---- 单实例守卫（L4 的剪贴板代理版）----
 # 同一条线缆帧管道**只能有一个读者**。两个实例会互相抢走发送授权消息与帧，症状是
@@ -522,10 +522,11 @@ public static class Oti
 //     写帧期间不插别的设备操作（与 otilink/otitrans.c 的 cable_pump_once_locked 语义一致）。
 public static class CablePump
 {
-    public const string BuildTag = "nativepump-2";
-    public const int QCAP = 64;              // 每个方向的队列容量（满丢最旧并计数）
+    public const string BuildTag = "nativepump-12";
+    public const int QCAP = 256;   // 大文件分片突发：64 太小，PS 处理跟不上会丢帧（实测 302MB 传输丢 78%）              // 每个方向的队列容量（满丢最旧并计数）
     const string LogPath = @"C:\Users\Public\cable.log";
-    const int CURSOR_MS = 40;                // 光标遥测周期（brief 要求 20~50ms）
+    const int CURSOR_MS = 150;               // 光标遥测周期 40→150ms（6.7/s）：回程判据 TTL 300ms 内足够；
+                                             // 40ms(25/s) 会超过设备授权写速、把 ACK/CLIP 挤到队后（2026-11-06 实测）
     const int ROLE_MS = 1000;                // ROLE 重发周期
     const int HELLO_MS = 10000;              // HELLO / 注入模式重发周期
     const int SLOW_MS = 30;                  // 单次设备操作超过它就打 SLOWOP（证据行）
@@ -727,9 +728,12 @@ public static class CablePump
                 byte ty = msg[0];
                 if (ty == 0x05)
                 {
-                    // 对端有帧：一次最多读 4 帧（与 otilink 一致，缩短单次占用）
+                    // 对端有帧：一次最多读 4 帧（与 otilink 一致，缩短单次占用）。
+                    // **背压**：PS 主循环跟不上时（大文件分片 226 帧/s 而 PS ~50 帧/s）绝不读进来丢掉——
+                    // 让帧留在设备缓冲里，对端写帧自然变慢 → 发送端 send_wait 被限速，靠"慢"而不是"丢"。
                     int n = ((int)msg[1] << 8) | (int)msg[2];
                     if (n > 4) n = 4;
+                    lock (lk) { if (rxq.Count >= QCAP - 8) n = 0; }
                     for (int i = 0; i < n && !stopFlag && g == gen; i++)
                     {
                         long t1 = Stopwatch.GetTimestamp();
@@ -763,11 +767,11 @@ public static class CablePump
                 }
                 else if (ty == 0x06 || ty == 0x07)
                 {
-                    // 发送授权窗口：**每次授权最多写 2 帧**就回到消息读循环。
-                    // 为什么不一次清空 txq（首版设计是清空）：剪贴板大图 11 帧 × 2~4ms = 40ms，
-                    // 正好贴住 HID 写最大间隔的验收阈值（40ms）；限量后我们每轮都上报 pending，
-                    // 设备会继续发授权，CURSOR/HID 有插空机会（Lead 2026-11-06 决定）。
-                    for (int w = 0; w < 2 && !stopFlag && g == gen; w++)
+                    // 发送授权窗口：**一次把 txq 写完**（与旧 PowerShell 泵/厂商语义一致）。
+                    // 2026-11-06 真机教训：限量 2 帧时，ACK/CLIP 长期排在 CURSOR 之后，抓不住
+                    // 授权窗口 → 对端 1.5s 收不到 ACK → 重发风暴；现场还表现为"Windows→麒麟
+                    // 的剪贴板帧干脆到不了"。实测帧写 2~4ms，整队通常 <30ms；慢对端由麒麟侧退避兜底。
+                    for (int w = 0; w < QCAP && !stopFlag && g == gen; w++)
                     {
                         byte[] body;
                         lock (lk)
@@ -831,8 +835,9 @@ public static class CablePump
             lastCursorTick = now;
             int pend;
             lock (lk) { pend = txq.Count; }
-            // 队列快满时先不发光标遥测：别把剪贴板数据帧挤掉（光标是"最新值"，晚一点无所谓）
-            if (pend < QCAP - 16)
+            // 队列里有积压就**不发光标遥测**：ACK/CLIP 必须优先出队（ACK 迟到 1.5s 会引发重发风暴）；
+            // 光标是"最新值"语义，晚一点/少几帧无所谓（回程判据 TTL 300ms）。
+            if (pend < 8)
             {
                 byte[] pl = CursorPayload();
                 if (pl != null) EnqueueTx(Oti.Encode(11, 0, pl, 8));
@@ -2739,7 +2744,7 @@ function New-TxState {
     @{ active=$false; fid=[uint32]0; paths=@(); cur=0; fs=$null; name=''; total=[uint64]0;
        nparts=0; sent=0; crc=[uint32]0; crcDone=$false; phase=0; deadline=(Get-Date);
        rounds=0; t0=(Get-Date); lastLog=(Get-Date); done=0; bytes=[uint64]0;
-       todo=$null; todoI=0; doneParts=0; failStreak=0 }
+       todo=$null; todoI=0; doneParts=0; failStreak=0; verdictResend=(Get-Date) }
 }
 function New-RxState {
     @{ active=$false; fid=[uint32]0; fs=$null; name=''; path=''; partPath=''; total=[uint64]0;
@@ -2881,8 +2886,8 @@ function Send-TxPart([int]$idx) {
 function Step-FileTx {
     # 接收端超时清理（对端掉线/中断时别把 .part 文件永远留着）
     $r = $script:fileRx
-    if ($r.active -and ((Get-Date) - $r.lastPart).TotalSeconds -gt 60) {
-        Write-Host "  [warn] 大文件接收超时（60 秒无新片），丢弃 $($r.name)（$($r.got)/$($r.nparts) 片）"
+    if ($r.active -and ((Get-Date) - $r.lastPart).TotalSeconds -gt 180) {
+        Write-Host "  [warn] 大文件接收超时（180 秒无新片），丢弃 $($r.name)（$($r.got)/$($r.nparts) 片）"
         try { if ($r.fs) { $r.fs.Close() } } catch { }
         try { Remove-Item -LiteralPath $r.partPath -Force -ErrorAction SilentlyContinue } catch { }
         $script:fileRx = New-RxState
@@ -2894,7 +2899,12 @@ function Step-FileTx {
     # 我这边 fid 大就先停，等对端传完（两边比较的是同一对数 → 不会双双停住）。
     if ($script:fileRx.active -and $t.fid -gt $script:fileRx.fid) { return }
     if ($t.phase -eq 1) {                       # 等裁决
-        if (((Get-Date) - $t.deadline).TotalSeconds -gt 30) { Abort-FileTx "等待对端校验超时（30 秒）" }
+        if (((Get-Date) - $t.deadline).TotalSeconds -gt 120) { Abort-FileTx "等待对端校验超时（120 秒）" }
+        # DONE 单帧丢失 → 收端永不裁决：每 5s 重发（幂等）
+        if ((Get-Date) -ge $t.verdictResend) {
+            $t.verdictResend = (Get-Date).AddSeconds(5)
+            [void](Send-FileCtrl $t.fid 1 0 $t.total $t.crc $t.nparts 0 $t.name)
+        }
         return
     }
     if ($null -eq $t.fs) {
@@ -2939,8 +2949,9 @@ function Step-FileTx {
     if ($allSent -and $t.phase -eq 0) {
         $rc = Send-FileCtrl $t.fid 1 0 $t.total $t.crc $t.nparts 0 $t.name
         $t.phase = 1
-        $t.deadline = (Get-Date).AddSeconds(30)
-        Write-Host "  [xfer] $($t.name) 全部 $($t.nparts) 片已发出，等待对端校验（crc=$('{0:x8}' -f $t.crc)）…"
+        $t.deadline = (Get-Date).AddSeconds(120)
+        $t.verdictResend = (Get-Date).AddSeconds(5)
+        Write-Host "  [xfer] $($t.name) 全部 $($t.nparts) 片已发出，等待对端校验（crc=$('{0:x8}' -f $t.crc)，最长 120s）…"
     }
 }
 
@@ -3107,7 +3118,8 @@ function Handle-FileDone([byte[]]$pl) {
     # 防回环：记下"我刚写进剪贴板的这份文件"的身份，下一轮轮询就不会再发回去
     $script:lastFileIdent = Get-FileIdent @($final)
     $script:haveFileIdent = $true
-    [void](Send-FileCtrl $fid 2 1 $r.total 0 $r.nparts $r.nparts $r.name)
+    # 裁决单帧会丢（帧通道静默丢帧）：冗余 3 份，发端幂等
+    for ($vi = 0; $vi -lt 3; $vi++) { [void](Send-FileCtrl $fid 2 1 $r.total 0 $r.nparts $r.nparts $r.name) }
     $script:fileRx = New-RxState
 }
 
@@ -3123,7 +3135,11 @@ function Send-ClipAck([uint32]$crc, [uint16]$fmt) {
     $pl = New-Object byte[] 8
     [Oti]::Put32($pl, 0, $crc); [Oti]::Put16($pl, 4, $fmt); [Oti]::Put16($pl, 6, 0)
     $msg = [Oti]::Encode(6, 0, $pl, 8)
-    return (TxBody $msg)
+    # 线缆帧通道会静默丢帧：ACK 单帧丢一次，对端就重发整笔并覆盖剪贴板（文件尤其明显）。
+    # 冗余 3 份（对端按 crc 匹配，幂等）。
+    $rc = TxBody $msg
+    for ($i = 0; $i -lt 2; $i++) { [void](TxBody $msg) }
+    return $rc
 }
 
 # 发送一份剪贴板载荷（首发/重发共用）；成功后登记"待对端确认"
@@ -3165,7 +3181,7 @@ function Send-ClipPayload([byte[]]$bytes, [int]$clipFmt, [uint32]$crc, [string]$
     # 登记待确认：对端应用后会回 ACK（type=6）。重发时**不重新登记**（否则重试计数被清零 → 无限重发）
     if (-not $NoRegister) {
         $script:clipAck = @{ active = $true; crc = $crc; fmt = $clipFmt; bytes = $bytes;
-                             deadline = (Get-Date).AddMilliseconds(1500); tries = 0 }
+                             deadline = (Get-Date).AddMilliseconds(2500); tries = 0 }
     }
     return 0
 }
@@ -3175,7 +3191,7 @@ function Step-ClipAck {
     $k = $script:clipAck
     if (-not $k.active) { return }
     if ((Get-Date) -lt $k.deadline) { return }
-    if ($k.tries -ge 3) {
+    if ($k.tries -ge 6) {
         Write-Host "  [warn] 剪贴板 $($k.bytes.Length) 字节重发 3 次仍无确认，放弃"
         $script:nAckFail++
         $k.active = $false; $k.bytes = $null
@@ -3187,7 +3203,7 @@ function Step-ClipAck {
     $t = $k.tries
     [void](Send-ClipPayload $k.bytes $k.fmt $k.crc '重发' -NoRegister)
     $k.tries = $t                       # Send-ClipPayload 不动它，这里显式保留
-    $k.deadline = (Get-Date).AddMilliseconds(1500)
+    $k.deadline = (Get-Date).AddMilliseconds(2500)
 }
 
 Write-Host "开始循环（Ctrl+C 退出）…"

@@ -70,6 +70,7 @@ struct oti_xfer_tx {
     int      crc_done;
     int      phase;             /* 0=发片 1=等裁决 */
     long     wait_deadline_ms;
+    long     verdict_resend_ms;  /* phase 1：下次重发 DONE 的时刻（丢帧容错） */
     long     t_start_ms, t_log_ms;
     int      rounds;            /* 重传轮数（护栏） */
     int      fail_streak;       /* 连续发送失败次数（退避/放弃判据） */

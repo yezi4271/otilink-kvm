@@ -5148,6 +5148,36 @@ otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otili
   之后重启剪贴板代理（双击 `restart-clip.vbs` 或 `cd re/windows && ./deploy.sh --restart`）。
 * 结论：**安全软件对本项目是"第二主人"级别的干扰源**（相当于 L1 的另一种形态），排障时先确认它没拦。
 
+### 76.7 文件剪贴板/大文件排查（2026-11-06 15:00–15:40，用户报"文字能复制、文件不行"）
+
+**实测矩阵（当前部署：Windows nativepump-12 + 麒麟本轮传输改动）**
+* 文本：麒麟→Windows **可应用**（`Get-Clipboard` 校验）；Windows→麒麟 **时通时不通**。
+* 文件（用户给的 `test.jpg` 1.6MB / `test.jar` 302MB，麒麟桌面）：
+  * `test.jpg` 麒麟→Windows **通过**：Windows 剪贴板出现 1 个文件（解到 `Temp\otilink_files_*`）。
+  * `test.jar` 麒麟→Windows **到 93% 卡住**：见下。
+  * Windows→麒麟 文件：**不通**（Windows 侧日志有 `CLIP 发送 52 字节 fmt=3 源=文件`，麒麟侧无任何 `RECV CLIP`）。
+
+**本轮查到的两个真问题**
+1. **Windows 泵"限量 2 帧/授权"造成 ACK/CLIP 排不上队**（已修）：改成每次授权把 txq 写完；同时 CURSOR 40ms→150ms、
+   队列 64→256、PS 跟不上时**背压**（不读进队列丢，让设备缓冲把对端写堵慢）。
+   实测 302MB 大文件从上一版 22%（丢 78%）→ **93%**，接收端 3.2MB/s 稳定，`[xfer] 接收 … 93.1%`。
+2. **Windows→麒麟方向 type=4（CLIP）帧仍然丢**（未修完）：大文件到 93% 后，Windows 反复
+   `[warn] … 缺 252 片，回缺片位图（从第 0 片起）`，麒麟日志里**没有任何**收到裁决/缺片的记录 →
+   RESUME 控制帧没到。同一条链路上小帧（CURSOR/ROLE/ACK）能到、PS 入队的 CLIP 帧不到，
+   与之前"ENQ 有、TXF 无、RXF 无"的观测一致，怀疑在 Windows 泵写 PS 帧的路径（待下一轮定点测）。
+   帧通道本身有 40% 量级静默丢帧（NOTES 旧结论），控制帧（DONE/RESUME/VERDICT）必须冗余+可重发。
+
+**已部署的配套修复（本轮）**
+* ACK 双端冗余 3 份；重发策略 1.5s×3 → 2.5s×6（容忍慢 ACK，避免重发风暴覆盖剪贴板）。
+* 大文件：DONE 每 5s 重发、等裁决 30s→120s、接收端"无新片"超时 60s→180s、完成裁决 ×3。
+* 麒麟：读侧退避阈值 30→150ms（读退避会自伤 ACK 时延）；写入侧 HID 守卫默认关闭（动鼠标时会把 CLIP/ACK 饿死）。
+* 回归：`gate.sh --hw-lat` PASS=5 FAIL=0（改动后 HID 最大间隔仍达标）。
+
+**未完成（下一轮）**
+* Windows→麒麟 CLIP 帧丢失的定点定位（建议给 Windows 泵加每帧 ENQ/TXF/RXF 日志 + 记录写 rc）；
+* `test.jar` 302MB 端到端 md5（当前停在 93%，RESUME 丢失后失败）；
+* `clipreg` 正式回归（当前仍受 ACK 延迟/乱序影响，最佳 15/17）。
+
 ### 76.6 现场应急（本轮已做）
 
 * 11:37 对 Kylin `~/otilink/otitrans.c` 做了**临时热修**（`if (0 && g_hid_busy)`）并重启 otikm，

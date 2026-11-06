@@ -1711,7 +1711,7 @@ static void clip_ack_register(struct app *a, const void *data, size_t len, uint3
     a->ack_fmt = fmt;
     a->ack_active = 1;
     a->ack_tries = 0;
-    a->ack_deadline_ms = now_ms() + 1500;
+    a->ack_deadline_ms = now_ms() + 2500;
 }
 
 /* 超时未确认 → 重发（复用登记时的字节） */
@@ -1721,8 +1721,8 @@ static void clip_ack_check(struct app *a)
         return;
     if (now_ms() < a->ack_deadline_ms)
         return;
-    if (a->ack_tries >= 3) {
-        say(a, "[warn] 剪贴板 %zu 字节重发 3 次仍无确认（对端在吗？），放弃", a->ack_len);
+    if (a->ack_tries >= 6) {
+        say(a, "[warn] 剪贴板 %zu 字节重发 %d 次仍无确认（对端在吗？），放弃", a->ack_len, a->ack_tries);
         a->n_ack_fail++;
         a->ack_active = 0;
         free(a->ack_buf);
@@ -1733,7 +1733,7 @@ static void clip_ack_check(struct app *a)
     a->n_ack_retry++;
     say(a, "剪贴板未确认 → 第 %d 次重发 %zu 字节（crc=%08x）", a->ack_tries, a->ack_len, a->ack_crc);
     send_clipboard(a, a->ack_buf, a->ack_len);     /* 只发，不重新登记 */
-    a->ack_deadline_ms = now_ms() + 1500;
+    a->ack_deadline_ms = now_ms() + 2500;
 }
 
 /* 保活：所有传输发 PING（可探测对端存活）；线缆模式额外发全零 dummy 帧冲刷设备
@@ -2377,6 +2377,10 @@ static void *rx_thread(void *arg)
             const uint8_t *data;
             uint32_t dlen;
             if (oti_decode_clip(pl, h.len, &ch, &data, &dlen) == 0) {
+                if (a->cfg.verbose)
+                    say(a, "RECV CLIP fmt=%u fid=%u off=%u total=%u dlen=%u",
+                        (unsigned)ch.format, (unsigned)ch.fid, (unsigned)ch.offset,
+                        (unsigned)ch.total_len, (unsigned)dlen);
                 /* 大文件分片 / 传输控制：先于普通剪贴板重组分派（见 otixfer.h） */
                 if (ch.format == OTI_CLIP_FMT_PART) {
                     /* u32 idx, u32 nparts, u64 total, u32 namelen, name, u32 dlen2, data */
@@ -2454,15 +2458,20 @@ static void *rx_thread(void *arg)
                             /* 走**可靠**发送：ACK 很小，可它一丢，对端就会把整笔内容重发 3 轮
                                （实测主控模式下 6KB 图片被重发 8 次；8MB 包更亏）。
                                超时给短一点，别把接收线程拖住。 */
+                            /* 线缆帧通道会静默丢帧（实测 40% 量级）——ACK 只有一帧，丢一次发送端就
+                               重发整笔并可能覆盖剪贴板（2026-11-06 现场：文字/文件复制互相打架）。
+                               冗余 3 份（首份走可靠发送，其余入队），接收端幂等。 */
                             int arc = oti_tr_send_wait(a->tx, ab, an, 300);
                             note_send_result(a, arc);
-                            if (arc)
-                                say(a, "ERR send ACK rc=%d", arc);
-                            else {
+                            if (arc == 0) {
+                                for (int ai = 0; ai < 2; ai++)
+                                    (void)oti_tr_send(a->tx, ab, an);
                                 a->n_sent++;
                                 if (a->cfg.verbose)
-                                    say(a, "→ 回执 ACK crc=%08x（fmt=%u）", rh,
+                                    say(a, "→ 回执 ACK×3 crc=%08x（fmt=%u）", rh,
                                         (unsigned)(ch.format ? ch.format : 1));
+                            } else {
+                                say(a, "ERR send ACK rc=%d", arc);
                             }
                         }
                     }

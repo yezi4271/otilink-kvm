@@ -230,8 +230,9 @@ static void tx_send_done(struct oti_xfer_tx *t)
         memcpy(b + 28, t->name, nl);
     t->ops->send_clip(t->ops->user, OTI_CLIP_FMT_CTRL, t->fid, b, 28 + nl);
     t->phase = 1;
-    t->wait_deadline_ms = now_ms() + 30000;
-    xlog(t, "  %s 全部 %u 片已发出，等待对端校验（crc=%08x）…", t->name, t->nparts, t->crc);
+    t->wait_deadline_ms = now_ms() + 120000;   /* 大文件在慢链路上收端可能落后 >30s */
+    t->verdict_resend_ms = now_ms() + 5000;
+    xlog(t, "  %s 全部 %u 片已发出，等待对端校验（crc=%08x，最长 120s）…", t->name, t->nparts, t->crc);
 }
 
 void oti_xfer_tx_verdict(struct oti_xfer_tx *t, uint16_t flags, uint32_t resume_from,
@@ -361,9 +362,26 @@ int oti_xfer_tx_poll(struct oti_xfer_tx *t)
     map = NULL;
 
     if (t->phase == 1) {                     /* 等裁决 */
-        if (now_ms() > t->wait_deadline_ms) {
-            oti_xfer_tx_abort(t, "等待对端校验超时（30 秒）");
+        long now = now_ms();
+        if (now > t->wait_deadline_ms) {
+            oti_xfer_tx_abort(t, "等待对端校验超时（120 秒）");
             return 0;
+        }
+        /* DONE 帧同样是单帧，丢了收端就永远不裁决 → 每 5s 重发（幂等） */
+        if (now >= t->verdict_resend_ms) {
+            t->verdict_resend_ms = now + 5000;
+            uint8_t b[64];
+            size_t nl = strlen(t->name);
+            w16(b + 0, OTI_XFER_DONE);
+            w16(b + 2, 0);
+            w64(b + 4, t->total);
+            w32(b + 12, t->crc);
+            w32(b + 16, t->nparts);
+            w32(b + 20, 0);
+            w32(b + 24, (uint32_t)nl);
+            if (nl)
+                memcpy(b + 28, t->name, nl);
+            t->ops->send_clip(t->ops->user, OTI_CLIP_FMT_CTRL, t->fid, b, 28 + nl);
         }
         return 1;
     }

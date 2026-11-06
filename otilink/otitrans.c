@@ -145,7 +145,11 @@ void oti_tr_set_slowop_policy(int threshold_ms, int base_ms, int max_ms)
 }
 
 /* 写入侧 HID 优先窗口（见 otitrans.h）：默认 50ms，0 = 关闭。 */
-static int g_hid_guard_ms = OTI_HID_GUARD_MS;
+/* 2026-11-06 真机修正：默认**关闭**写入侧 HID 优先守卫。
+   原因：Windows 原生泵到位后帧写 2~4ms，这个守卫不但没收益，还在用户动鼠标时把
+   CLIP/ACK 饿死（现场"文字也复制不过去"、重发 3 次放弃）。慢对端由慢写退避窗口处理；
+   真要调试可用 oti_tr_set_hid_guard_ms(50) 打开。 */
+static int g_hid_guard_ms = 0;
 void oti_tr_set_hid_guard_ms(int ms) { g_hid_guard_ms = ms > 0 ? ms : 0; }
 
 /* HID 写入成功后由捕获/泵线程调用：只写一个时间戳，**不拿 t->lock**（否则捕获线程会
