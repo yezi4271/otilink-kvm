@@ -82,7 +82,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 # BuildTag：改本文件必须 bump（日志证据行/部署核对用；与 otiagent2.cs 的 BuildTag 分开）。
 #   pump-throttle-1 → nativepump-1：线缆 I/O 从 PowerShell 主循环搬进 Add-Type 的 C# 后台泵线程。
 #   nativepump-2：锁屏时 Set-Clipboard 抛 ExternalException 会把代理整个带走 —— CLIP 文本应用加 catch（2026-11-06 真机）。
-$script:BuildTag = 'nativepump-14'
+$script:BuildTag = 'nativepump-23'
 
 # ---- 单实例守卫（L4 的剪贴板代理版）----
 # 同一条线缆帧管道**只能有一个读者**。两个实例会互相抢走发送授权消息与帧，症状是
@@ -522,7 +522,7 @@ public static class Oti
 //     写帧期间不插别的设备操作（与 otilink/otitrans.c 的 cable_pump_once_locked 语义一致）。
 public static class CablePump
 {
-    public const string BuildTag = "nativepump-14";
+    public const string BuildTag = "nativepump-23";
     public const int QCAP = 256;   // 每个方向队列容量（大文件分片突发：64 太小，PS 跟不上会丢帧）
     // 大文件传输期间**暂停光标遥测**：单队列设备上双向同时写帧会互相堵
     // （实测两侧帧写都出现 ~1.28s 的对称卡顿 → 传输速率掉到 0.1~0.4MB/s）。
@@ -2516,15 +2516,36 @@ function Get-IdleMs {
 #    每 3 秒对每个设备查一次会**卡住线缆泵**（帧静默丢失、对端写命令被拒 rc=524546）。
 #    RemovalPolicy 在设备插着的时候不会变 → 按 InstanceId 缓存，只在首次见到时查。
 $script:rolePolCache = @{}
+# 读 RemovalPolicy 的 PnP 属性调用与 CIM 一样会**在 agent 进程内挂死**（实测：
+# 主循环卡在 Update-LocalInput 的 Where-Object→Test-HotplugInput，剪贴板/键鼠全哑）。
+# 用独立 runspace + 1.2s 超时；超时按"可热插拔"处理并本次会话停用该探测。
+$script:pnpPropBroken = $false
 function Test-HotplugInput([string]$instanceId) {
     if ($script:rolePolCache.ContainsKey($instanceId)) { return $script:rolePolCache[$instanceId] }
     $v = $true
-    try {
-        $pol = (Get-PnpDeviceProperty -InstanceId $instanceId -KeyName 'DEVPKEY_Device_RemovalPolicy' -EA Stop).Data
-        $v = ([int]$pol -ne 1)        # 1 = EXPECT_NO_REMOVAL = 内置/不可移除
-    } catch {
-        Write-Host ("  ROLE [warn] 读不到 " + $instanceId + " 的 RemovalPolicy，按可热插拔处理")
-        $v = $true
+    if (-not $script:pnpPropBroken) {
+        $ps = [PowerShell]::Create()
+        [void]$ps.AddScript("try { (Get-PnpDeviceProperty -InstanceId '" + $instanceId +
+            "' -KeyName 'DEVPKEY_Device_RemovalPolicy' -ErrorAction Stop).Data } catch { 'ERR' }")
+        try {
+            $h = $ps.BeginInvoke()
+            if (-not $h.AsyncWaitHandle.WaitOne(1200)) {
+                try { $ps.Stop() } catch { }
+                $script:pnpPropBroken = $true
+                Write-Host ("  ROLE [warn] PnP 属性查询超时（" + $instanceId + "）→ 本次会话停用 RemovalPolicy 探测，按可热插拔处理")
+            } else {
+                $r = $ps.EndInvoke($h)
+                if ($null -ne $r -and "$r" -ne 'ERR' -and "$r" -ne '') {
+                    $v = ([int]"$r" -ne 1)        # 1 = EXPECT_NO_REMOVAL = 内置/不可移除
+                } else {
+                    Write-Host ("  ROLE [warn] 读不到 " + $instanceId + " 的 RemovalPolicy，按可热插拔处理")
+                }
+            }
+        } catch {
+            Write-Host ("  ROLE [warn] 读不到 " + $instanceId + " 的 RemovalPolicy，按可热插拔处理")
+        } finally {
+            try { $ps.Dispose() } catch { }
+        }
     }
     $script:rolePolCache[$instanceId] = $v
     return $v
@@ -2543,15 +2564,49 @@ $script:probeJob = $null
 #    取值是权衡：**20 秒**（检测键鼠换边 ≤20s；更长会拖慢换主控、甚至两端同时主控）。
 #    根治方向：改用 Raw Input（GetRawInputDeviceList，无 WMI），或在后台 **runspace** 里跑
 #    （而不是每几秒起子进程）。见 re/NOTES.md §58。
+# WMI/CIM 调用在个别机器上会**永久挂住**（实测本机 agent 进程内 Get-CimInstance 卡死，
+# 而新开的 PowerShell 又是 0.3s 返回 → 不是 WMI 服务坏，是该 host 的 WMI 客户端状态）。
+# 主循环要是卡在这里，剪贴板/键鼠全哑（现场"Windows→麒麟文字文件都不行"）。
+# 用独立 runspace + 超时兜底：超时就放弃本轮并标记坏掉，后续用 Raw Input 兜底，绝不再挂。
+$script:cimBroken = $false
+function Get-CimTimed([string]$cls, [int]$ms) {
+    if ($script:cimBroken) { return $null }
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript('@(Get-CimInstance ' + $cls + ' -ErrorAction SilentlyContinue)')
+    try {
+        $h = $ps.BeginInvoke()
+        if (-not $h.AsyncWaitHandle.WaitOne($ms)) {
+            try { $ps.Stop() } catch { }
+            try { $ps.Dispose() } catch { }
+            $script:cimBroken = $true
+            Write-Host ("  [warn] CIM 查询 " + $cls + " 超时 " + $ms + "ms → 本次会话停用 WMI 本机输入探测（改用 Raw Input/上次值）")
+            return $null
+        }
+        $r = $ps.EndInvoke($h)
+        return $r
+    } catch {
+        $script:cimBroken = $true
+        return $null
+    } finally {
+        try { $ps.Dispose() } catch { }
+    }
+}
+
 function Update-LocalInput {
     # 用 Win32_Keyboard / Win32_PointingDevice（简单 CIM 类）替代 Get-PnpDevice：
     # 实测同样 5 个设备，Get-PnpDevice **1267ms** vs CIM **328ms**。这个耗时就是主循环被
     # 阻塞的时间（阻塞期间一帧都收不到）—— 越短，帧丢得越少、换边检测才能更快。
-    $kbd = @(); $mou = @()
-    try { $kbd = @(Get-CimInstance Win32_Keyboard -EA SilentlyContinue) } catch {}
-    try { $mou = @(Get-CimInstance Win32_PointingDevice -EA SilentlyContinue) } catch {}
-    $kbd = @($kbd | Where-Object { $_.PNPDeviceID -and $_.PNPDeviceID -notmatch 'VID_0EA0&PID_2213' -and (Test-HotplugInput $_.PNPDeviceID) })
-    $mou = @($mou | Where-Object { $_.PNPDeviceID -and $_.PNPDeviceID -notmatch 'VID_0EA0&PID_2213' -and (Test-HotplugInput $_.PNPDeviceID) })
+        $kbd = @(); $mou = @()
+    $rk = Get-CimTimed 'Win32_Keyboard' 1500
+        $rm = Get-CimTimed 'Win32_PointingDevice' 1500
+        if ($null -ne $rk) { $kbd = @($rk | Where-Object { $_ }) }
+    if ($null -ne $rm) { $mou = @($rm | Where-Object { $_ }) }
+    if ($null -eq $rk -or $null -eq $rm) {
+        # 超时：不动 roleHasLocal（不知道就别乱改角色），下次循环再说；已经置 cimBroken 就不再试。
+        return
+    }
+        $kbd = @($kbd | Where-Object { $_.PNPDeviceID -and $_.PNPDeviceID -notmatch 'VID_0EA0&PID_2213' -and (Test-HotplugInput $_.PNPDeviceID) })
+        $mou = @($mou | Where-Object { $_.PNPDeviceID -and $_.PNPDeviceID -notmatch 'VID_0EA0&PID_2213' -and (Test-HotplugInput $_.PNPDeviceID) })
     $nl = 0; if ($kbd.Count -gt 0 -or $mou.Count -gt 0) { $nl = 1 }
     if ($nl -ne $script:roleHasLocal) {
         $script:roleHasLocal = $nl
@@ -2727,7 +2782,9 @@ function Send-Role {
 }
 
 Update-LocalInput
+
 try { $rawN = @([OtiRaw]::Names()).Count; Write-Host ("RAW 设备数=" + $rawN + "（>0 表示可用 Raw Input 替代 Get-PnpDevice）") } catch { Write-Host ("RAW 探测失败: " + $_.Exception.Message) }
+
 Write-Host ("ROLE 初始化: boot={0:x8} hasLocal={1} want={2} state=slave（Windows 侧 grab=跑 otiagent2）" -f $script:roleBoot, $script:roleHasLocal, $script:roleWant)
 
 # ============================ 大文件流式传输（format 4/5）============================
@@ -2879,11 +2936,21 @@ function Send-TxPart([int]$idx) {
     [Oti]::Put32($pl, 40 + $nb.Length, [uint32]$n)
     if ($n -gt 0) { [Array]::Copy($buf, 0, $pl, 44 + $nb.Length, $n) }
     $msg = [Oti]::Encode(4, $t.fid, $pl, 44 + $nb.Length + $n)
+    # 发送端背压：设备写入速度有限，泵队列积压时等一等（此前直接入队 → 队列满静默丢帧，
+    # 实测 184MB 传输首轮丢 800+ 片）。与麒麟侧 send_wait 的阻塞语义对齐。
+    $bpN = 0
+    while ([CablePump]::PendingTx -gt 192 -and $bpN -lt 1000) {
+        Start-Sleep -Milliseconds 2
+        $bpN++
+    }
     $wrc = TxBody $msg
     if ($wrc -eq 0) {
         if ($t.todo) { $t.todoI++ } else { $t.sent++ }
         $t.doneParts++
     }
+    # 发送端限速：接收端/设备消化约 3MB/s，猛发会让设备写阻塞 ~1.28s，
+    # 期间 HID 注入写被堵 → 鼠标冻结（hidlat 实测 MAXGAP=1284ms）。
+    Start-Sleep -Milliseconds 20
     return $wrc
 }
 
@@ -2987,7 +3054,7 @@ function Handle-FileVerdict([byte[]]$pl) {
     }
     if ($flags -band 4) { Abort-FileTx "对端放弃"; return }
     if ($flags -band 2) {                       # RESUME
-        if ($t.rounds -ge 3) { Abort-FileTx "重传 3 轮仍未通过校验"; return }
+        if ($t.rounds -ge 8) { Abort-FileTx "重传 8 轮仍未通过校验"; return }
         $t.rounds++
         $t.todo = $null; $t.todoI = 0
         $mapOff = 48 + $nl
@@ -3002,8 +3069,9 @@ function Handle-FileVerdict([byte[]]$pl) {
                 Write-Host "  [xfer] 对端位图为空（可能要求整份重发），从头发"
                 $t.sent = 0
             } else {
-                $t.todo = $todo
-                Write-Host "  [xfer] 对端缺 $($todo.Count) 片，按位图补发（第 $($t.rounds) 轮）"
+                # 补发也丢帧（W→K 小帧丢失率实测很高）→ 每个缺片补 3 份
+                $t.todo = @($todo | ForEach-Object { $_, $_, $_ })
+                Write-Host "  [xfer] 对端缺 $($todo.Count) 片，按位图补发 ×3（第 $($t.rounds) 轮）"
             }
         } else {
             if ($resume -ge $t.nparts) { $resume = $t.nparts - 1 }
@@ -3175,6 +3243,12 @@ function Send-ClipPayload([byte[]]$bytes, [int]$clipFmt, [uint32]$crc, [string]$
             } catch { $wrc = -1; Write-Host ("  [warn] TCP 写失败: " + $_.Exception.Message) }
         } else {
             $wrc = TxBody $msg
+            # 首次发送冗余 ×3：帧通道静默丢帧（实测 W→K 单帧偶发全丢 → 文字迟迟不过去）。
+            # 同一 fid 的重复包接收端幂等（已完整则忽略/重复应用同内容），重发路径不再加冗余。
+            if ($wrc -eq 0 -and -not $NoRegister) {
+                [void](TxBody $msg)
+                [void](TxBody $msg)
+            }
         }
         if ($wrc -ne 0) { Write-Host "  写帧失败 rc=$wrc" }
         $off += $n
@@ -3213,6 +3287,7 @@ function Step-ClipAck {
 }
 
 Write-Host "开始循环（Ctrl+C 退出）…"
+
 Write-Host ("线缆 I/O: 原生 C# 泵线程（build {0}）：读授权→读帧/写帧全在后台；PS 主循环只跟内存队列打交道，不再有 SPTI 阻塞" -f [CablePump]::BuildTag)
 Init-Tray
 $lastTray = [DateTime]::MinValue
@@ -3224,6 +3299,7 @@ $script:lastIter0 = $null
 $script:slowLogAt = Get-Date
 $script:profPre = 0
 while ($true) {
+
     $iter0 = Get-Date
     if ($script:lastIter0) {
         $gapMs = ($iter0 - $script:lastIter0).TotalMilliseconds

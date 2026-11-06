@@ -5242,6 +5242,33 @@ otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otili
 ③ 分片窗口内逐片 ACK（改动大，但根治）；
 ④ 给 Windows 泵加逐帧 ENQ/TXF/RX + 写 rc 日志，先确认 RESUME 到底写没写出去。
 
+### 76.11 两个根因落定：agent 内 WMI 挂死 + 大文件无节流把鼠标堵死（2026-11-06 17:00–18:00）
+
+**根因 A：Windows 剪贴板代理的 PS 主循环卡在 WMI/PnP 调用上（"W→K 文字文件都不行"）**
+* 用启动探针（`C:\Users\Public\psmark.log`）定位：主循环卡在
+  `Update-LocalInput → Test-HotplugInput → Get-PnpDeviceProperty`（PnP 属性查询在 agent 进程内
+  **永不返回**；新开 PowerShell 里同样的查询 0.3s 返回 → 是该 host 的 WMI 客户端状态问题，换会话即好）。
+  卡住期间泵线程照跑（CURSOR 还在发），但 PS 不轮询剪贴板/不发 CLIP → 用户看到"W→K 完全不通"。
+* 修：`Get-CimTimed`（独立 runspace + 1.5s 超时）与 `Test-HotplugInput` 的 1.2s 超时兜底；
+  超时后本会话停用该探测、按"可热插拔"处理。修后探针显示 `loop#201` 正常、W→K 文字 4 秒内到达。
+
+**根因 B：大文件传输无节流 → 设备帧写阻塞 ~1.28s → HID 注入写排队 → 鼠标冻结**
+* `hidlat` 在 302MB 传输进行中实测：**MAXGAP=1284ms**（19 次 >40ms）—— 用户"复制时鼠标不能动"属实。
+* 机理：接收端约 50 片/秒（2.5~3.2MB/s），设备缓冲很小；发送端猛发把设备写堵住，
+  单次帧写退化成 ~1.28s，期间 HID 写只能排队。
+* 修：**两端 xfer 发送按每片 20ms 限速**（≈3.2MB/s，与接收端匹配）。
+* 修后同条件实测：**MAXGAP=28ms / GAPS_OVER_40=0 / SEND_FAIL=0**（远低于 40ms 验收线）。
+
+**本轮其它可靠性修复（nativepump-20~23）**
+* CLIP 首发包冗余 ×3（同 fid，接收端幂等）—— W→K 文字从"重发 6 次不到"变成 4 秒内到。
+* xfer 缺片补发 ×3、重传轮次 3→8；发送端背压（`PendingTx>192` 等待）。
+* 同修：迟到/未知 DONE 不再回 ABORT（否则多文件批次被在途 DONE 杀掉）。
+
+**最终实测（md5 级）**
+* Windows→麒麟 `test.apk` 192,768,115B：**PASS**，md5 `147488f92368e3a9eefc117bbc27e94a` 两端一致（73.9s，2.5MB/s）。
+* 麒麟→Windows `test.jar` 302,812,732B：**PASS**，md5 `053dd5bccb9446eb9a8380e439673a31` 两端一致（116.8s，2.5MB/s）。
+* 文字双向 PASS；传输期间 HID MAXGAP=28ms（鼠标不卡）。
+
 ### 76.6 现场应急（本轮已做）
 
 * 11:37 对 Kylin `~/otilink/otitrans.c` 做了**临时热修**（`if (0 && g_hid_busy)`）并重启 otikm，

@@ -169,6 +169,12 @@
 > 真机数据：`hidlat MAXGAP=15ms`（旧 372~482ms，650KB 剪贴板突发期间）、`kmbret PASS=21 FAIL=0 WARN=4`
 > （小步回程成功、park 37 包、**交接耗时 15ms**；现场真人日志还有一次 `交接耗时 35ms`）、麒麟 `SLOWOP=0`；
 > 剪贴板双向已由 win-pump 在解锁后手测互通。
+> **✅ 2026-11-06 18:00 两个根因已修，用户指定的文件双向全通（md5 级）**：
+> ① Windows agent 的 PS 主循环会卡在 `Get-PnpDeviceProperty`（agent 进程内 WMI 永不返回）→ 剪贴板全哑；
+> 用 runspace+超时兜底修掉。② 大文件发送无节流把设备写堵 ~1.28s → **鼠标冻结**（实测 MAXGAP=1284ms）；
+> 两端 xfer 按 20ms/片限速后 **MAXGAP=28ms**（<40ms 验收线），复制 302MB 时鼠标不卡。
+> 实测：W→K `test.apk`(184MB) md5 一致 PASS；K→W `test.jar`(302MB) md5 一致 PASS；文字双向 PASS。
+> 详见 NOTES §76.11。
 > **⚠️ 2026-11-06 16:55 拔插复位后重测**：文本双向 PASS；`test.jpg` 双向 PASS（md5 一致）；
 > `test.jar` 302MB 麒麟→Windows **99.1%（4691/4732 片）**，末 23 片补发帧系统性不到达（每 10s ×3 补发、接收端每份 DONE 都回缺片位图），120s 中止。
 > 已修「迟到 DONE 回 ABORT 杀整批」「缺片补发 ×3」「传输中暂停 CURSOR」；下一轮：补发按 rc 重试 + 给 Windows 泵加逐帧投递日志。详见 NOTES §76.9。

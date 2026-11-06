@@ -462,6 +462,10 @@ int oti_xfer_tx_poll(struct oti_xfer_tx *t)
         else
             t->sent_parts++;
         t->done_parts++;
+        /* 发送端限速（2026-11-06 真机）：接收端处理约 50 片/秒（3.2MB/s），而设备缓冲很小；
+           猛发会把设备写堵住，单次帧写变成 ~1.28s —— 期间 HID 注入写排在后面，鼠标直接冻结
+           （hidlat 实测 MAXGAP=1284ms）。按接收速率给每片留 20ms，鼠标就不受影响。 */
+        usleep(20 * 1000);
     }
 
     long now = now_ms();
