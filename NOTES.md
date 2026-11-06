@@ -5108,6 +5108,19 @@ otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otili
    差异，不影响运行；后续可让 `gate.sh --deploy-kylin` 先清理多余源码或用显式文件清单。
 5. 锁屏期间 Windows PS 主循环 ~1.2s/轮（剪贴板 API 阻塞），泵 rx 队列偶满、丢最旧
    ROLE/背景帧（tx 不丢）；解锁后应自愈。若长期锁屏可加"每轮最多处理 N 帧"硬化（未做）。
+8. **解锁后正式回归（2026-11-06 13:1x）**：`gate.sh --hw-clip` 最佳 **PASS=15 FAIL=2**（多次跑跳动 12~15 PASS），
+   失败项全是"内容乱序/陈旧覆盖"（收到上一笔的 14 字节旧内容）而非帧解码失败；`clipshort` 7/7 过。
+   为定位做了逐帧 trace（临时 build，已恢复）：
+   * ACK **确实到达**，但**迟到**：`RECV ACK crc=…（待确认=… active=0）` —— 到达时发送端已 3 次重发后放弃；
+   * Windows 原生泵 `ENQ type=6 → TXF type=6` 间隔实测 **~1.1s**；`cable.log` 同期持续 `SLOWOP frame-write 250~330ms`；
+   * 机制：`0x06/0x07` 授权窗口每次只写 2 帧 + CURSOR 25/s 入队 > 授权写速 ~20/s → txq 长期积压 ~1s，
+     后入队的 ACK/CLIP 排在陈旧 CURSOR 后面 → 超过发送端 1.5s ACK 期限 → 重发风暴 → 旧帧在新帧之后被应用（乱序）。
+   * 尝试：Windows `nativepump-4`（CURSOR 40→100ms + 每次授权写 4 帧）在噪声较大的一轮未变好（PASS=12），
+     **已回退到验证过手感/hidlat 的 nativepump-2**；Kylin 读侧退避阈值 30→150ms 保留（避免读退避自伤 ACK 时延）。
+   * 下一轮修法建议（未做）：① 按实际授权速率自适应 CURSOR 周期（或"txq 有积压时降 CURSOR 频率/丢旧 CURSOR"）；
+     ② ACK 期限 1.5s→2.5s + 重发次数 3→4（容忍慢 ACK）；③ 剪贴板按 fid 单调性丢弃迟到的旧内容（根治乱序覆盖）；
+     ④ 量化设备"每秒授权次数"，据此给 pump 设定 per-auth 帧数上限与 CURSOR 节奏。
+
 7. **仓库/真机一致性修正（2026-11-06 12:35）**：首版提交 `108887e` 里的
    `windows/otiagent.ps1` 被误带入了**未部署、未验证**的 `nativepump-3` 硬化（批量出队≤16 帧、
    rx 满优先丢背景帧、光标静止 200ms 心跳+慢写 300ms 退避）。**真机验收跑的是 `nativepump-2`**；

@@ -522,8 +522,12 @@ static int cable_pump_once_locked(oti_transport *t)
                 l = OTI_BODY_MAX;
             q_push(&t->rxq, frame + OTI_FRAME_HEAD, l);
             t->rx_done++;
-            if (rdt > g_slowop_ms) {
-                /* 帧读慢：退避帧读（独立曲线）。只推迟帧读 —— 消息泵与 HID 写不受影响。 */
+            /* 2026-11-06 现场修正：读侧退避会**自己制造** ACK/CLIP 迟到 ——
+               一旦进入读退避窗口，对端写帧被堵（SLOWOP 256ms），ACK 迟到 >1.5s 后发送端
+               已放弃重发（日志 `RECV ACK ... active=0`），引发无谓的重发风暴。
+               实测帧读正常 2~3ms；只有 >150ms 的极端读才值得退避。 */
+            if (rdt > 150) {
+                /* 帧读极慢：退避帧读（独立曲线）。只推迟帧读 —— 消息泵与 HID 写不受影响。 */
                 long rnow = now_ms();
                 if (t->read_last_slow_ms &&
                     rnow - t->read_last_slow_ms > (long)g_slow_base_ms * 8)
