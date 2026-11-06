@@ -19,6 +19,13 @@
 #    必须由 Lead 排硬件窗口后运行；脚本结束会恢复真实 otikm（run-kylin.sh）。
 # ⚠️ 合成实例**不接 X**（env -u DISPLAY）：边缘判据走状态机累计位移，和 kmbret 一致。
 #
+# 🔬 状态（2026-11-06，必须如实标注）：**实验性、尚未真机验证、未注册进门禁**。
+#    本轮验收窗口用在了 winfreeze/hidduringclip 上，没有剩余窗口跑它；首次使用前请
+#    Lead 审阅并给一个小窗口（约 40s），先跑 CYCLES=1 确认能出数字再加到 gate。
+#    出去方向的延迟需要跨机时钟（Kylin CLOCK_MONOTONIC ↔ Windows 绝对时间），
+#    校准误差 = ±(ssh RTT/2) + WSL/Windows 时钟差（实测 WSL 与 Windows 同机、差 <100ms）；
+#    误差 >150ms 时出去方向只 WARN 不判 FAIL（回来方向用同机时钟，精确）。
+#
 # 用法：
 #   ./handofflat.sh                 # 3 次往返（默认）
 #   CYCLES=5 ./handofflat.sh        # 验收要求的 5 次往返
@@ -201,8 +208,15 @@ info "出去方向延迟(ms)：${TOUT_LIST:-无}"
 info "回来方向延迟(ms)：${TBACK_LIST:-无}"
 
 echo "=== 6/6 判定 ==="
-[ "$N_OUT" -ge 1 ] && [ "$N_OUT_OK" -eq "$N_OUT" ] && ok "撞边→对端开始动：全部 ${N_OUT} 次 ≤ ${LIMIT}ms${UNC:+（跨机时钟 ±${UNC}ms）}" \
-    || bad "撞边→对端开始动：${N_OUT_OK}/${N_OUT} 次 ≤ ${LIMIT}ms（原始：${TOUT_LIST:-无}；时钟误差 ±${UNC:-?}ms）"
+if [ "$N_OUT" -le 0 ]; then
+    bad "撞边→对端开始动：没有测到样本（原始：${TOUT_LIST:-无}）"
+elif [ "$N_OUT_OK" -eq "$N_OUT" ]; then
+    ok "撞边→对端开始动：全部 ${N_OUT} 次 ≤ ${LIMIT}ms${UNC:+（跨机时钟 ±${UNC}ms）}"
+elif [ "${UNC:-999}" -le 150 ]; then
+    bad "撞边→对端开始动：${N_OUT_OK}/${N_OUT} 次 ≤ ${LIMIT}ms（原始：${TOUT_LIST}；时钟误差 ±${UNC}ms）"
+else
+    warn "撞边→对端开始动：${N_OUT_OK}/${N_OUT} 次 ≤ ${LIMIT}ms（原始：${TOUT_LIST}；跨机时钟误差 ±${UNC}ms 太大，只 WARN 不判 FAIL，需缩小误差后复核）"
+fi
 [ "$N_BACKM" -ge 1 ] && [ "$N_BACK_OK" -eq "$N_BACKM" ] && ok "回推→本端恢复：全部 ${N_BACKM} 次 ≤ ${LIMIT}ms（同机时钟）" \
     || bad "回推→本端恢复：${N_BACK_OK}/${N_BACKM} 次 ≤ ${LIMIT}ms（原始：${TBACK_LIST:-无}）"
 [ "$N_OUT" -ge "$CYCLES" ] && [ "$N_BACKM" -ge "$CYCLES" ] && ok "往返 ${CYCLES} 次都测到延迟样本" \
