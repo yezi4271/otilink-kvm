@@ -2771,12 +2771,14 @@ function Step-ClipAck {
 }
 
 Write-Host "开始循环（Ctrl+C 退出）…"
+Write-Host "线缆轮询: 空闲 30ms / 有帧立即泵（降低与 HID 转发的单队列争用；build pump-throttle-1）"
 Init-Tray
 $lastTray = [DateTime]::MinValue
 $lastPump = [DateTime]::MinValue
 # ---- 慢轮诊断（长期保留）：帧大量丢失的直接原因是"主循环整段卡住"，
 #      把"整轮间隔"与"取帧之前那段耗时"分开，一眼看出卡在哪一段。----
 $script:lastIter0 = $null
+$script:lastPumpMs = [DateTime]::MinValue
 $script:slowLogAt = Get-Date
 $script:profPre = 0
 while ($true) {
@@ -2858,7 +2860,17 @@ while ($true) {
         $body = RxTcp
         if ($null -ne $body) { $len = $body.Length }
     } elseif ($useCable) {
-        $didWork = Pump-Cable
+        $didWork = $false
+        # 线缆是**单队列**设备：这里的 SPTI 读会和麒麟侧发来的 HID 鼠标包抢设备。
+        # 实测主循环的 C[取帧] 可阻塞 1.3~9s（LOOP 慢轮），期间 Windows 指针会冻结
+        # （用户报障"鼠标在 Windows 一卡一卡，Kylin 正常"）。空闲时把轮询降到 30ms；
+        # 有帧要发/要收时仍然立刻泵（剪贴板大文件不降速）。
+        $pumpDue = ($script:txq.Count -gt 0) -or ($script:rxq.Count -gt 0) -or
+                   (((Get-Date) - $script:lastPumpMs).TotalMilliseconds -ge 30)
+        if ($pumpDue) {
+            $script:lastPumpMs = Get-Date
+            $didWork = Pump-Cable
+        }
         if ($script:rxq.Count -gt 0) {
             $body = $script:rxq.Dequeue()
             $len = $body.Length
@@ -2876,7 +2888,7 @@ while ($true) {
         } elseif ($Verbose -and $rc -ne 0) { Write-Host "  读失败 rc=$rc" }
     }
     if ($useCable -and -not $didWork -and $null -eq $body) {
-        Start-Sleep -Milliseconds 2      # 空闲小睡：既省 CPU 又不影响延迟
+        Start-Sleep -Milliseconds 10     # 空闲小睡：降低主循环 CPU（实测 ~90% 单核）与设备争用
     }
     $script:profPre = ((Get-Date) - $iter0).TotalMilliseconds   # 取帧之后的那一段（见慢轮诊断）
     if ($null -ne $body -and $len -gt 0) {
