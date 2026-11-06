@@ -155,6 +155,22 @@
 > ⚠️ 仍欠一件事：`--hw-km` 第 1 步用的是**假失败**判据（光标贴右边缘时 +100 推不动 → Δ=0），
 > HID 通路实测是好的（+247px）。见 `NOTES §55`。
 
+> **⚠️ 2026-11-06 第 61 轮（已部署两端，最重要）**：现场「鼠标在 Windows 与 Kylin 之间来回不顺畅 +
+> 在 Windows 移动一段时间卡几秒」= **Windows 剪贴板 PowerShell 代理读帧太慢，麒麟向它写 64KB 帧时
+> 在单队列设备上阻塞 250~700ms，把 HID 注入写堵住**（实测 `hidlat MAXGAP=372~482ms`）。
+> 修法（已上线）：
+> * Windows：`windows/otiagent.ps1` **BuildTag `nativepump-2`** —— 内嵌 C# `CablePump` 后台线程独占
+>   线缆设备，紧凑读帧；CURSOR 遥测 40ms、ROLE/HELLO 由泵线程重发；PS 主循环不再做设备 I/O
+>   （CPU 99%→~9%）。另修「锁屏时 `Set-Clipboard` 抛异常把代理整个带走」。
+> * 麒麟：传输层逐命令计时 + **慢操作守卫**（帧写 >30ms 退避 300ms→2s，只停帧写）；删掉上一轮
+>   有害的「HID 优先窗口（暂停消息泵）」；写入侧 HID 优先**按需启用**（新泵下不触发）。
+> * 交接判据重写：真实光标（TTL 300ms）+ 贴入口边 + 继续外推 ≥16 计数；`交接耗时 15ms`。
+> * 新门禁：`--hw-clipstall`（hidduringclip.sh）、`--hw-freeze`（winfreeze.sh）。
+> 真机数据：`hidlat MAXGAP=15ms`（旧 372~482ms，650KB 剪贴板突发期间）、`kmbret PASS=21 FAIL=0 WARN=4`、
+> 麒麟 `SLOWOP=0`。**未验证**：剪贴板端到端（Windows 锁屏无法 Set-Clipboard）、Windows 光标冻结
+> 客观值（需 HID 驱动态/用户解锁）—— 详见 `NOTES §76.5`。回滚：Windows `deploy.sh --restart` 前把
+> `C:\Users\Public\otiagent.baseline.ps1` 拷回；麒麟 `git checkout -- otilink/... && gate.sh --deploy-kylin`。
+
 ---
 
 ## 1. 一句话现状

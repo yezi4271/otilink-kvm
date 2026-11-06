@@ -1244,3 +1244,50 @@ pgrep -x otikm | wc -l                         # 1
 守卫取消、VT 不变、X 键盘不掉）。**守卫没在跑时该脚本会中止、不会注入**。
 
 **回滚**：`sudo systemctl disable --now otilink-sosguard && sudo rm /etc/systemd/system/otilink-sosguard.service /usr/local/bin/sosguard.sh`。
+
+## 23. 【第 61 轮】鼠标"卡几秒 / 来回不顺畅"的定层与判据（2026-11-06）
+
+**已根治的根因**：Windows 剪贴板 PowerShell 代理读帧太慢（旧版主循环 1.3~9s/轮），麒麟向它写
+64KB 帧时会在 SCSI 命令里阻塞 250~700ms；对拷线是**单队列**设备，HID 注入写排在同一条设备队列
+后面 → 用户看到"在 Windows 移动一段时间卡几秒"、"交接手势一顿一顿"。
+修法：Windows 代理 **BuildTag `nativepump-2`**（`windows/otiagent.ps1` 内嵌 C# `CablePump` 后台线程
+独占设备，PS 主循环不再做设备 I/O）；麒麟侧删掉"HID 优先窗口"并加慢操作守卫。
+
+**怎么判断现在跑的是不是新实现（各 1 行）**：
+
+```bash
+grep -a 'build nativepump' /mnt/c/Users/Public/clip.log | tail -1     # 期望 nativepump-2
+grep -a '线缆泵: build' /mnt/c/Users/Public/clip.log | tail -1          # 期望同一 BuildTag
+grep -a 'PUMP rx=' /mnt/c/Users/Public/clip.log | tail -3              # 每 5s 一行（rx/tx/maxread/maxwrite/drop）
+tail -20 /mnt/c/Users/Public/cable.log                                  # 泵自己的日志：CABLEPUMP start / SLOWOP / error
+grep -a '写入侧 HID 优先' /tmp/otikm.log | tail -1                     # 麒麟侧新实现标志行
+```
+
+**关键指标（客观判定）**：
+
+```bash
+cd re/tools && ./gate.sh --hw-lat          # 期望：hidlat MAXGAP ≤ 200ms；新实现实测 ~15ms
+cd re/tools && ./gate.sh --hw-clipstall    # 650KB 剪贴板突发期间 MAXGAP ≤ 40ms（需 Windows 已解锁）
+grep -a 'SLOWOP' /tmp/otikm.log /tmp/rk.log | tail   # 新 Windows 泵下应为空（0 次）
+grep -a '交接耗时' /tmp/otikm.log | tail             # 期望 <100ms（实测 15ms）
+```
+
+**常见误判**：
+* Windows **锁屏**时 `Set-Clipboard/Get-Clipboard` 必然 `ExternalException`（实测 ~1.2s）：
+  期间剪贴板"未确认"、麒麟重发 3 次放弃**是正常现象**，解锁后自愈（新版代理会打
+  `[warn] 应用远端剪贴板失败（锁屏/剪贴板被占用？已忽略，代理继续）`，不会再崩）。
+* 麒麟处于**本机控制态**时，直写 HID 包推不动 Windows 光标（测量必须在"HID 模式：指针交给对端"下做）。
+* Windows 代理 `clip.log` 里 `LOOP 慢轮` 现在只反映 **PS 剪贴板/文件处理**耗时（取帧已是微秒级出队），
+  不再等于"鼠标冻结"；看 `PUMP maxread/maxwrite` 与麒麟 `hidlat` 才准。
+
+**回滚**（任一异常时）：
+```bash
+# Windows：恢复部署前的旧代理（win-pump2 部署时已备份）
+cp /mnt/c/Users/Public/otiagent.baseline.ps1 /mnt/c/Users/yezi4/otilink/otiagent.ps1
+cd re/windows && ./deploy.sh --restart
+
+# 麒麟：回到上一版源码后部署 + 重启
+cd re && git checkout -- otilink/otikm.c otilink/otikm_core.c otilink/otikm_core.h \
+    otilink/otilink.c otilink/otilink.h otilink/otitrans.c otilink/otitrans.h otilink/mocktest.c otilink/coretest.c
+cd tools && ./gate.sh --deploy-kylin     # 再按 §4.1 重启 otikm
+```

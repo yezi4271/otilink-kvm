@@ -148,6 +148,8 @@ ssh kylin@<麒麟IP> 'pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkil
 | 键鼠共享 / 交接 / 回程 / 钩子 / 令牌（**拓扑 A：键鼠在 Windows**） | `--static` + `--hw-km` | `hwtest` PASS=12 FAIL=0；`km.log` 出现 `LOCAL(startup) → REMOTE → F24 token seen → LOCAL(peer token)` |
 | 键鼠回程（**拓扑 B：键鼠在麒麟**，主控端本地判定） | `--static` + `--hw-kmb` | `kmbret` FAIL=0（小步外推能回程 + 落点同步 + 入口边 park + by-id 抓取 + 麒麟侧抑制缓冲补发）；Windows 侧「真收到 Ctrl/C」两条按 §61.2 线缆固件丢包**只算 WARN**（见 NOTES §63.9）；`coretest` 全过 |
 | 键鼠卡顿（"过几秒卡一下" = HID 写被设备级操作堵住） | `--static` + `--hw-lat` | `hidlat` PASS：与 otikm 并发时 HID 写最大间隔 ≤ 200ms、`SEND_FAIL=0` |
+| 剪贴板突发时键鼠卡顿（边传 650KB 边动鼠标） | `--static` + `--hw-clipstall` | `hidduringclip` PASS：650KB 下发期间 `hidlat` MAXGAP ≤ 40ms、`SEND_FAIL=0`（锁屏时"已应用"降为 WARN，见 NOTES §76） |
+| Windows 光标冻结（"在 Windows 上移动一段时间卡几秒"） | `--static` + `--hw-freeze`（需 otikm 处于 HID 驱动态，否则 SKIP 不算通过） | `winfreeze` PASS：1ms 采样 `MAXFREEZE ≤ 50ms`、`FREEZES_OVER_50=0` |
 | 键盘独占 / 双重输入（"我在 Windows 上打字，麒麟也在同步打字"） | `--static` + `--hw-kbdexcl` | `kbdexcl` FAIL=0：接管期间虚拟键盘探针 **BUSY**（本机桌面收不到按键）、回程后 **FREE**（能力收得回来），日志无「键盘不独占」 |
 | SOS 救援误触发（「蓝屏 / 键盘输入不了」，VT 被切 tty5、`console_lock` 死锁） | `--static` + `--hw-sos` | `sosreg` FAIL=0：注入左 Meta+H 后守卫确认（feedback +1、timeout 不增）、活动 VT 不变、X 键盘仍挂 master |
 | 线缆拔插自愈（拔插后 otikm 不崩 + 自发现重开） | `--static` + `--deploy-kylin` + `--replug` | `replugreg` FAIL=0（N 轮拔插后 otikm 存活、传输重新就绪、无 segfault） |
@@ -178,6 +180,7 @@ ssh kylin@<麒麟IP> 'pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkil
   3. 硬件相关先经 `envcheck`。
 * **必须在 `re/tools/gate.sh` 里加一档调用它**，并在本文件 §5 表格里登记 —— `doccheck.sh` 会检查
   `clipreg.sh / xferreg.sh / hwtest.sh / kmbret.sh / kbdexcl.sh / hidlat.sh / sosreg.sh / xferlocal.sh / coretest / portablecheck.sh` 是否被 gate 注册，漏注册直接 FAIL。
+  2026-11-06 新增：`hidduringclip.sh`（`--hw-clipstall`）、`winfreeze.sh`（`--hw-freeze`）。
 
 **常用验证工具**（都在 `re/` 下）：
 
@@ -188,6 +191,8 @@ ssh kylin@<麒麟IP> 'pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkil
 | `otilink/hwtest.sh` | 双向 | 键鼠真机回归（12 项，**会动真实光标**；**只覆盖拓扑 A**） |
 | `otilink/kmbret.sh` | 麒麟主控 | **拓扑 B 回程手势**真机回归（22 项 = 20 硬断言 + 2 WARN）：`--sim-input` 合成手势经真实线缆 → 小步（2px/次）外推必须回程、落点同步、入口边 park、by-id 抓取、抑制缓冲补发；Windows 侧「真收到 Ctrl/C」受 §61.2 固件丢包影响**只 warn**；会短暂停/恢复麒麟 otikm（`gate.sh --hw-kmb`） |
 | `otilink/hidlat.sh [秒数] [ms]` | 麒麟主控 | **键鼠卡顿**回归（20 项左右）：与 otikm **并发**量 HID 写间隔，>200ms 即 FAIL（`gate.sh --hw-lat`）—— 真机案例：保活 dummy 帧 64KB 单次堵设备 ~1.3s |
+| `otilink/hidduringclip.sh` | 麒麟主控 | **剪贴板突发下的 HID 卡顿**回归：650KB 下发期间与 otikm 并发量 HID 写间隔，MAXGAP >40ms 即 FAIL（`gate.sh --hw-clipstall`）—— 2026-11-06 根因证据：旧 Windows 慢代理让单帧写阻塞 250~700ms |
+| `otilink/winfreeze.sh` + `otilink/cursortrace.cs` | Windows+麒麟 | **Windows 光标冻结**客观测量：合成 HID 驱动 + 1ms `GetCursorPos` 采样，MAXFREEZE >50ms 即 FAIL（`gate.sh --hw-freeze`）；需 otikm 处于 HID 驱动态 |
 | `otilink/kbdexcl.sh` | 麒麟主控 | **键盘独占**真机回归（拓扑 B，约 40s）：用 `uisim` 造 uinput 虚拟键鼠给 otikm 抓（不碰真键鼠），探针按 **EVIOCGRAB 排他性**判定 —— 接管期间必须 **BUSY**（本机桌面收不到按键 = 不双重输入）、回程后必须 **FREE**（L8）；会短暂停/恢复麒麟 otikm（`gate.sh --hw-kbdexcl`） |
 | `otilink/sosreg.sh` | 麒麟 | **SOS 救援**回归（约 15s）：`sosinject` 注入一次左 Meta+H（麒麟内置 SOS 组合键），断言 `otilink-sosguard` 在超时前确认（`/sys/kos_rescue/rescue_feedback=1`）、活动 VT 不变、X 键盘不掉；**守卫没跑就中止、绝不注入**（`gate.sh --hw-sos`） |
 | `otilink/replugreg.sh [N]` | 双向 | 线缆拔插自愈回归：用 USB unbind/bind **模拟拔插** N 轮（缺省 3），不需人手拔线；修复前二进制第 2 轮必崩 |

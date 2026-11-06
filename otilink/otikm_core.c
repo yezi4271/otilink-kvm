@@ -194,6 +194,66 @@ static void remote_reset_disp(otikm_core *c)
     c->drv_x = c->drv_y = 0;
 }
 
+/* 入口边的"贴边"容差（**远端像素**）：edge_px*4。
+   edge_px 是本地触边阈值（默认 4）→ 容差 16px；再兜底 ≥8px。
+   为什么用乘以 4 而不是 edge_px：CURSOR 遥测是采样值，远端光标被系统夹在
+   rem_w-1 附近，但虚拟桌面/DPI 换算可能差 1~2px；±16px 足够宽又不至于把
+   "离边几十像素"误判成贴边（贴边只是回程的必要条件，不是充分条件）。 */
+static int rem_edge_margin(const otikm_core *c)
+{
+    int m = c->edge_px > 0 ? c->edge_px * 4 : 16;
+    if (m < 8)
+        m = 8;
+    return m;
+}
+
+/* 最新一次回传的光标是否贴在"从对端进来那条边"上。
+   几何必须用回传自带的 rem_cur_w/h（虚拟桌面 3584x1152），**不用** rem_w/h
+   （HELLO 的 10s 心跳可能是旧的 2048x1152）。 */
+static int rem_cursor_at_entry_edge(const otikm_core *c)
+{
+    if (c->rem_cur_w <= 0 || c->rem_cur_h <= 0 || c->rem_cur_w > 65535 ||
+        c->rem_cur_h > 65535)
+        return 0;
+    int m = rem_edge_margin(c);
+    if (c->rem_entry_x == 1)
+        return c->rem_cur_x >= c->rem_cur_w - 1 - m;
+    if (c->rem_entry_x == 0)
+        return c->rem_cur_x <= m;
+    if (c->rem_entry_y == 1)
+        return c->rem_cur_y >= c->rem_cur_h - 1 - m;
+    if (c->rem_entry_y == 0)
+        return c->rem_cur_y <= m;
+    return 0;
+}
+
+/* "未缩放位移"沿**向入口边外推**方向的投影：正数 = 用户在把指针往本机方向顶。
+   入口边 = 对端屏幕上离本机最近的那条边（由 enter_remote 记住 rem_entry_*）。 */
+static int drv_push_out(const otikm_core *c)
+{
+    if (c->rem_entry_x == 1)
+        return c->drv_x;
+    if (c->rem_entry_x == 0)
+        return -c->drv_x;
+    if (c->rem_entry_y == 1)
+        return c->drv_y;
+    if (c->rem_entry_y == 0)
+        return -c->drv_y;
+    return 0;
+}
+
+/* 旧兼容判据阈值：只对**从未收到过 CURSOR** 的对端（零软件端/旧 agent）生效。
+   max(100, edge_px*12) 个未缩放计数。为什么不是 16：没有真实光标反馈时无法区分
+   "贴边外推"与"正常移动"，阈值必须大到只有明确的推回动作才触发（2026-10-10 真机：
+   阈值 16 时在 Windows 稍微一动就被拉回，用户感受是"过不去/键盘在两机之间跳"）。 */
+static int legacy_push_need(const otikm_core *c)
+{
+    int need = c->edge_px * 12;
+    if (need < 100)
+        need = 100;
+    return need;
+}
+
 /* 回程落点：离出口边多远（px）。必须足够远，否则回程后的一点惯性/抖动又会立刻推出去。
    真机（2026-10-10，纯鼠标切换）：落点 edge+8=12px，用户在 Windows 上用鼠标 1~2 秒就
    回程一次 → 键盘被反复 EVIOCGRAB，"在 Kylin 上打不了字"。2026-10-27 起至少 96px。 */
@@ -297,11 +357,9 @@ void otikm_core_set_remote_screen(otikm_core *c, int w, int h)
         c->rem_x = (int16_t)(w - 1);
     if (c->rem_y > h - 1)
         c->rem_y = (int16_t)(h - 1);
-    /* 回传的光标坐标同一坐标系：几何变了就夹紧，避免旧值越界误判"在边缘"。 */
-    if (c->rem_cur_x > w - 1)
-        c->rem_cur_x = w - 1;
-    if (c->rem_cur_y > h - 1)
-        c->rem_cur_y = h - 1;
+    /* 回传光标的坐标**不能**用 HELLO 的几何夹紧：CURSOR 载荷自带虚拟桌面尺寸
+       （Windows 现场 3584x1152，HELLO 心跳是 10s 前的旧值/主屏尺寸 2048x1152）。
+       拿旧几何夹 rem_cur_x 会把"远端右边缘 3583"夹成 1919 → 永远判不到边。 */
 }
 
 void otikm_core_set_remote_cursor(otikm_core *c, int x, int y, int w, int h, long now)
@@ -349,9 +407,13 @@ static void enter_remote(otikm_core *c, int exit_edge)
     c->rem_entry_x = -1;
     c->rem_entry_y = -1;
     remote_reset_disp(c);
-    /* 新一段驱动：上一段的对端光标位置已无意义，等新的回传。 */
+    /* 新一段驱动：上一段的对端光标位置已无意义，等新的回传。
+       若对端曾经发过 CURSOR（cursor_ever），hid_park 已经把它的光标顶到入口边
+       → 首帧遥测到达前先按"在入口边"假设，允许用户立刻反悔（300ms 窗口）。 */
     c->rem_cur_valid = 0;
-    c->rem_cur_anchor_ms = 0;
+    c->rem_switch_ms = c->now_ms;
+    c->rem_edge_anchor_ms = 0;
+    c->rem_edge_confirmed = c->cursor_ever ? 1 : 0;
     if (exit_edge == OTI_EDGE_RIGHT || exit_edge == OTI_EDGE_LEFT) {
         int from_right = (exit_edge == OTI_EDGE_RIGHT);
         c->rem_x = (int16_t)(from_right ? 0 : (rw > 0 ? rw - 1 : 0));
@@ -514,24 +576,19 @@ otikm_act otikm_core_local_mouse(otikm_core *c, const oti_mouse_evt *m, oti_swit
         int rh = c->rem_h > 0 ? c->rem_h : c->screen_h;
         int lw = c->local_w > 0 ? c->local_w : 1920;
         int lh = c->local_h > 0 ? c->local_h : 1080;
-        /* 对端真实光标回传：新鲜 + 远端几何已知才敢用。 */
-        int cur_fresh = c->rem_cur_valid && c->now_ms > 0 &&
-                        c->rem_cur_w > 0 && c->rem_cur_h > 0 &&
-                        c->now_ms - c->rem_cur_ms >= 0 &&
+        /* ---- 对端真实光标回传（2026-11-06 重写）----
+           新鲜窗口 300ms（Windows 原生泵 20~50ms/条）；"贴边"必须用回传自带的
+           虚拟桌面几何 rem_cur_w/h。 */
+        int cur_fresh = c->rem_cur_valid && c->rem_cur_w > 0 && c->rem_cur_h > 0 &&
+                        c->now_ms >= c->rem_cur_ms &&
                         c->now_ms - c->rem_cur_ms <= OTI_REM_CURSOR_TTL_MS;
-        int cur_at_edge = 0;
-        if (cur_fresh) {
-            int e = c->edge_px > 1 ? c->edge_px : 1;
-            int cw = c->rem_cur_w, ch = c->rem_cur_h;
-            if (c->rem_entry_x == 1)
-                cur_at_edge = c->rem_cur_x >= cw - 1 - e;
-            else if (c->rem_entry_x == 0)
-                cur_at_edge = c->rem_cur_x <= e;
-            else if (c->rem_entry_y == 1)
-                cur_at_edge = c->rem_cur_y >= ch - 1 - e;
-            else if (c->rem_entry_y == 0)
-                cur_at_edge = c->rem_cur_y <= e;
-        }
+        int cur_at_edge = cur_fresh ? rem_cursor_at_entry_edge(c) : 0;
+        /* 首帧假设窗口：刚交出去、本段还没收到第一帧遥测，但 hid_park 已把远端
+           光标顶到入口边 → 300ms 内先按"在入口边"处理（用户立刻反悔能马上回来）。
+           一旦发现用户往对端里面走（外推投影变负）立即作废这个假设。 */
+        long since_switch = c->now_ms - c->rem_switch_ms;
+        int assume_edge = c->cursor_ever && !c->rem_cur_valid && since_switch >= 0 &&
+                          since_switch <= OTI_REM_CURSOR_WAIT_MS;
         int dx = (int)((long)m->dx * rw / lw);
         int dy = (int)((long)m->dy * rh / lh);
         if (dx == 0 && m->dx)
@@ -546,69 +603,65 @@ otikm_act otikm_core_local_mouse(otikm_core *c, const oti_mouse_evt *m, oti_swit
         axis_advance(&ny, &o1, &o2, rh, dy);
         c->rem_y = (int16_t)ny;
 
-        /* ---- 回程：把推出去的距离推回来，再多推一点 ⇒ 把指针收回本机 ----
-           累计的是**未缩放的原始位移**（= 真正发给对端的 HID 计数）：
-             * 不能用单次位移：鼠标事件每次只有 1~3 个计数 → 真机"推半天回不来"
-               （2026-09-21 用户报障，coretest 1b 回归）；
-             * 也不能用缩放后的 rem_x 越界量：远端几何（Windows 报的是 4480x1440
-               虚拟桌面）可能在手势中途才到，缩放与出口边一起变 → 回程距离翻倍
-               （真机实测"同一手势时好时坏"，见 otikm_core_set_remote_screen 注释）。
-           阈值 max(8, edge_px*4)：与积分判据一致，贴着入口边抖 ±1px 不会误判。 */
+        /* ---- 回程判据（2026-11-06 第 61 轮重写）：真实光标为主，计数只负责防抖 ----
+           规则（与 NOTES §76.2 的验收一致）：
+             * 主判据：远端**真实光标**被确认贴在入口边（±edge_px*4）之后，
+               用户继续向入口边外推的**未缩放位移累计** ≥ OTI_REM_CURSOR_PUSH(16)
+               → 回程。计数用未缩放值：它正好等于我们真发给对端的 HID 位移，
+               与远端几何/指针加速无关（镜像手势）。
+             * 连续"在入口边"的遥测**不重锚/不清零**：20~50ms 一条遥测时，
+               如果每条都清零，慢推（2px/次）永远攒不到 16 → 真机"回不来"。
+               只有 0→1 跃迁（从"不在边"到"在边"）才重锚。
+             * 遥测过期（>300ms）：**冻结判定**，但累计计数保留；新遥测一到就按
+               最新值判（用户已经推够 16 的话立刻回）。**绝不**退回"计数 100 就揪回"
+               （2026-11-06 现场 bug：回传过期 + 正常移动累积 100 计数被揪回）。
+             * 从未收到过 CURSOR 的对端（零软件/旧 agent）：保留旧计数判据
+               max(100, edge_px*12) 作为唯一的回程方式（兼容路径）。
+           为什么用"未缩放位移"而不是远端像素：远端几何可能在手势中途才到
+           （HELLO 报的是虚拟桌面 4480x1440），缩放/出口边一起变 → 回程距离翻倍，
+           真机表现为"同一手势时好时坏"（coretest 1d）。 */
         {
+            int anchored_now = 0;
+            /* ① 状态更新：只在**新鲜遥测**上更新"是否在入口边"；过期时保持上次
+                  确认（这样断档期间累计的外推计数不会丢，恢复后立即生效）。 */
             if (cur_fresh) {
                 if (cur_at_edge) {
-                    /* 新的“在入口边”回传 → 以它为零点重锚计数。
-                       同一毫秒的重复回传不重锚（否则用户推的位移一直被抹掉）。 */
-                    if (c->rem_cur_ms != c->rem_cur_anchor_ms) {
-                        c->rem_cur_anchor_ms = c->rem_cur_ms;
+                    if (!c->rem_edge_confirmed) {
+                        /* 0→1 跃迁：以这次确认为零点重锚（之前在路上推的计数不算；
+                           本拍事件的位移也不计入 —— 它很可能正是"走到边"的那一步）。 */
                         c->drv_x = c->drv_y = 0;
+                        c->rem_edge_anchor_ms = c->rem_cur_ms;
+                        anchored_now = 1;
                     }
+                    c->rem_edge_confirmed = 1;
                 } else {
-                    /* 对端光标**不在**入口边：计数与像素已漂移，清零；
+                    /* 对端光标**不在**入口边：计数与像素可能已漂移，清零；
                        这一段不按计数回程（等下一次回传确认真到边）。 */
+                    c->rem_edge_confirmed = 0;
+                    c->rem_edge_anchor_ms = 0;
                     c->drv_x = c->drv_y = 0;
-                    c->rem_cur_anchor_ms = 0;
                 }
             }
-            c->drv_x += m->dx;
-            c->drv_y += m->dy;
+            if (!anchored_now && (c->rem_edge_confirmed || !c->cursor_ever)) {
+                c->drv_x += m->dx;
+                c->drv_y += m->dy;
+            }
+            /* ② 首帧假设只对"立刻继续往外顶"成立：一旦用户明显往对端里面走
+               （外推投影为负），说明远端光标大概率已被带离入口边 → 作废假设。 */
+            if (assume_edge && c->rem_edge_confirmed && drv_push_out(c) < 0) {
+                c->rem_edge_confirmed = 0;
+                c->rem_edge_anchor_ms = 0;
+                c->drv_x = c->drv_y = 0;
+            }
+            /* ③ 判定 */
             int back = 0;
-            if (cur_fresh) {
-                /* 精确判据（2026-11-03）：必须收到"在入口边"的回传，
-                   并且之后再往外推 OTI_REM_CURSOR_PUSH 个计数。
-                   这修掉 Windows 指针加速导致的"净计数 +100、光标还差 1000px"早切。 */
-                if (cur_at_edge) {
-                    int push = 0;
-                    if (c->rem_entry_x == 1)
-                        push = c->drv_x;
-                    else if (c->rem_entry_x == 0)
-                        push = -c->drv_x;
-                    else if (c->rem_entry_y == 1)
-                        push = c->drv_y;
-                    else if (c->rem_entry_y == 0)
-                        push = -c->drv_y;
-                    if (push >= OTI_REM_CURSOR_PUSH)
-                        back = 1;
-                }
-            } else if (!c->cursor_ever) {
-                /* 旧判据（从未收到过回传）：兼容零软件端与旧 agent。
-                   纯鼠标切换：回程必须是一个"明确的推回"动作，不能一碰就回。
-                   原来是 edge_px*4=16 计数（约 0.3mm）→ 在 Windows 上稍微一动就被拉回来，
-                   表现成"过不去 Windows / 键盘在两机之间跳"（2026-10-10 真机）。
-                   ⚠️ 只对**从未有过 CURSOR 回传**的对端生效：一旦对端会回传真实光标，
-                   回传过期（例如 HID 优先窗口把消息泵暂停）时绝不能退回纯计数 ——
-                   否则用户正常移动累积 100 计数就被"揪回 Kylin"（2026-11-06 现场）。 */
-                int need = c->edge_px * 12;
-                if (need < 100)
-                    need = 100;
-                if (c->rem_entry_x == 0 && c->drv_x <= -need)
+            if (c->cursor_ever) {
+                if (c->rem_edge_confirmed && (cur_fresh || assume_edge) &&
+                    drv_push_out(c) >= OTI_REM_CURSOR_PUSH)
                     back = 1;
-                else if (c->rem_entry_x == 1 && c->drv_x >= need)
-                    back = 1;
-                else if (c->rem_entry_y == 0 && c->drv_y <= -need)
-                    back = 1;
-                else if (c->rem_entry_y == 1 && c->drv_y >= need)
-                    back = 1;
+            } else if (drv_push_out(c) >= legacy_push_need(c)) {
+                /* 兼容路径：从未有过真实光标回传（零软件端/旧 agent）。 */
+                back = 1;
             }
             if (back) {
                 /* 指针放回"当初出去的那条边"往里一点点：
@@ -638,6 +691,8 @@ otikm_act otikm_core_local_mouse(otikm_core *c, const oti_mouse_evt *m, oti_swit
                 c->have_control = 1;
                 c->rem_entry_x = c->rem_entry_y = -1;
                 remote_reset_disp(c);
+                c->rem_edge_confirmed = 0;
+                c->rem_edge_anchor_ms = 0;
                 fill_switch(c, OTI_SIDE_LOCAL, sw);
                 c->n_switch++;
                 return OTI_ACT_SWITCH_TO_LOCAL;
@@ -703,11 +758,20 @@ otikm_act otikm_core_remote_switch(otikm_core *c, const oti_switch_evt *sw)
     c->n_switch++;
     if (sw->side == OTI_SIDE_REMOTE) {
         c->have_control = 1;
+        c->rem_edge_confirmed = 0;
+        c->rem_edge_anchor_ms = 0;
+        remote_reset_disp(c);
         pend_clear(c);
         return OTI_ACT_LOCAL;
     }
     c->have_control = 0;
     remote_reset_disp(c);            /* 远端几何/坐标被重设：位移累计不能沿用旧的 */
+    /* 对端把指针交给我们（它刚撞边）：入口边未知，不做"已在入口边"的假设，
+       等它自己的 CURSOR 遥测来确认（cursor_ever=1 时判据只在新鲜遥测上判）。 */
+    c->rem_cur_valid = 0;
+    c->rem_switch_ms = c->now_ms;
+    c->rem_edge_confirmed = 0;
+    c->rem_edge_anchor_ms = 0;
     if (sw->screen_w && sw->screen_h) {
         /* 对端刚把指针交给我们并**同时**报上它的屏幕：立即生效。
            不能走 set_remote_screen() —— 此刻 have_control 已经是 0（正在驱动），
@@ -740,6 +804,10 @@ void otikm_core_force_local(otikm_core *c)
         return;
     c->have_control = 1;
     c->edge = OTI_EDGE_RIGHT;
+    c->rem_entry_x = c->rem_entry_y = -1;
+    c->rem_edge_confirmed = 0;
+    c->rem_edge_anchor_ms = 0;
+    remote_reset_disp(c);
     c->n_watchdog++;
 }
 

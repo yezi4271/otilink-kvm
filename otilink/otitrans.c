@@ -24,10 +24,12 @@ enum { TR_CABLE, TR_FD };
 #define OTI_QSLOTS 32
 struct oti_qslot {
     uint32_t len;
+    uint32_t ts_ms;                  /* 入队时刻（单调时钟低 32 位）：HID 守卫判"饥饿"用 */
     uint8_t body[OTI_BODY_MAX];
 };
 struct oti_queue {
     struct oti_qslot s[OTI_QSLOTS];
+    struct oti_qslot tmp;            /* 满队列踢背景帧时的交换缓冲（避免队内大 memmove） */
     int head, tail, count;
     long dropped;
 };
@@ -44,10 +46,35 @@ struct oti_transport {
     long resets;                 /* 收到 0x01/0x00/0x08/0x10 复位的次数 */
     long tx_done, rx_done;       /* 真正写出/读回的条数（看门狗用） */
     long last_tx_ms;             /* 最近一次成功写出的时刻 */
+    /* ---- 慢操作守卫（见 otitrans.h；全部在 t->lock 内读写）---- */
+    long peer_slow_until_ms;     /* 写侧：在此时刻前不发起帧写（0 = 正常） */
+    long peer_last_slow_ms;      /* 上一次慢帧写的时刻（判"连续慢"用） */
+    int  peer_slow_streak;       /* 连续慢帧写次数（指数退避指数） */
+    long slow_window_ms;         /* 当前/最近一次帧写退避窗口（0 = 已恢复） */
+    unsigned long peer_slow_count;   /* 慢帧写累计次数 */
+    unsigned long deferred_writes;   /* 窗口内被推迟的帧写次数 */
+    long frame_write_max_ms;     /* 单次帧写最大耗时 */
+    long read_slow_until_ms;     /* 读侧：在此时刻前不发起帧读 */
+    long read_last_slow_ms;
+    int  read_slow_streak;
+    long read_window_ms;
+    unsigned long read_slow_count;
+    unsigned long deferred_reads;
+    long frame_read_max_ms;
+    long op_max_ms;              /* 线缆命令（读消息/读帧/写帧）最大单次耗时 */
+    unsigned long bg_merged, bg_dropped;
+    /* ---- 写入侧 HID 优先（见 otitrans.h；last_hid_ms 用原子访问，见 note 函数）---- */
+    volatile long last_hid_ms;   /* 最近一次成功 HID 写的时刻（0 = 从未） */
+    unsigned long deferred_hid;  /* 因 HID 活动被推迟的帧写次数 */
+    int  peer_slow_seen;         /* 1 = 疑似慢对端（见过 >10ms 帧写；HID 守卫据此启用） */
+    int  frame_fast_streak;      /* 连续快帧写次数（>=5 → 关掉 HID 守卫） */
+    unsigned long starved;       /* HID 守卫饥饿放行次数 */
     /* fd */
     int fd;
     int owns;
 };
+
+static long now_ms(void);   /* 前向声明：q_push 要写入队时间戳 */
 
 static int q_push(struct oti_queue *q, const void *body, size_t len)
 {
@@ -59,14 +86,13 @@ static int q_push(struct oti_queue *q, const void *body, size_t len)
     }
     struct oti_qslot *s = &q->s[q->tail];
     s->len = (uint32_t)len;
+    s->ts_ms = (uint32_t)now_ms();
     if (len)
         memcpy(s->body, body, len);
     q->tail = (q->tail + 1) % OTI_QSLOTS;
     q->count++;
     return 0;
 }
-
-static uint8_t q_scratch[OTI_BODY_MAX];   /* 仅用于"队列满丢最旧"时接住被丢的条目 */
 
 static int q_pop(struct oti_queue *q, void *body, size_t *len)
 {
@@ -86,6 +112,148 @@ static long now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static long now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+/* ---------------- 慢操作守卫（2026-11-06；详见 otitrans.h）----------------
+ * 实测（Lead 真机）：0xD8 消息读 0~1ms；0xD9/0x28 帧读有数据 ~2ms；0xD9/0x2A 帧写
+ * 耗时完全取决于**对端消费速度**（对端快 2~4ms，旧 PowerShell 代理 250~700ms）。线缆是
+ * 单队列设备，慢帧写会把 HID 注入写堵在后面 → 指针冻结。因此在传输层给每条命令计时：
+ * 单次帧写 > 阈值（默认 30ms）就判定"对端消费慢"并进入退避窗口，窗口内不再发起帧写。
+ * 窗口曲线：base 300ms 起，连续慢 600/1200/2000ms 封顶；一次快写恢复即清零。
+ * 读侧（帧读 >30ms）单独统计/退避，只推迟帧读，不影响 HID 与消息泵。 */
+static int g_slowop_ms = OTI_SLOWOP_MS;
+static int g_slow_base_ms = 300;
+static int g_slow_max_ms = 2000;
+
+void oti_tr_set_slowop_policy(int threshold_ms, int base_ms, int max_ms)
+{
+    if (threshold_ms > 0)
+        g_slowop_ms = threshold_ms;
+    if (base_ms > 0)
+        g_slow_base_ms = base_ms;
+    if (max_ms > 0)
+        g_slow_max_ms = max_ms;
+    if (g_slow_max_ms < g_slow_base_ms)
+        g_slow_max_ms = g_slow_base_ms;
+}
+
+/* 写入侧 HID 优先窗口（见 otitrans.h）：默认 50ms，0 = 关闭。 */
+static int g_hid_guard_ms = OTI_HID_GUARD_MS;
+void oti_tr_set_hid_guard_ms(int ms) { g_hid_guard_ms = ms > 0 ? ms : 0; }
+
+/* HID 写入成功后由捕获/泵线程调用：只写一个时间戳，**不拿 t->lock**（否则捕获线程会
+   被正在做的设备 I/O 挡住——那正是本轮要根除的"鼠标冻结"）。用 relaxed 原子访问，
+   泵线程读到的至多差几微秒，对本守卫（50ms 窗口）完全够。 */
+void oti_tr_note_hid_activity(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return;
+    __atomic_store_n(&t->last_hid_ms, now_ms(), __ATOMIC_RELAXED);
+}
+
+/* 连续慢的指数退避窗口：base << (streak)，封顶 max。调用者负责 streak++。 */
+static long slow_window_next(int streak)
+{
+    if (streak > 16)
+        streak = 16;                       /* 防溢出；反正早被 max 封顶 */
+    long w = (long)g_slow_base_ms << streak;
+    if (w <= 0 || w > g_slow_max_ms)
+        w = g_slow_max_ms;
+    return w;
+}
+
+/* 背景心跳帧识别：PING/HELLO/ROLE/CURSOR 这类"只有最新值有意义"的状态帧。
+   返回消息类型（>0）或 0（不是背景帧/不是我们的协议帧）。
+   慢对端时它们可以被**合并或丢弃**；剪贴板/键鼠数据绝不主动丢。 */
+static int bg_type_of(const void *body, size_t len)
+{
+    if (!body || len < OTI_HDR_SIZE)
+        return 0;
+    uint32_t magic = 0;
+    uint16_t type = 0;
+    memcpy(&magic, body, 4);
+    if (magic != OTI_MSG_MAGIC)
+        return 0;
+    memcpy(&type, (const uint8_t *)body + 4, 2);
+    switch (type) {
+    case OTI_MSG_PING:
+    case OTI_MSG_HELLO:
+    case OTI_MSG_ROLE:
+    case OTI_MSG_CURSOR:
+        return (int)type;
+    default:
+        return 0;
+    }
+}
+
+/* 队列满时踢掉一条背景帧给关键数据让位：把找到的背景帧与队头交换，再丢队头。
+   用队列自带的 tmp 缓冲（65KB）而不是在环里 memmove（32 槽 × 65KB 太大）。
+   返回 1 = 踢掉一条；0 = 队里没有背景帧（退回"丢最旧"）。 */
+static int txq_evict_bg(struct oti_queue *q)
+{
+    if (q->count <= 0)
+        return 0;
+    for (int i = 0, idx = q->head; i < q->count; i++, idx = (idx + 1) % OTI_QSLOTS) {
+        if (bg_type_of(q->s[idx].body, q->s[idx].len) <= 0)
+            continue;
+        struct oti_qslot *h = &q->s[q->head];
+        struct oti_qslot *s = &q->s[idx];
+        if (s != h) {
+            memcpy(&q->tmp, h, sizeof(q->tmp));
+            memcpy(h, s, sizeof(q->tmp));
+            memcpy(s, &q->tmp, sizeof(q->tmp));
+        }
+        q->head = (q->head + 1) % OTI_QSLOTS;
+        q->count--;
+        return 1;
+    }
+    return 0;
+}
+
+/* 入队策略（2026-11-06 重设计；调用者必须持有 t->lock）：
+ *   - 背景心跳：队列里已有同类型 → **原地换成最新**（ROLE/HELLO/CURSOR 只有最新值有效，
+ *     PING 去重）→ 返回 0；队列满 → 直接丢新（心跳可丢）→ 返回 0；
+ *   - 关键数据（KEY/MOUSE/CLIP/ACK/大文件片…）：绝不主动丢；队列满时优先踢一条背景
+ *     心跳让位；连背景帧都没有才返回 -1，由调用方按"丢最旧"兜底（鼠标位移宁丢旧不卡新）。
+ * 返回 0 = 已接收（入队/合并/可丢的背景帧被丢）；-1 = 队列满且没有背景帧可踢。 */
+static int txq_enqueue(oti_transport *t, const void *body, size_t len)
+{
+    struct oti_queue *q = &t->txq;
+    if (len > OTI_BODY_MAX)
+        return -1;
+    int ty = bg_type_of(body, len);
+    if (ty > 0) {
+        for (int i = 0, idx = q->head; i < q->count; i++, idx = (idx + 1) % OTI_QSLOTS) {
+            struct oti_qslot *s = &q->s[idx];
+            if (bg_type_of(s->body, s->len) != ty)
+                continue;
+            s->len = (uint32_t)len;
+            memcpy(s->body, body, len);
+            t->bg_merged++;
+            return 0;
+        }
+        if (q->count >= OTI_QSLOTS) {
+            q->dropped++;
+            t->bg_dropped++;
+            return 0;                       /* 心跳：慢/满时允许丢 */
+        }
+        return q_push(q, body, len);
+    }
+    if (q->count >= OTI_QSLOTS) {
+        if (txq_evict_bg(q)) {
+            t->bg_dropped++;
+            return q_push(q, body, len);
+        }
+        return -1;                          /* 没有背景帧可踢：交给"丢最旧"兜底 */
+    }
+    return q_push(q, body, len);
 }
 
 oti_transport *oti_tr_open_cable(const char *sg_path)
@@ -250,14 +418,18 @@ static int fd_read_all(int fd, void *buf, size_t len, int timeout_ms)
     return 0;
 }
 
-/* 消息读超时 / HID 优先级（见 NOTES §75.5）：
-   线缆是单队列设备，一次阻塞的 SCSI 读会把 HID 写堵住数百毫秒。
-   - 消息读（16 字节）单独用有界超时，默认 5000，HID 直发模式由 otikm 调小；
-   - HID 包正在写时，泵不要在"读授权 → 写帧"之间插入新的消息读。 */
+/* 消息读的 SG_IO 超时（浓缩自 NOTES §75.5 的历史结论）：
+   线缆是单队列设备，一次阻塞的 SCSI 读会把 HID 写堵住。实测 0xD8 消息读**本身 0~1ms**
+   就返回（无消息时 m0=0x01），所以超时保持默认 5000ms 即可；把它压到 200~300ms 反而
+   会让设备消息读频繁超时、帧通道卡死（真机踩过）。HID 与设备操作的互斥改由
+   otilink_cable_io_lock（"读授权 → 立刻写帧"整窗）+ 慢操作守卫保证。 */
 static int g_msg_timeout_ms = 5000;
-static volatile int g_hid_busy = 0;
 void oti_tr_set_msg_timeout(int ms) { g_msg_timeout_ms = ms > 0 ? ms : 5000; }
-void oti_tr_set_hid_busy(int busy) { g_hid_busy = busy; }
+
+/* 【已废弃】原"HID 优先窗口"：HID 包正在写时不开始消息读。后来真机证明它害处更大：
+   泵一停 CURSOR/ROLE 遥测就饿死 → 交接/回程判据失灵（2026-11-06 现场"鼠标回不来"）。
+   保留空函数只为不破坏旧调用点的符号；消息泵现在**永远** 5~10ms 级轮询。 */
+void oti_tr_set_hid_busy(int busy) { (void)busy; }
 
 /* ---------------- 线缆：一次"读消息 → 分派"的设备交互 ----------------
  * 严格按厂商 ProcessIdleState 的语义（NOTES §34）：
@@ -265,17 +437,16 @@ void oti_tr_set_hid_busy(int busy) { g_hid_busy = busy; }
  *   2) 0x05 → 对端有数据：be16(m[1..2]) 帧数 → 0xD9/0x28 读帧进 rxq
  *   3) 0x06/0x07 → **发送授权** → 立刻把 txq 的帧写出去（中间不能插别的设备操作）
  *   4) 0x01/0x00/0x08/0x10 → 复位（链路未就绪/对端未消费），计数后返回
+ * 2026-11-06 起每一次命令都计时：帧写 >阈值 → 慢对端 → 进退避窗口（窗口内帧写推迟），
+ * 帧读 >阈值 → 退避帧读；消息泵与 HID 写永不被这两条守卫挡住。
  * 调用者必须已持有 t->lock。 */
 static int cable_pump_once_locked(oti_transport *t);
 
 /* 整段 pump（读授权 → 立刻写帧）必须与 HID 包写互斥：HID 写插进授权窗口会让授权作废，
-   真机表现就是帧写 rc=524546、帧大量丢失。包一层而不是在函数里加锁，避免 5 个 return
+   真机表现就是帧写 rc=524546、帧大量丢失。包一层而不是在函数里加锁，避免多个 return
    漏解锁。 */
 static int cable_pump_once(oti_transport *t)
 {
-    /* HID 包正在写设备：本次不开始新的消息读（已开始的读受 g_msg_timeout_ms 约束）。 */
-    if (g_hid_busy)
-        return -2;
     otilink_cable_io_lock();
     int rc = cable_pump_once_locked(t);
     otilink_cable_io_unlock();
@@ -287,11 +458,37 @@ static int cable_pump_once_locked(oti_transport *t)
     static uint8_t frame[OTI_FRAME_SIZE];
     static uint8_t body[OTI_BODY_MAX];
     uint8_t m[16];
+    long now = now_ms();
+    long hid_last = __atomic_load_n(&t->last_hid_ms, __ATOMIC_RELAXED);
+    /* HID 守卫**按需启用**：只有见过 >10ms 帧写（peer_slow_seen）才生效。
+       新原生泵（帧写 2~4ms）下 peer_slow_seen 永远为 0 → 帧写不会被 HID 活动饿死。 */
+    int hid_blocked = (g_hid_guard_ms > 0 && t->peer_slow_seen && hid_last > 0 &&
+                       now - hid_last < g_hid_guard_ms);
+    int slow_blocked = (t->peer_slow_until_ms > now);
+    /* 饥饿上限：队首帧等太久（>1000ms）且仅被 HID 守卫挡住 → 放行写 1 帧，防止
+       ROLE 心跳/剪贴板 ACK 在用户"连续移动鼠标 >5s"时被无限饿死（Windows 判对端不在）。 */
+    int starve_allow = 0;
+    if (hid_blocked && !slow_blocked && t->txq.count > 0) {
+        uint32_t waited = (uint32_t)now - t->txq.s[t->txq.head].ts_ms;
+        if (waited >= (uint32_t)OTI_HID_STARVE_MS) {
+            starve_allow = 1;
+            t->starved++;
+            fprintf(stderr, "[info] SLOWOP HID 饥饿放行：队首帧等待 %ums，先写 1 帧\n",
+                    (unsigned)waited);
+        }
+    }
+    int write_blocked = slow_blocked || (hid_blocked && !starve_allow);
 
-    unsigned pending = (unsigned)t->txq.count;
+    /* 窗口内上报 pending=0：让设备**不要**发放帧写授权（避免空授权/帧写被拒）。
+       注意只影响"写"：消息读（0xD8）与帧读照常，遥测/剪贴板接收不受影响。 */
+    unsigned pending = write_blocked ? 0u : (unsigned)t->txq.count;
     if (pending > 100)
         pending = 100;
+    long tu0 = now_us();
     int rc = otilink_msg_read_to(&t->dev, m, (uint16_t)pending, g_msg_timeout_ms);
+    long dt_us = now_us() - tu0;
+    if (dt_us / 1000 > t->op_max_ms)
+        t->op_max_ms = dt_us / 1000;
     if (rc)
         return rc;
 
@@ -299,14 +496,24 @@ static int cable_pump_once_locked(oti_transport *t)
         unsigned n = ((unsigned)m[1] << 8) | (unsigned)m[2];
         if (n > 4)
             n = 4;                     /* 一次最多收 4 帧：缩短持锁时间，输入线程不被长时间挡住 */
+        if (t->read_slow_until_ms > now) {
+            t->deferred_reads++;
+            return 0;                  /* 帧读退避窗口内：数据留在设备侧，下次再取 */
+        }
         for (unsigned i = 0; i < n; i++) {
             if (t->rxq.count >= OTI_QSLOTS) {
                 t->rxq.dropped++;      /* 队列满：不读，留在设备侧下次再取 */
                 break;
             }
+            long tr0 = now_us();
             rc = otilink_recv_frame(&t->dev, frame);
+            long rdt = (now_us() - tr0) / 1000;
             if (rc)
                 return rc;
+            if (rdt > t->frame_read_max_ms)
+                t->frame_read_max_ms = rdt;
+            if (rdt > t->op_max_ms)
+                t->op_max_ms = rdt;
             if (otilink_frame_check(frame) != 1)
                 continue;              /* 空闲/非法帧：丢弃 */
             uint32_t l = 0;
@@ -315,26 +522,119 @@ static int cable_pump_once_locked(oti_transport *t)
                 l = OTI_BODY_MAX;
             q_push(&t->rxq, frame + OTI_FRAME_HEAD, l);
             t->rx_done++;
+            if (rdt > g_slowop_ms) {
+                /* 帧读慢：退避帧读（独立曲线）。只推迟帧读 —— 消息泵与 HID 写不受影响。 */
+                long rnow = now_ms();
+                if (t->read_last_slow_ms &&
+                    rnow - t->read_last_slow_ms > (long)g_slow_base_ms * 8)
+                    t->read_slow_streak = 0;      /* 很久没慢：重新从 base 起 */
+                long w = slow_window_next(t->read_slow_streak);
+                t->read_slow_streak++;
+                t->read_window_ms = w;
+                t->read_last_slow_ms = rnow;
+                t->read_slow_until_ms = rnow + w;
+                t->read_slow_count++;
+                fprintf(stderr, "[warn] SLOWOP frame read %ldms（对端/设备慢，暂停帧读 %ldms）\n",
+                        rdt, w);
+                break;                 /* 本次不再读后续帧 */
+            }
+            if (t->read_slow_streak > 0 && t->read_slow_until_ms <= now) {
+                fprintf(stderr, "[info] SLOWOP 恢复：帧读 %ldms（连续慢 %d 次后清零）\n",
+                        rdt, t->read_slow_streak);
+                t->read_slow_streak = 0;
+                t->read_window_ms = 0;
+            }
         }
         return 0;
     }
 
     if (m[0] == 0x06 || m[0] == 0x07) {
-        while (t->txq.count > 0) {
+        if (t->txq.count == 0)
+            return 0;
+        if (slow_blocked) {
+            /* 慢写退避窗口内：**不发起帧写**（保留 HID 与消息泵）。帧留在队列里，窗口后继续。 */
+            t->deferred_writes++;
+            return 0;
+        }
+        if (hid_blocked && !starve_allow) {
+            /* 写入侧 HID 优先（仅疑似慢对端生效）：最近 50ms 内有成功的 HID 注入写 → 先不写帧。
+               这样即使对端是旧慢代理（帧写 250~700ms），用户动鼠标期间也不会有长帧写
+               去堵 HID；停手 50ms 后自动补发。队列保留、消息泵/帧读照常。 */
+            t->deferred_writes++;
+            t->deferred_hid++;
+            return 0;
+        }
+        int max_frames = starve_allow ? 1 : 0x7fffffff;   /* 饥饿放行只写 1 帧 */
+        while (t->txq.count > 0 && max_frames-- > 0) {
             size_t l = 0;
             if (q_pop(&t->txq, body, &l))
                 break;
+            long tw0 = now_us();
             rc = otilink_send_frame(&t->dev, body, l);
+            long wdt = (now_us() - tw0) / 1000;
+            if (wdt > t->frame_write_max_ms)
+                t->frame_write_max_ms = wdt;
+            if (wdt > t->op_max_ms)
+                t->op_max_ms = wdt;
             if (rc)
                 return rc;             /* 失败：该帧已丢，计数在上层 */
             t->tx_done++;
             t->last_tx_ms = now_ms();
+            long wnow = now_ms();
+            /* "按需启用 HID 守卫"的疑似慢对端判定：单次 >10ms → 开；连续 5 次 <10ms → 关。 */
+            if (wdt > OTI_PEER_SLOW_HINT_MS) {
+                t->peer_slow_seen = 1;
+                t->frame_fast_streak = 0;
+            } else if (t->peer_slow_seen) {
+                if (++t->frame_fast_streak >= 5) {
+                    t->peer_slow_seen = 0;          /* 对端已恢复快：关掉 HID 守卫 */
+                    t->frame_fast_streak = 0;
+                }
+            }
+            if (wdt > g_slowop_ms) {
+                /* 对端消费慢：进入退避窗口，窗口内不再发起帧写。
+                   连续慢 → 指数退避（300/600/1200/2000ms 封顶）。
+                   ⚠️ 本次授权不再写后续帧：它们大概率同样慢，会把 HID 一起堵住。 */
+                if (t->peer_last_slow_ms &&
+                    wnow - t->peer_last_slow_ms > (long)g_slow_base_ms * 8)
+                    t->peer_slow_streak = 0;      /* 很久没慢：重新从 base 起 */
+                long w = slow_window_next(t->peer_slow_streak);
+                t->peer_slow_streak++;
+                t->slow_window_ms = w;
+                t->peer_last_slow_ms = wnow;
+                t->peer_slow_until_ms = wnow + w;
+                t->peer_slow_count++;
+                fprintf(stderr, "[warn] SLOWOP frame write %ldms（对端消费慢，暂停帧发送 %ldms）\n",
+                        wdt, w);
+                break;
+            }
+            if (t->peer_slow_streak > 0) {
+                /* 退避窗口后第一次写恢复快 → 连续慢清零（"恢复后计数清零"）。 */
+                fprintf(stderr, "[info] SLOWOP 恢复：帧写 %ldms（连续慢 %d 次后清零）\n",
+                        wdt, t->peer_slow_streak);
+                t->peer_slow_streak = 0;
+                t->slow_window_ms = 0;
+                t->peer_slow_until_ms = 0;
+            }
         }
         return 0;
     }
 
     t->resets++;
     return 0;
+}
+
+/* 非阻塞推一次设备泵（单测/诊断工具用；fd 后端不需要泵） */
+int oti_tr_pump_once(oti_transport *t)
+{
+    if (!t)
+        return -EINVAL;
+    if (t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    int rc = cable_pump_once(t);
+    pthread_mutex_unlock(&t->lock);
+    return rc;
 }
 
 int oti_tr_send(oti_transport *t, const void *body, size_t len)
@@ -355,32 +655,29 @@ int oti_tr_send(oti_transport *t, const void *body, size_t len)
         pthread_mutex_unlock(&t->lock);
         return rc;
     }
-    /* 线缆：**绝不阻塞输入路径**。
-       只入队 + 顺手推一次；真正的发送由接收线程的泵负责。
-       （教训：之前在这里等最多 5 秒且持有互斥锁，对端一不消费就把输入线程和
-         接收线程一起卡死 —— 用户表现为"键鼠完全失控、热键也失灵"。） */
+    /* 线缆：**只入队，绝不在这里做设备 I/O**（2026-11-06 重设计，Lead 明确要求）。
+       为什么：一次慢帧写（对端旧/慢代理时 250~700ms）如果发生在捕获/输入线程的
+       内联泵里，会把这条线程整个卡住；把它交给 RX 泵线程（5~10ms 级轮询，阻塞无妨）
+       才能保证"设备操作永远短、键鼠永不冻结"。历史上这里的"顺手推一次"正是隐患。
+       入队策略见 txq_enqueue（背景心跳合并/可丢；关键数据不丢）。 */
     pthread_mutex_lock(&t->lock);
-    if (q_push(&t->txq, body, len)) {
-        size_t dl = 0;
-        q_pop(&t->txq, q_scratch, &dl);      /* 丢最旧的一条：鼠标位移宁丢旧不卡新 */
+    int rc = txq_enqueue(t, body, len);
+    if (rc != 0) {
+        /* 队列满且没有背景心跳可踢：沿用历史兜底"丢最旧"（鼠标位移宁丢旧不卡新）。 */
+        t->txq.head = (t->txq.head + 1) % OTI_QSLOTS;
+        t->txq.count--;
+        t->txq.dropped++;
         q_push(&t->txq, body, len);
+        rc = 0;
     }
     pthread_mutex_unlock(&t->lock);
-
-    /* **尝试**推一次；拿不到锁（接收线程正在读设备）就立刻返回 ——
-       帧已经在队列里，接收线程下一次泵会把它发出去。
-       绝不在输入路径上等设备 I/O：那会造成"鼠标隔一会卡一下"。 */
-    if (pthread_mutex_trylock(&t->lock) == 0) {
-        int rc = cable_pump_once(t);
-        pthread_mutex_unlock(&t->lock);
-        return rc;
-    }
-    return 0;
+    return rc;
 }
 
 /* 可靠发送：队列满时**等**（而不是丢最旧的）。给大文件分片用 ——
  * 文件片丢一片虽然能被收端的位图发现并重传，但频繁丢会让 500MB 传得很惨。
- * 返回 0 成功；<0 = 超时/设备错（上层按"收端位图裁决"重传）。 */
+ * ⚠️ 会内联推一次设备泵：只允许非输入线程（剪贴板/大文件/ACK）调用 —— 慢帧写
+ * 在这里阻塞是可接受的（这些线程不碰键鼠实时性）。返回 0 成功；<0 = 超时/设备错。 */
 int oti_tr_send_wait(oti_transport *t, const void *body, size_t len, int timeout_ms)
 {
     if (!t || len > OTI_BODY_MAX)
@@ -390,7 +687,7 @@ int oti_tr_send_wait(oti_transport *t, const void *body, size_t len, int timeout
     long deadline = now_ms() + timeout_ms;
     for (;;) {
         pthread_mutex_lock(&t->lock);
-        if (q_push(&t->txq, body, len) == 0) {
+        if (txq_enqueue(t, body, len) == 0) {
             int rc = cable_pump_once(t);
             pthread_mutex_unlock(&t->lock);
             return rc;
@@ -428,6 +725,159 @@ void oti_tr_cable_drop_tx(oti_transport *t)
         return;
     pthread_mutex_lock(&t->lock);
     t->txq.head = t->txq.tail = t->txq.count = 0;
+    pthread_mutex_unlock(&t->lock);
+}
+
+/* ---------------- 慢操作守卫的只读统计 API（验证/单测/日志用）---------------- */
+unsigned long oti_tr_cable_slow_count(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    unsigned long v = t->peer_slow_count;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+unsigned long oti_tr_cable_read_slow_count(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    unsigned long v = t->read_slow_count;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+unsigned long oti_tr_cable_deferred_writes(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    unsigned long v = t->deferred_writes;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+unsigned long oti_tr_cable_deferred_hid(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    unsigned long v = t->deferred_hid;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+unsigned long oti_tr_cable_starved(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    unsigned long v = t->starved;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+int oti_tr_cable_peer_slow_seen(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    int v = t->peer_slow_seen;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+unsigned long oti_tr_cable_bg_merged(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    unsigned long v = t->bg_merged;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+unsigned long oti_tr_cable_bg_dropped(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    unsigned long v = t->bg_dropped;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+long oti_tr_cable_frame_write_max_ms(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    long v = t->frame_write_max_ms;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+long oti_tr_cable_frame_read_max_ms(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    long v = t->frame_read_max_ms;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+long oti_tr_cable_max_latency_ms(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    long v = t->op_max_ms;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+long oti_tr_cable_backoff_ms(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    pthread_mutex_lock(&t->lock);
+    long v = t->slow_window_ms;
+    pthread_mutex_unlock(&t->lock);
+    return v;
+}
+
+long oti_tr_cable_peer_slow_remaining_ms(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return 0;
+    long now = now_ms();
+    pthread_mutex_lock(&t->lock);
+    long r = t->peer_slow_until_ms - now;
+    pthread_mutex_unlock(&t->lock);
+    return r > 0 ? r : 0;
+}
+
+/* 清统计（不动队列/窗口/设备）：验证脚本在"传输前"清零，测"本次传输"的慢操作。 */
+void oti_tr_cable_reset_stats(oti_transport *t)
+{
+    if (!t || t->kind != TR_CABLE)
+        return;
+    pthread_mutex_lock(&t->lock);
+    t->peer_slow_count = 0;
+    t->deferred_writes = 0;
+    t->deferred_hid = 0;
+    t->starved = 0;
+    t->frame_write_max_ms = 0;
+    t->read_slow_count = 0;
+    t->deferred_reads = 0;
+    t->frame_read_max_ms = 0;
+    t->op_max_ms = 0;
+    t->bg_merged = t->bg_dropped = 0;
+    t->txq.dropped = t->rxq.dropped = 0;
+    t->resets = 0;
     pthread_mutex_unlock(&t->lock);
 }
 
@@ -477,12 +927,10 @@ int oti_tr_recv(oti_transport *t, void *body, size_t *len, int timeout_ms)
             return 0;
         if (deadline >= 0 && now_ms() >= deadline)
             return -2;
-        /* 设备侧暂时没有数据：小睡一下，别把 CPU 空转打满。
-           ⚠️ 这里同时是 HID 鼠标的"竞争对手"：每次 cable_pump_once 都要拿
-           g_cable_io 做一次 SCSI 读，读未完成时捕获线程的 otilink_send_hid()
-           只能等锁 —— 真机表现就是"Windows 指针每 100~300ms 冻结一下"
-           （2026-11-06，1ms 采样）；原先 300us 一次把设备几乎占满。
-           10ms 一次：CURSOR/ROLE/剪贴板延迟上限 +10ms，大文件按帧仍够用。 */
+        /* 设备侧暂时没有数据：小睡 10ms，别把 CPU 空转打满。
+           为什么是 10ms（2026-11-06 重设计保持不变）：0xD8 消息读本身 0~1ms，10ms 级轮询
+           让 CURSOR/ROLE/剪贴板延迟上限 +10ms，又不会把单队列设备占满（HID 写每次只需
+           等这 1ms 级读窗口）。慢对端的风险已由"帧写/帧读退避窗口"处理，不再靠停泵。 */
         usleep(10 * 1000);
     }
 }

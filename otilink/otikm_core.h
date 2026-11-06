@@ -19,12 +19,25 @@
 
 #include "otiproto.h"
 
-/* 对端光标回传（OTI_MSG_CURSOR）的新鲜度窗口：Windows 剪贴板代理的主循环
-   约 1.3s/轮（取帧阻塞），2.5s 内仍算新鲜；超时退回旧的计数判据，
-   兼容没回传 / 旧版 Windows agent。 */
-#define OTI_REM_CURSOR_TTL_MS 2500
-/* 回传确认"在入口边"之后，还要再往外推多少计数才回程（防抖/防误触）。 */
-#define OTI_REM_CURSOR_PUSH   8
+/* 对端光标回传（OTI_MSG_CURSOR）的新鲜度窗口。
+   2026-11-06（第 61 轮）：Windows 侧线缆 I/O 搬进原生泵线程后，CURSOR 遥测从
+   0.3~2.5s/条 提升到 20~50ms/条 —— 窗口必须跟着收紧。旧值 2500ms 的后果：
+   回传"其实已经过期"的旧值仍参与判据，过期后又退回计数判据，现场表现为
+   "正常移动累积 100 计数就被揪回 Kylin"（NOTES §76.1）。
+   过期时的规则（重要）：**曾收到过遥测的对端只等新遥测、绝不退回计数判据**；
+   从未收到过遥测的零软件/旧对端才走兼容计数判据（见 local_mouse）。 */
+#define OTI_REM_CURSOR_TTL_MS 300
+/* 回程主判据：远端光标贴住入口边（容差 = edge_px*4 远端像素）后，
+   用户继续向入口边外推的**未缩放位移累计**要达到这个计数才回程。
+   16 计数 ≈ 1000Hz 鼠标 2~8 个事件；贴边 ±1px 的抖动/惯性尾巴不会误触发。
+   注意这是 HID 原始计数，不是像素：Windows 指针加速会让计数≠像素，
+   所以"计数"只负责防抖，"到没到边"由真实光标回传负责。 */
+#define OTI_REM_CURSOR_PUSH   16
+/* 切出去后等首帧 CURSOR 的最长时间：hid_park 已经把远端光标顶到入口边，
+   这段时间内按"光标已在入口边"的假设判回程（用户立刻反悔可以马上回来；
+   一旦发现用户在往对端里面走，假设立即作废，见 local_mouse）。超时仍无
+   遥测 → 冻结回程判据（不判、也不退回计数），直到遥测恢复。 */
+#define OTI_REM_CURSOR_WAIT_MS 300
 
 typedef enum {
     OTI_ACT_LOCAL = 0,          /* 本地消费（不发送） */
@@ -89,7 +102,10 @@ typedef struct {
         只在"键鼠在对端"的老拓扑里成立）。 */
     int      rem_entry_x, rem_entry_y;
     /* 交出去之后累计的**未缩放位移**（入口边 = 0；往对端里面为负/正见下）。
-       回程判据只看它：用户必须把"推出去的距离"推回来，再多推 max(100, edge_px*12)。
+       2026-11-06 第 61 轮起的用法：它只是**防抖计数**，不再单独决定回程 ——
+       主判据要求"远端真实光标确认在入口边" + 继续外推 ≥ OTI_REM_CURSOR_PUSH(16)；
+       从"不在边"跃迁到"在边"的那一刻清零重锚，遥测断档期间保留（恢复后立即判）。
+       只有**从未收到过 CURSOR** 的零软件/旧对端才用纯计数阈值 max(100, edge_px*12)。
        为什么不用 rem_x：rem_x 是**远端像素**坐标，要按 rem_w/local_w 缩放，而远端
        几何可能在手势中途才到（真机实测：Windows 的 HELLO 报的是 4480x1440 虚拟桌面，
        它在驱动中途到达 → 缩放从 2 跳到 4、出口边从 1919 跳到 4479，用户推回去的
@@ -97,16 +113,19 @@ typedef struct {
        未缩放的计数正好是**我们真发给对端的 HID 位移**：推出去多少、推回来多少，
        与远端几何无关，也不会被整数截断吃掉对称性（coretest 1d 回归）。 */
     int      drv_x, drv_y;
-    /* 对端光标的**真实**位置（2026-11-03，OTI_MSG_CURSOR 回传）：
+    /* 对端光标的**真实**位置（2026-11-03 起 OTI_MSG_CURSOR 回传；2026-11-06 重写判据）。
        HID 路径只有相对计数；Windows 的“提高指针精确度”会让净计数与像素位置漂移
        （真机实测：快左移 + 慢右移后净计数 +100，Windows 光标却还离右边缘 1068px）。
-       有回传时用它判回程；超过 OTI_REM_CURSOR_TTL_MS 没更新则退回 drv_* 计数判据。 */
+       有回传时用它判回程；**几何用回传自带的 rem_cur_w/h**（Windows 报的是虚拟桌面
+       3584x1152，而 HELLO 的 10s 心跳值可能是旧的），HELLO 只当驱动坐标系的初值。 */
     int      rem_cur_x, rem_cur_y;   /* 已归一化到远端虚拟桌面左上角：0..w-1 */
-    int      rem_cur_w, rem_cur_h;   /* 回传自带的虚拟桌面尺寸（不依赖 HELLO 的 10s 节奏） */
-    long     rem_cur_ms;             /* 收到回传的时刻（本地单调毫秒） */
-    int      rem_cur_valid;
-    int      cursor_ever;        /* 对端曾回过 CURSOR：有真实光标反馈，回程不再退化成纯计数 */
-    long     rem_cur_anchor_ms;      /* 最近一次“回传确认在入口边”的时刻（用于重锚 drv_*） */
+    int      rem_cur_w, rem_cur_h;   /* 回传自带的虚拟桌面尺寸（判"贴哪条边"的依据） */
+    long     rem_cur_ms;             /* 最近一次收到回传的时刻（本地单调毫秒） */
+    int      rem_cur_valid;          /* 本次交出去之后收到过 CURSOR（enter_remote 清零） */
+    int      cursor_ever;            /* 对端**曾经**发过 CURSOR：=1 后回程永不再退回计数判据 */
+    int      rem_edge_confirmed;     /* 最近一次确认：远端光标在入口边（跨遥测断档保持） */
+    long     rem_edge_anchor_ms;     /* 确认"在入口边"的时刻（诊断用；跃迁时才重锚） */
+    long     rem_switch_ms;          /* 本次交给对端的时刻（首帧假设窗口起点） */
     long     now_ms;                 /* 本次事件时刻，由调用方（handle_local/coretest）写入 */
     int      edge_px;          /* 触边阈值（像素/单位位移） */
     int16_t  mx, my;           /* 本地指针位置（本地控制时跟踪） */
@@ -130,8 +149,9 @@ const char *otikm_hotkey_name(const otikm_hotkey *hk, char *buf, size_t cap);
 void otikm_core_set_hotkey(otikm_core *c, uint16_t code, int only_hotkey);
 /* 对端上报屏幕几何（0 表示未知，忽略） */
 void otikm_core_set_remote_screen(otikm_core *c, int w, int h);
-/* 对端回传的真实光标位置（已归一化到远端虚拟桌面：0..rem_w-1）。
-   now 用本地单调毫秒；超过 TTL 后自动退回计数判据。 */
+/* 对端回传的真实光标位置（已归一化到**回传自带**的虚拟桌面：0..w-1）。
+   now 用本地单调毫秒。超过 OTI_REM_CURSOR_TTL_MS 视为过期：回程判据冻结
+   （等新遥测），**不**退回计数判据 —— 只有从未收到过回传的对端才用计数判据。 */
 void otikm_core_set_remote_cursor(otikm_core *c, int x, int y, int w, int h, long now);
 /* 写入本次鼠标事件的时刻（handle_local 每次调用前设置；coretest 直接写 c->now_ms 也可） */
 void otikm_core_set_now(otikm_core *c, long now);

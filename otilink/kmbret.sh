@@ -11,6 +11,14 @@
 # 同时验证 HID 路径会补发被抑制的修饰键（Ctrl+C 这类组合能到对端）。
 # 全程走**真实线缆**（HID 包真送到 Windows），并断言 Windows 侧看到按键/光标位移。
 #
+# ⚠️ 2026-11-06（第 61 轮）回程判据改成"真实光标"为主：
+#   远端光标贴入口边（±edge_px*4）+ 继续外推 ≥16 未缩放计数 → 回程；遥测过期时只等
+#   新遥测、不退回计数判据；只有"从未收到过 CURSOR"的零软件/旧对端才走旧计数判据。
+#   → 本回归需要 Windows 侧**原生泵**（CURSOR 20~50ms/条）在场；旧 PowerShell 慢代理
+#     （主循环 1.3~9s）会让遥测经常过期，合成手势可能"回不来"（这不是麒麟侧回归）。
+#   日志断言：`回程判据：对端光标 … 已在入口边`（真实光标路径）；老对端兼容路径会打
+#   `回程判据（无光标回传，退回计数）：已把推出去的位移推回 N/100`。
+#
 # 用法：
 #   ./kmbret.sh                约 30 秒；会**短暂停止并恢复**麒麟 otikm
 #   EXIT=right ./kmbret.sh     物理摆位相反（麒麟在 Windows 左边）时用
@@ -132,8 +140,34 @@ else
 fi
 grep -q "对端光标已停在入口边" "$TMP/otikm.log" && ok "交接时已把对端光标顶到入口边（消除不可见夹边位移）" \
     || bad "没有做入口边 park（回程判据仍可能与用户看到的不一致）"
-grep -q "回程判据：已把推出去的位移推回" "$TMP/otikm.log" && ok "回程判据诊断有进度（日志可复盘）" \
-    || warn "没有回程进度日志（可能推回得太快，或诊断被节流）"
+# park 包数受保护（估算路径 ≥32 包下限、64 包上限；单次 HID 写 >20ms 会提前中止）
+PARK_LINE=$(grep -o "park [0-9]\+ 包" "$TMP/otikm.log" | head -1 || true)
+[ -n "${PARK_LINE:-}" ] && ok "park 包数已记录（${PARK_LINE}，上限 64）" \
+    || warn "日志里没有 park 包数（旧日志格式或 park 未执行）"
+if grep -q "park 提前中止" "$TMP/otikm.log"; then
+    warn "park 有提前中止（单次 HID 写 >20ms：设备被慢对端/大帧拖住，交接耗时可能变大）"
+else
+    ok "park 未触发耗时保护（单次 HID 写都 ≤20ms）"
+fi
+# 交接耗时（2026-11-06 新增诊断；验收目标：从撞边到对端指针开始动 <100ms）
+REAL_CUR_MS=$(grep -o "交接耗时 [0-9]\+ms（→远端" "$TMP/otikm.log" | head -1 | grep -o "[0-9]\+" || true)
+if [ -n "${REAL_CUR_MS:-}" ]; then
+    if [ "$REAL_CUR_MS" -le 100 ]; then ok "交接耗时 ${REAL_CUR_MS}ms（→远端，≤100ms 达标）"
+    elif [ "$REAL_CUR_MS" -le 200 ]; then warn "交接耗时 ${REAL_CUR_MS}ms（→远端，>100ms：检查 park 包数/设备慢写）"
+    else bad "交接耗时 ${REAL_CUR_MS}ms（→远端，>200ms：交接动作太慢）"; fi
+else
+    warn "日志里没有'交接耗时 …ms（→远端…'（旧二进制？）"
+fi
+# 新回程判据诊断（真实光标路径）：本机持有控制权期间、用户往入口边推时每秒打一行
+if grep -q "回程判据：对端光标.*已在入口边" "$TMP/otikm.log"; then
+    ok "回程判据走**真实光标**路径（日志确认'对端光标…已在入口边'）"
+elif grep -q "回程判据：遥测过期" "$TMP/otikm.log"; then
+    ok "回程判据走真实光标路径（遥测过期→等新帧，未退回计数判据）"
+elif grep -q "回程判据（无光标回传，退回计数）：已把推出去的位移推回" "$TMP/otikm.log"; then
+    ok "兼容路径：无 CURSOR 回传 → 计数判据诊断可见（零软件/旧对端）"
+else
+    warn "没有回程进度日志（可能推回得太快、诊断被 1s 节流，或对端没有 CURSOR 遥测）"
+fi
 grep -q "抓取设备 /dev/input/by-id/" "$TMP/otikm.log" && ok "抓取用的是 by-id 稳定路径（拔插后不会抓错设备）" \
     || warn "抓取路径不是 by-id（这台机器可能没有 by-id 链接；eventN 拔插后会变）"
 

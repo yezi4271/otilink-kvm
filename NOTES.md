@@ -4993,3 +4993,125 @@ otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otili
 这是"不要在 HID 写的时候插读"，不是"把读超时调短"；但**已经开始的 5s 读仍会把设备占住**，
 所以只能减少碰撞概率。若用户复测仍卡，剩余根因是 Windows SPTI 读无法取消（最小 1s 超时），
 真正的修法只能是 Windows 侧 overlapped SCSI + `CancelIoEx`（50ms 级取消）或改传输/角色架构。
+
+## 76 第 61 轮：现场「鼠标来回不顺畅 + 在 Windows 移动一段时间卡几秒」= Windows 侧读帧节奏太慢堵住单队列设备（2026-11-06）
+
+**报障**（2026-11-06 10:59）："现在鼠标在 windows 和 kylin 之间来回不顺畅，而且在 windows 移动一段时间会卡几秒。"
+
+拓扑 B（物理键鼠插在 Kylin，Kylin 是主控、HID 直发；Windows 侧只跑剪贴板 PowerShell 代理）。
+上一轮（§75）把 HID 直发改成 4ms 合并、把 Windows 代理轮询降到 30ms、加了 HID 优先窗口，**仍不够**。
+
+### 76.1 决定性取证：HID 写被"帧写"堵在单队列设备上
+
+* 线缆设备 `/sys/block/sdb/device/queue_depth = **1**`（USB BOT 单队列）——HID 注入写与帧管道
+  共用同一条 SCSI 设备，**任何一条命令阻塞，后面的 HID 写全部排队**。
+* 现状基线（Windows 剪贴板代理在跑，麒麟 `hidlat` 与 otikm 并发 20s）：
+  ```
+  GAP  353ms (send 343ms) / GAP  253ms (send 243ms) / ... MAXGAP=482 GAPS_OVER_200=11
+  ```
+* 临时 trace 版 otikm（逐条 SCSI 命令计时，见 `/tmp/iotest.c` 方法）在 650KB 剪贴板同步期间：
+  ```
+  d9 2a ff 00 dir=1 len=65536 rc=0  耗时 250~700ms（单帧写！）
+  ```
+* **对照实验**：把 Windows 侧换成一个原生紧凑读帧循环（`C:\Users\Public\fastpump.cs`，
+  只读不处理，~2000 次 msg read/s），同样触发 650KB 剪贴板传输：
+  ```
+  hidlat: MAXGAP=14 GAPS_OVER_100=0 SEND_FAIL=0
+  trace:  d9 2a 每帧 2~4ms；fastpump 侧帧读 max 3ms、msg read max 9ms
+  ```
+  → **结论：帧写单次耗时完全取决于对端（Windows）读帧的及时性；Windows PowerShell 主循环
+  1.3~9s/轮、取帧可阻塞数秒，导致麒麟侧每帧写阻塞数百 ms，把 HID 写堵住数百 ms~数秒。**
+  这也解释了为什么 §75 的"合并设备写"没根治：堵在**读**，不在写速率。
+* 补充实测（`/tmp/iotest`，无竞争）：`0xD8` 消息读 0~1ms 返回（m0=0x01，不阻塞）、
+  `0xD9/0x28` 帧读无数据时立即 -90；短超时（20ms）本身不会弄坏设备。
+  → 上一轮"缩短读超时"失败（§75.6）的真正原因是对端消费问题，不是超时本身。
+* 现场另一个 bug：当前 `otikm` 的"HID 优先窗口"（鼠标移动期间 `g_hid_busy` 跳过整个消息泵）
+  在用户持续移动时会饿死 CURSOR/ROLE：`ERR send ROLE rc=-2（连续 1 次）` 每秒刷、
+  CURSOR 遥测过期 → 回程判据永远拿不到"远端光标已到入口边" → **用户现场卡在 Windows 回不来**
+  （日志 `回程判据：对端光标 (x,y) 未到入口边` 反复出现）。这属于**我们上一轮引入的回归**。
+
+### 76.2 重新设计（本轮施工）
+
+1. **Windows 侧线缆 I/O 移出 PowerShell 主循环**：在 `otiagent.ps1` 的内嵌 C# 里新增
+   `CablePump` 后台线程，独占 `\\.\H:` 做紧凑 loop（`ReadMsgP(0xD8,pending)` → 0x05 读帧 /
+   0x06/0x07 写帧），帧体经内存队列与 PS 交换；CURSOR 遥测（20~50ms）与 ROLE/HELLO 心跳
+   由该线程原生发送。PS 只做剪贴板/文件/角色逻辑，主循环不再碰设备。
+2. **麒麟侧**：删除"HID 优先窗口"（不再暂停消息泵）；新增**慢操作守卫**——帧写单次 >30ms
+   判定"对端消费慢"，暂停帧写 300ms（指数退避到 2s），期间 HID 与消息泵照常；背景心跳帧
+   在慢窗口内可合并/丢弃，剪贴板数据不丢。`otilink_send_hid` 的 trylock 补丁收敛为短等待。
+3. **交接/回程**：以 20~50ms 的**真实光标回传**为主判据（远端光标贴入口边 + 继续外推 ≥16 计数）；
+   遥测过期且有历史遥测时等待新遥测（≤300ms），不再退回"计数 100 就揪回"；零软件/旧对端保留
+   兼容计数判据。交接时用已知远端光标计算 park 位移（首轮无遥测才用饱和位移，最多 8 包）。
+4. 新增客观回归：`otilink/hidduringclip.sh`（650KB 剪贴板突发期间 hidlat MAXGAP 阈值）、
+   `otilink/winfreeze.sh`+`cursortrace.cs`（Windows 光标 1~2ms 采样，量化冻结）、交接延迟测量。
+
+### 76.3 本轮实现（2026-11-06 已部署两端的代码）
+
+1. **Windows 剪贴板代理（`windows/otiagent.ps1`，BuildTag `nativepump-2`）**：
+   * 在原有内嵌 C# 里新增 `CablePump` 后台线程：独占 `\\.\H:`，紧凑循环
+     `ReadMsgP(0xD8,pending)` → `0x05` 读帧（每次最多 4 帧）→ `0x06/0x07` 写帧
+     （**每次授权最多 2 帧**，让 HID 有插空机会）；`CURSOR(11)` 由泵线程每 40ms
+     用 `GetCursorPos` 原生发送，`ROLE/HELLO/注入模式` 由 PS 更新载荷、泵线程按 1s/10s 重发。
+   * PowerShell 主循环**不再做任何设备 I/O**，只 `EnqueueTx/TryDequeueRx` 内存队列；
+     剪贴板/大文件/角色/托盘逻辑保持原实现。会话自愈：泵线程连续失败退出 → PS 重新
+     发现设备重启泵（含拔插后盘符变化）。
+   * 修掉一个**旧崩溃**（新泵让帧更快到达后暴露）：锁屏时 `Set-Clipboard` 抛
+     `ExternalException` 而旧代码未捕获 → 整个代理退出。现在 catch + `[warn] 应用远端剪贴板失败…`
+     + **不 ACK**（不伪装成功）。
+   * 实测：CPU 从 ~90-99% 单核降到 **~9%**；`clip.log` 每 5s 一行
+     `PUMP rx=.. tx=.. maxread=..ms maxwrite=..ms resets=.. drop=..`。
+2. **麒麟传输层（`otilink/otitrans.c|h`、`otilink.c|h`、`otikm.c`）**：
+   * 逐命令计时 API（`otilink_io_*`）；**慢操作守卫**：帧写单次 >30ms → 退避 300ms 起、
+     连续慢指数退避到 2s，窗口内只暂停帧写（消息泵/帧读/HID 照常）；帧读慢独立退避。
+   * 删除上一轮引入的"HID 优先窗口"（鼠标移动期间暂停整个消息泵）——它是现场
+     "CURSOR 遥测饿死 → 回不来"的直接原因；消息泵保持 10ms 级持续轮询。
+   * **写入侧 HID 优先（按需启用）**：初始关闭；帧写 >10ms 才启用。启用后 HID 写成功后
+     50ms 内不发起帧写；队首帧饥饿 >1000ms 放行 1 帧。新原生泵场景完全不触发。
+   * `oti_tr_send()` 线缆后端**只入队、零设备 I/O**（捕获线程绝不被慢帧写阻塞）。
+   * 背压：PING/HELLO/ROLE/CURSOR 同类新覆盖旧；CLIP/键鼠/ACK/大文件片不主动丢。
+3. **交接/回程判据（`otilink/otikm_core.c|h`）**：真实光标回传（TTL 300ms）+ 远端入口边
+   ±16px + 继续外推 ≥16 未缩放计数才回程；连续"在边"遥测不重锚（慢推能累计）；
+   遥测过期冻结、不退回"计数 100 就揪回"；从未有遥测的零软件/旧端保留计数兼容；
+   交接 park 按已知远端光标估算（32~64 包，单次 HID 写 >20ms 提前中止），日志记
+   `交接耗时 Nms`。
+4. **新增门禁**：`gate.sh --hw-clipstall`（`otilink/hidduringclip.sh`）与
+   `--hw-freeze`（`otilink/winfreeze.sh` + `cursortrace.cs`），登记见 `AGENTS.md §5/§6`。
+
+### 76.4 验收数据（真机，2026-11-06 12:0x-12:3x）
+
+| 指标 | 修复前（旧 Windows PS 代理） | 修复后（nativepump-2 + 新麒麟传输层） |
+|---|---|---|
+| 空闲/剪贴板突发期间 HID 写最大间隔（`hidlat`） | **MAXGAP=372~482ms**（`GAPS_OVER_200`>0） | **MAXGAP=15ms，GAPS_OVER_40=0，SEND_FAIL=0**（650KB 文本反复下发期间实测） |
+| 麒麟侧 `SLOWOP`（慢帧写）计数 | —（旧代码无此守卫） | **0**（Windows 原生泵帧写 2~4ms，不触发） |
+| 拓扑 B 回程手势（`kmbret`） | 旧判据依赖 1.3s 级遥测，慢推/过期时不可靠 | **PASS=21 FAIL=0 WARN=4**：小步 2px/次外推能回程、park 37 包、`交接耗时 15ms`、Windows 光标位移 -960px |
+| Windows 代理 CPU | ~90-99% 单核 | ~9~10% 单核 |
+| Windows 光标冻结（`winfreeze`/`hidduringclip`） | 历史 100~1400ms，最高 2.49s | **待测**（需 otikm 处于 HID 驱动态/用户解锁，见 §76.5） |
+
+证据行（可复核）：
+* `C:\\Users\\Public\\clip.log`：`OTiLink 剪贴板代理 build nativepump-2`、
+  `线缆泵: build nativepump-2 dev=\\.\\H:`、每 5s `PUMP rx=.. tx=.. maxread=..ms maxwrite=..ms`
+* 麒麟 `hidlat`：`MAXGAP=15 GAPS_OVER_40=0 SEND_FAIL=0`
+* 麒麟 `/tmp/otikm.log`：`写入侧 HID 优先: 疑似慢对端时…`、`交接耗时 15ms（→远端…）`
+
+### 76.5 未验证 / 待用户确认（必须如实标注）
+
+1. **剪贴板端到端**：验收时 **Windows 处于锁屏**（logonui），`Set-Clipboard/Get-Clipboard`
+   在锁屏下必然 `ExternalException`（实测 ~1.1-1.2s 后抛）→ 只能验证"麒麟侧已下发 + Windows
+   泵已收到帧"，**未能验证应用/ACK**。用户解锁后需补：文本/图片各一次双向复制粘贴
+   （`clipreg.sh` 17 项作为正式判定）。
+2. **Windows 光标冻结客观值**（`winfreeze`）：需 otikm 真正处于"HID 模式：指针交给对端"
+   时用合成 HID 驱动才有效（本机控制态直写 HID 包对 Windows 光标几乎无效，实测 130×dx=40 只动 2px）；
+   本轮锁屏+时间窗未跑出有效数字。**用户手感复测是最终判据**。
+3. `clipreg.sh`/`xferreg.sh` 本轮未跑（锁屏下剪贴板全链路不可用）；解锁后补跑。
+4. Kylin 部署的二进制 `src=` 指纹与本地预期不同（`f3d4a82e706a` vs `c500f6867430`）：
+   Kylin `~/otilink` 里存在仓库外的历史 `.c` 文件，`SRC_SHA` 把全部 `*.c|*.h` 计入，属**指纹口径**
+   差异，不影响运行；后续可让 `gate.sh --deploy-kylin` 先清理多余源码或用显式文件清单。
+5. 锁屏期间 Windows PS 主循环 ~1.2s/轮（剪贴板 API 阻塞），泵 rx 队列偶满、丢最旧
+   ROLE/背景帧（tx 不丢）；解锁后应自愈。若长期锁屏可加"每轮最多处理 N 帧"硬化（未做）。
+
+### 76.6 现场应急（本轮已做）
+
+* 11:37 对 Kylin `~/otilink/otitrans.c` 做了**临时热修**（`if (0 && g_hid_busy)`）并重启 otikm，
+  先解掉"移动期间消息泵饿死 → 回不来"；该文件随后被团队最终代码覆盖。
+* 回滚：`git checkout --` 对应文件 + `gate.sh --deploy-kylin` + 重启；Windows 侧
+  `cd re/windows && ./deploy.sh --restart` 回到备份的 otiagent.ps1。
