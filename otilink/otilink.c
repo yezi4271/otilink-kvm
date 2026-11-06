@@ -25,6 +25,114 @@ void otilink_cable_io_unlock(void) { pthread_mutex_unlock(&g_cable_io); }
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+/* ---------------- 设备操作逐命令计时（见 otilink.h）----------------
+ * 为什么要它：真机实测线缆是单队列设备，0xD9/0x2A 帧写在对端消费慢时会阻塞
+ * 250~700ms，把后面的 HID 注入写全部堵住（鼠标冻结）。传输层要靠"单次命令耗时"
+ * 判定慢操作并退避（otitrans.c），验证脚本也靠它给客观数字。
+ * 加锁代价：一次 pthread_mutex lock/unlock ≈ 几十 ns，相对 1ms+ 的 SCSI 命令可忽略；
+ * 不能省的原因是 HID 写（捕获线程）、消息泵（RX 线程）、保活/剪贴板线程都会走这里。 */
+static struct {
+    struct oti_io_stat s[OTI_IO_CAT_N];
+    pthread_mutex_t lock;
+} g_io_stats = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+static const char *const g_io_cat_name[OTI_IO_CAT_N] = {
+    "msg_read", "frame_read", "frame_write", "hid_write", "ctl", "other",
+};
+
+const char *otilink_io_cat_name(int cat)
+{
+    return (cat >= 0 && cat < OTI_IO_CAT_N) ? g_io_cat_name[cat] : "?";
+}
+
+/* 按 CDB 分类（只用于统计；不影响命令语义/时序） */
+static int oti_io_classify(const uint8_t *cdb)
+{
+    if (!cdb)
+        return OTI_IO_OTHER;
+    switch (cdb[0]) {
+    case OTI_OP_READ:
+        if (cdb[1] == 0x00 && cdb[2] == OTI_RD_CH_DATA)
+            return OTI_IO_MSG_READ;
+        return OTI_IO_OTHER;              /* 0xD8/0x01 远端状态写：很少用 */
+    case OTI_OP_WRITE:
+        if (cdb[1] == OTI_SUB_DATA)
+            return OTI_IO_FRAME_WRITE;
+        if (cdb[1] == OTI_SUB_FRAME_RD)
+            return OTI_IO_FRAME_READ;
+        if (cdb[1] == OTI_SUB_HID_TYPE1 || cdb[1] == OTI_SUB_HID_TYPE2 ||
+            cdb[1] == OTI_SUB_HID_TYPE3)
+            return OTI_IO_HID_WRITE;
+        return OTI_IO_CTL;                /* 0xD9/0x60 设备模式等 */
+    case OTI_OP_QUERY:
+        return OTI_IO_CTL;
+    default:
+        return OTI_IO_OTHER;
+    }
+}
+
+static void io_stat_add(int cat, unsigned long us)
+{
+    if (cat < 0 || cat >= OTI_IO_CAT_N)
+        return;
+    pthread_mutex_lock(&g_io_stats.lock);
+    struct oti_io_stat *st = &g_io_stats.s[cat];
+    st->count++;
+    st->sum_us += us;
+    if (us > st->max_us)
+        st->max_us = us;
+    if (us > (unsigned long)OTI_SLOWOP_MS * 1000UL)
+        st->slow++;
+    pthread_mutex_unlock(&g_io_stats.lock);
+}
+
+void otilink_io_stats_snapshot(struct oti_io_stat out[OTI_IO_CAT_N])
+{
+    if (!out)
+        return;
+    pthread_mutex_lock(&g_io_stats.lock);
+    memcpy(out, g_io_stats.s, sizeof(g_io_stats.s));
+    pthread_mutex_unlock(&g_io_stats.lock);
+}
+
+void otilink_io_stats_reset(void)
+{
+    pthread_mutex_lock(&g_io_stats.lock);
+    memset(g_io_stats.s, 0, sizeof(g_io_stats.s));
+    pthread_mutex_unlock(&g_io_stats.lock);
+}
+
+unsigned otilink_io_max_ms(int cat)
+{
+    if (cat < 0 || cat >= OTI_IO_CAT_N)
+        return 0;
+    pthread_mutex_lock(&g_io_stats.lock);
+    unsigned long us = g_io_stats.s[cat].max_us;
+    pthread_mutex_unlock(&g_io_stats.lock);
+    return (unsigned)((us + 999) / 1000);
+}
+
+unsigned otilink_io_avg_ms(int cat)
+{
+    if (cat < 0 || cat >= OTI_IO_CAT_N)
+        return 0;
+    pthread_mutex_lock(&g_io_stats.lock);
+    unsigned long n = g_io_stats.s[cat].count;
+    unsigned long long sum = g_io_stats.s[cat].sum_us;
+    pthread_mutex_unlock(&g_io_stats.lock);
+    return n ? (unsigned)((sum / n + 999) / 1000) : 0;
+}
+
+unsigned long otilink_io_slow_count(int cat)
+{
+    if (cat < 0 || cat >= OTI_IO_CAT_N)
+        return 0;
+    pthread_mutex_lock(&g_io_stats.lock);
+    unsigned long v = g_io_stats.s[cat].slow;
+    pthread_mutex_unlock(&g_io_stats.lock);
+    return v;
+}
+
 static int read_hex_file(const char *path, unsigned *out)
 {
     FILE *f = fopen(path, "r");
@@ -148,8 +256,9 @@ void otilink_set_ops(struct otilink_dev *d, const struct oti_scsi_ops *ops)
         memset(&d->ops, 0, sizeof(d->ops));
 }
 
-int otilink_cdb_len(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
-                    void *data, unsigned len, int to_dev, struct oti_scsi_result *res)
+static int cdb_len_to_raw(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
+                          void *data, unsigned len, int to_dev,
+                          struct oti_scsi_result *res, int timeout_ms)
 {
     if (d->ops.exec)                      /* 注入的后端（仿真设备/测试） */
         return d->ops.exec(d->ops.ctx, cdb, data, len, to_dev, res);
@@ -169,7 +278,7 @@ int otilink_cdb_len(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
     memset(sense, 0, sizeof(sense));
     hdr.sbp = sense;
     hdr.mx_sb_len = sizeof(sense);
-    hdr.timeout = 5000;
+    hdr.timeout = timeout_ms > 0 ? (unsigned)timeout_ms : 5000;
     int io = ioctl(d->sg, SG_IO, &hdr);
     if (res) {
         memset(res, 0, sizeof(*res));
@@ -192,10 +301,34 @@ int otilink_cdb_len(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
     return 0;
 }
 
+int otilink_cdb_len_to(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
+                       void *data, unsigned len, int to_dev,
+                       struct oti_scsi_result *res, int timeout_ms)
+{
+    /* 计时包在**真实执行**外层：SG_IO 与注入后端都覆盖。用单调时钟的秒+纳秒直接算
+       （tv_nsec 相减可能为负，但按总纳秒算不会错）。 */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = cdb_len_to_raw(d, cdb, cdb_len, data, len, to_dev, res, timeout_ms);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long long ns = (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
+                   (long long)(t1.tv_nsec - t0.tv_nsec);
+    if (ns < 0)
+        ns = 0;
+    io_stat_add(oti_io_classify(cdb), (unsigned long)(ns / 1000));
+    return rc;
+}
+
+int otilink_cdb_len(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
+                    void *data, unsigned len, int to_dev, struct oti_scsi_result *res)
+{
+    return otilink_cdb_len_to(d, cdb, cdb_len, data, len, to_dev, res, 5000);
+}
+
 int otilink_cdb_ex(struct otilink_dev *d, const uint8_t cdb[16], void *data,
                    unsigned len, int to_dev, struct oti_scsi_result *res)
 {
-    return otilink_cdb_len(d, cdb, 16, data, len, to_dev, res);
+    return otilink_cdb_len_to(d, cdb, 16, data, len, to_dev, res, 5000);
 }
 
 int otilink_cdb(struct otilink_dev *d, const uint8_t cdb[16], void *data,
@@ -217,6 +350,40 @@ static void oti_cdb_tail(uint8_t cdb[16])
     cdb[15] = 'T';
 }
 
+/* HID 写拿"设备 I/O 互斥锁"的等待上限（2026-11-06 收敛，替换掉"trylock 失败就直接发"
+   的临时补丁）：
+   - 正常情况：泵的一次设备操作 = 0xD8 消息读(0~1ms) + 至多一帧写(对端快 2~4ms)，
+     锁窗口只有几 ms，10ms 足够等到；
+   - 异常情况：对端消费慢时一次帧写可达 250~700ms。传输层的慢操作守卫（otitrans.c）
+     会在第一次慢写后进入退避窗口、不再发起帧写，所以这种长锁最多出现一次。
+     等满 10ms 仍拿不到就**照发**（不丢 HID 写）——宁可冒一次"插入写帧窗口"的风险
+     （帧有 ACK/重发），也绝不能丢用户的按键/位移。
+   - 实现用 trylock + 短睡轮询（比手算 CLOCK_REALTIME 绝对 deadline 简单，且不受
+     系统时间跳变影响；10ms 上限的误差 ±0.5ms 对 HID 无意义）。 */
+#define OTI_HID_LOCK_WAIT_MS 10
+
+static int oti_cable_lock_wait(int timeout_ms)
+{
+    if (pthread_mutex_trylock(&g_cable_io) == 0)
+        return 1;
+    long deadline = 0;
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        deadline = (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + timeout_ms;
+    }
+    for (;;) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long now = (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        if (now >= deadline)
+            return 0;
+        usleep(200);                       /* 200us 一轮：最坏多等 0.2ms */
+        if (pthread_mutex_trylock(&g_cable_io) == 0)
+            return 1;
+    }
+}
+
 int otilink_send_hid(struct otilink_dev *d, int type, const uint8_t pkt[OTI_HID_PKT_LEN])
 {
     uint8_t cdb[16] = {0}, sense[32];
@@ -231,10 +398,12 @@ int otilink_send_hid(struct otilink_dev *d, int type, const uint8_t pkt[OTI_HID_
     cdb[1] = sub;
     memcpy(&cdb[2], pkt, OTI_HID_CDB_COPY);   /* 厂商只把前 12 字节放进 CDB */
     oti_cdb_tail(cdb);
-    /* 与 pump 的"读授权 → 立刻写帧"窗口互斥（否则授权会失效 → 帧写 CHECK_CONDITION） */
-    otilink_cable_io_lock();
+    /* 与 pump 的"读授权 → 立刻写帧"窗口互斥：HID 写插进授权窗口会让授权作废
+       （帧写 CHECK_CONDITION、帧大量丢失）。正常时锁窗口只有几 ms，见上方注释。 */
+    int locked = oti_cable_lock_wait(OTI_HID_LOCK_WAIT_MS);
     int rc = otilink_cdb(d, cdb, NULL, 0, 1, sense, sizeof(sense));
-    otilink_cable_io_unlock();
+    if (locked)
+        otilink_cable_io_unlock();
     return rc;
 }
 
@@ -450,7 +619,8 @@ int otilink_send_frame(struct otilink_dev *d, const void *body, size_t len)
     return otilink_cdb(d, cdb, frame, OTI_FRAME_SIZE, 1, sense, sizeof(sense));
 }
 
-int otilink_msg_read(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx)
+int otilink_msg_read_to(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx,
+                        int timeout_ms)
 {
     /* 消息管道：0xD8/0x00/0x03 + IN **16 字节**（厂商 ProcessIdleState @0x4e30）。
        CDB[3..4] = 本机待发送帧数（16 位大端），设备据此决定是否发放 0x07 发送授权。 */
@@ -462,7 +632,15 @@ int otilink_msg_read(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx
     cdb[4] = (uint8_t)(pending_tx & 0xff);
     oti_cdb_tail(cdb);
     memset(m16, 0, 16);
-    return otilink_cdb(d, cdb, m16, 16, 0, sense, sizeof(sense));
+    struct oti_scsi_result r;
+    int rc = otilink_cdb_len_to(d, cdb, 16, m16, 16, 0, &r, timeout_ms);
+    (void)sense;
+    return rc;
+}
+
+int otilink_msg_read(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx)
+{
+    return otilink_msg_read_to(d, m16, pending_tx, 5000);
 }
 
 int otilink_recv_frame(struct otilink_dev *d, uint8_t frame[OTI_FRAME_SIZE])

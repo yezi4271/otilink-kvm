@@ -769,6 +769,13 @@ pkill -x otikm; sleep 3; pgrep -x otikm >/dev/null && pkill -9 -x otikm; sleep 1
 4. 主控侧（**键鼠插在这一侧**，例如拓扑 B 的麒麟）：在对端屏幕上**继续往外推**（§15.14）。
    要点：推出去多少、就得推回来多少，再多推一点 —— 回程判据累计的是**未缩放的位移**，
    所以小步慢推（每个事件 1~3 个计数）照样会触发；另外落点会同步真实光标（不会停在边上）。
+   **2026-11-03 起（第 58 轮）**：回程判据优先用 Windows 代理回传的**真实光标位置**
+   （`OTI_MSG_CURSOR`）：必须等回传确认光标在入口边、再外推 8 计数才回程；回传不在边时
+   **不会**按计数提前回（修掉 Windows 指针加速导致的"净计数 +100、光标还差 1068px"）。
+   所以 Windows 剪贴板代理必须跑着（`cd re/windows && ./deploy.sh --restart`）；没跑/回传过期时
+   自动退回旧的计数判据。日志证据：`回程判据：对端光标 (x,y) 已在入口边` / `未到入口边`。
+   锁屏看护也改为**不抢控制权**：锁屏时不会把你从 Windows 拉回麒麟；要解锁就照常回程到麒麟。
+   注意：锁屏期间仍会**拒绝再交出去**（保护密码框），先解锁再切 Windows。
    仍回不来时：在**有键盘的那侧**把鼠标推向**回程边**（回程手势）；或 `pkill -x otikm` 立即释放独占，
    或看 /tmp/otikm.log 有没有 "HID 模式：指针拉回本机"。
 5. 拓扑 B 专项回归（自动，不需人推鼠标）：cd re/tools && KY=kylin ./gate.sh --hw-kmb
@@ -1088,6 +1095,7 @@ powershell.exe -NoProfile -Command 'Get-Content C:\Users\Public\km.log  -Tail 20
 | | ⑤ 键盘被独占但键送不出去（"死了"，本机也打不了） | 日志有 `已独占 <键盘>` 但 Windows 收不到、本机也收不到 | `NOTES §61`（根治看 §61.3） |
 | **「两机同时打字」（双重输入）** | 判据挂错通道 → 纯键盘没独占 | `grep -a "已独占\|键盘不独占" /tmp/otikm.log`：要看到 **`已独占 <你的键盘>`**；独立探针应 EBUSY(16) | `NOTES §63`、`§18.1`、`gate.sh --hw-kbdexcl` |
 | **「键鼠过几秒卡一下」** | 保活 dummy 帧（64KB）堵住单队列设备 ~1.3s | `gate.sh --hw-lat`：`MAXGAP` 必须 ≤200ms | `NOTES §61.1` |
+| **「鼠标在 Windows 移动一卡一卡，Kylin 正常」** | ① HID 直发逐事件写：1000Hz×2 轴≈2000 写/秒 > 线缆 ~1078/秒 → 捕获积压/evdev 丢事件；② 剪贴板/大帧在单队列上堵 HID（300~500ms 停顿） | 看 `/tmp/otikm.log` 是否 `HID 模式：指针交给对端`；`grep -a "CLIP 发送\|CLIP 应用远端"` 同一时段有没有大帧；`hidrate`（与 otikm 并发）的 rate/maxsend | `NOTES §75`、`§61.1` |
 | **「剪贴板单向／双向不通」** | ① Windows 剪贴板代理没跑（重启后最常见） | 查进程：`Get-CimInstance Win32_Process \| ? { $_.CommandLine -like '*otiagent.ps1*' }` 为空 → `deploy.sh --restart` | `§18.2` |
 | | ② 设备侧会话卡死（用久了/拔插无效） | 麒麟 `重发 3 次仍无确认…放弃` + `clip.log` `设备连续读取失败，尝试重连` | `§15.13.7` |
 | | ③ 厂商 XML 通知抢发送授权 | 麒麟日志 `已通知厂商端交还控制权` 每 1.5 秒刷屏 | `NOTES §49` |
@@ -1200,3 +1208,86 @@ $fallbackIp = '<麒麟热点IP>'
 实测 `ssh <host> true`（各 3 次）：**relay（LAN 直连）1.7–2.1s** vs **tailscale（DERP）5.3–8.1s**。
 > 结论：**交互用 `ssh kylin`（relay，快）；relay 失效或跨网时用 `ssh kylin-ts`（稳但慢）**。
 > 想让 tailscale 也直连：在 **Windows 主机**上跑 tailscale（它与麒麟同在热点 L2），或让 WSL 能看见热点网段。
+
+---
+
+## 22. 【第 59 轮】麒麟「蓝屏 / 键盘输入不了」= Win+H 误触发内置 SOS 救援（`kysos_key`）
+
+**症状**：桌面看着像死机/蓝屏，键盘鼠标全没反应；SSH 还能连。
+**一句判据**（SSH 里跑）：
+```bash
+cat /sys/class/tty/tty0/active      # 不是 tty7（常见 tty5）→ 就是本条
+cat /sys/kos_rescue/stats           # Timeout count 增加、Current state: IDLE（已超时）
+dmesg | grep -A6 'PANIC: SOS rescue' # 看到 SOS rescue timeout 即确诊
+```
+**真因**（NOTES §74）：麒麟内核 `kysos_key` 把**左 Meta+H** 当 SOS 组合键，20s 内没有用户态
+写 `/sys/kos_rescue/rescue_feedback=1` 确认，就切 VT 到 tty5 并拉起 `getty@tty5` →
+`console_lock` 死锁 → Xorg 摘掉全部输入设备。**Windows 上 Win+H 是"语音输入"**，共享键盘时
+误触即中招（EVIOCGRAB 挡不住内核 input handler）。
+
+**修法（已装）**：`otilink-sosguard.service`（`/usr/local/bin/sosguard.sh`）在超时前写
+`rescue_feedback=1` 取消救援；`install-kylin.sh` 第 6 步会装。
+```bash
+systemctl status otilink-sosguard          # 应 active
+tail -5 /var/log/otilink-sosguard.log      # 触发时会有「SOS 组合键（左 Meta+H）已被取消」
+```
+
+**已经死锁了怎么办**：`console_lock` 卡住时 `chvt`/`fgconsole`/`systemctl reboot` 都会卡，
+只能硬重启（`sync; sudo reboot -f`，或长按电源）。重启后确认：
+```bash
+cat /sys/class/tty/tty0/active                 # tty7
+DISPLAY=:0 xinput list | grep -c '\[slave'     # 设备都挂回 master（没有 floating）
+pgrep -x otikm | wc -l                         # 1
+```
+
+**回归**：`cd re/tools && ./gate.sh --hw-sos`（`otilink/sosreg.sh`，注入一次左 Meta+H，断言
+守卫取消、VT 不变、X 键盘不掉）。**守卫没在跑时该脚本会中止、不会注入**。
+
+**回滚**：`sudo systemctl disable --now otilink-sosguard && sudo rm /etc/systemd/system/otilink-sosguard.service /usr/local/bin/sosguard.sh`。
+
+## 23. 【第 61 轮】鼠标"卡几秒 / 来回不顺畅"的定层与判据（2026-11-06）
+
+**已根治的根因**：Windows 剪贴板 PowerShell 代理读帧太慢（旧版主循环 1.3~9s/轮），麒麟向它写
+64KB 帧时会在 SCSI 命令里阻塞 250~700ms；对拷线是**单队列**设备，HID 注入写排在同一条设备队列
+后面 → 用户看到"在 Windows 移动一段时间卡几秒"、"交接手势一顿一顿"。
+修法：Windows 代理 **BuildTag `nativepump-2`**（`windows/otiagent.ps1` 内嵌 C# `CablePump` 后台线程
+独占设备，PS 主循环不再做设备 I/O）；麒麟侧删掉"HID 优先窗口"并加慢操作守卫。
+
+**怎么判断现在跑的是不是新实现（各 1 行）**：
+
+```bash
+grep -a 'build nativepump' /mnt/c/Users/Public/clip.log | tail -1     # 期望 nativepump-2
+grep -a '线缆泵: build' /mnt/c/Users/Public/clip.log | tail -1          # 期望同一 BuildTag
+grep -a 'PUMP rx=' /mnt/c/Users/Public/clip.log | tail -3              # 每 5s 一行（rx/tx/maxread/maxwrite/drop）
+tail -20 /mnt/c/Users/Public/cable.log                                  # 泵自己的日志：CABLEPUMP start / SLOWOP / error
+grep -a '写入侧 HID 优先' /tmp/otikm.log | tail -1                     # 麒麟侧新实现标志行
+```
+
+**关键指标（客观判定）**：
+
+```bash
+cd re/tools && ./gate.sh --hw-lat          # 期望：hidlat MAXGAP ≤ 200ms；新实现实测 ~15ms
+cd re/tools && ./gate.sh --hw-clipstall    # 650KB 剪贴板突发期间 MAXGAP ≤ 40ms（需 Windows 已解锁）
+grep -a 'SLOWOP' /tmp/otikm.log /tmp/rk.log | tail   # 新 Windows 泵下应为空（0 次）
+grep -a '交接耗时' /tmp/otikm.log | tail             # 期望 <100ms（实测 15ms）
+```
+
+**常见误判**：
+* Windows **锁屏**时 `Set-Clipboard/Get-Clipboard` 必然 `ExternalException`（实测 ~1.2s）：
+  期间剪贴板"未确认"、麒麟重发 3 次放弃**是正常现象**，解锁后自愈（新版代理会打
+  `[warn] 应用远端剪贴板失败（锁屏/剪贴板被占用？已忽略，代理继续）`，不会再崩）。
+* 麒麟处于**本机控制态**时，直写 HID 包推不动 Windows 光标（测量必须在"HID 模式：指针交给对端"下做）。
+* Windows 代理 `clip.log` 里 `LOOP 慢轮` 现在只反映 **PS 剪贴板/文件处理**耗时（取帧已是微秒级出队），
+  不再等于"鼠标冻结"；看 `PUMP maxread/maxwrite` 与麒麟 `hidlat` 才准。
+
+**回滚**（任一异常时）：
+```bash
+# Windows：恢复部署前的旧代理（win-pump2 部署时已备份）
+cp /mnt/c/Users/Public/otiagent.baseline.ps1 /mnt/c/Users/yezi4/otilink/otiagent.ps1
+cd re/windows && ./deploy.sh --restart
+
+# 麒麟：回到上一版源码后部署 + 重启
+cd re && git checkout -- otilink/otikm.c otilink/otikm_core.c otilink/otikm_core.h \
+    otilink/otilink.c otilink/otilink.h otilink/otitrans.c otilink/otitrans.h otilink/mocktest.c otilink/coretest.c
+cd tools && ./gate.sh --deploy-kylin     # 再按 §4.1 重启 otikm
+```

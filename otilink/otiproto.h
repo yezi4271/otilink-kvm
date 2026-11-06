@@ -44,6 +44,10 @@ enum oti_msg_type {
        "未确认"，只能人工停一侧。有了 ROLE 之后：谁的本机键鼠在用谁当主控，
        另一侧主动让位，且**任何时刻只有一个 grab**（见 otikm.c 的不变式 I1-I5）。 */
     OTI_MSG_ROLE   = 10,
+    OTI_MSG_CURSOR = 11,  /* 主控端（被驱动侧的鼠标就在对端）回传**真实光标位置**：
+                              Windows 指针加速会让 HID 净计数与像素位置漂移，
+                              主控端用它判断"回程手势是否真的到了边缘"。
+                              载荷 = int16 x, int16 y，已归一化到虚拟桌面左上角。 */
 };
 
 /* ROLE 消息的三个枚举值 */
@@ -117,6 +121,14 @@ typedef struct {
     uint16_t width, height;
 } oti_hello_evt;
 
+/* 对端光标真实位置：x,y 已减去 SM_X/YVIRTUALSCREEN，归一化到虚拟桌面左上角
+   （0..virt_w-1 / 0..virt_h-1）；w,h 是虚拟桌面尺寸（与 HELLO 相同）。
+   带上 w/h 是为了不依赖 HELLO 的 10s 节奏：otikm 刚重启、第一次交接时也能立刻判边。 */
+typedef struct {
+    int16_t x, y;
+    uint16_t w, h;
+} oti_cursor_evt;
+
 typedef struct {
     uint32_t magic;
     uint16_t type;
@@ -154,6 +166,7 @@ size_t oti_encode_ack(uint32_t seq, uint32_t crc, uint16_t format, uint8_t *out,
 int oti_decode_ack(const uint8_t *payload, uint32_t len, uint32_t *crc, uint16_t *format);
 size_t oti_encode_mouse_abs(uint32_t seq, const oti_mouse_abs_evt *e, uint8_t *out, size_t cap);
 size_t oti_encode_hello(uint32_t seq, const oti_hello_evt *e, uint8_t *out, size_t cap);
+size_t oti_encode_cursor(uint32_t seq, const oti_cursor_evt *e, uint8_t *out, size_t cap);
 size_t oti_encode_mouse_mode(uint32_t seq, uint8_t mode, uint8_t *out, size_t cap);
 
 int oti_decode_key(const uint8_t *payload, uint32_t len, oti_key_evt *out);
@@ -163,6 +176,7 @@ int oti_decode_clip(const uint8_t *payload, uint32_t len, oti_clip_hdr *h,
                     const uint8_t **data, uint32_t *dlen);
 int oti_decode_mouse_abs(const uint8_t *payload, uint32_t len, oti_mouse_abs_evt *out);
 int oti_decode_hello(const uint8_t *payload, uint32_t len, oti_hello_evt *out);
+int oti_decode_cursor(const uint8_t *payload, uint32_t len, oti_cursor_evt *out);
 int oti_decode_mouse_mode(const uint8_t *payload, uint32_t len, uint8_t *mode_out);
 
 /* 角色协商（type=10）：载荷 = 上表 12 字节 */

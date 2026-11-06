@@ -1,6 +1,6 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11
-BINS     = probe selftest_proto e2e_test mocktest otikm cabletest hidprobe uisim
+BINS     = probe selftest_proto e2e_test mocktest otikm cabletest hidprobe uisim sosinject
 
 # ---- 版本指纹与构建基线（绿色包发布用；见 re/portable/README.md）------------
 # 发布二进制必须用"声明基线"编译（越老的 glibc 越通用）：
@@ -45,6 +45,11 @@ otikm: otikm.c otix11.c otix11.h otiproto.c otitrans.c otilink.c otikm_core.c ot
 # 又能真实验证 EVIOCGRAB 独占/释放（双重输入这条链路的唯一硬件不变量）。
 uisim: uisim.c
 	$(CC) $(CFLAGS) -o $@ uisim.c
+
+# 注入一次「左 Meta+H」（麒麟内置 SOS 组合键）—— sosreg.sh 用它验证 sosguard。
+# 必须走 uinput（内核 input 层）：XTEST/xdotool 不经过内核，触发不了 kysos_key。
+sosinject: sosinject.c
+	$(CC) $(CFLAGS) -o $@ sosinject.c
 
 # HID 方向探针：判定"本机 → 对端"的 HID 通道是否通（"回不来"类故障的第二层定位）
 #   ./hidprobe /dev/sg3 1 10        # 鼠标右移 40px × 10 → 看对端光标动不动

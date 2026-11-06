@@ -115,6 +115,41 @@ int  otilink_cdb_ex(struct otilink_dev *d, const uint8_t cdb[16], void *data,
 /* 允许自定义 CDB 长度（标准命令 6/10 字节；厂商命令用 16） */
 int  otilink_cdb_len(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
                      void *data, unsigned len, int to_dev, struct oti_scsi_result *res);
+/* 同 otilink_cdb_len，但显式指定 SG_IO 超时（毫秒）。消息管道读用它把"阻塞读占住
+   单队列设备"的时间压到有界，见 NOTES §75.5。 */
+int  otilink_cdb_len_to(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
+                        void *data, unsigned len, int to_dev,
+                        struct oti_scsi_result *res, int timeout_ms);
+
+/* ---- 设备操作逐命令计时（2026-11-06 传输层重设计，真机证据的基础）------------
+ * 每次 otilink_cdb_len_to() 都会按 CDB 分类累计**单次执行耗时**（不含等锁/排队时间）。
+ * 真机实测（Lead，2026-11-06）：0xD8 消息读 0~1ms（不阻塞）；0xD9/0x28 帧读有数据 ~2ms；
+ * 0xD9/0x2A 帧写——对端消费慢时 250~700ms、对端快时 2~4ms。线缆是单队列设备
+ * （/sys/block/sdb/device/queue_depth=1），一次慢帧写会把 HID 注入写堵在后面。
+ * 这些统计被 otitrans.c 的慢操作守卫（单次 >30ms 判定慢、退避窗口）和真机验证脚本共用。 */
+enum oti_io_cat {
+    OTI_IO_MSG_READ = 0,   /* 0xD8/0x00/0x03 消息泵读（16B） */
+    OTI_IO_FRAME_READ,     /* 0xD9/0x28/0x64 帧读（64KB IN） */
+    OTI_IO_FRAME_WRITE,    /* 0xD9/0x2A/0xFF 帧写（64KB OUT；对端消费慢时最慢的一条） */
+    OTI_IO_HID_WRITE,      /* 0xD9/0x33|0x34|0x36 HID 注入写（键鼠） */
+    OTI_IO_CTL,            /* 0xF0 查询/锁、0xD9/0x60 设备模式等控制命令 */
+    OTI_IO_OTHER,
+    OTI_IO_CAT_N,
+};
+#define OTI_SLOWOP_MS 30   /* "单次操作慢"阈值：设备命令超过它 = 对端消费慢/设备异常 */
+
+struct oti_io_stat {
+    unsigned long count;       /* 调用次数 */
+    unsigned long slow;        /* 单次耗时 > OTI_SLOWOP_MS 的次数 */
+    unsigned long max_us;      /* 单次最大耗时（微秒，ms 级 API 会向上取整） */
+    unsigned long long sum_us; /* 累计耗时（微秒，算平均用） */
+};
+void otilink_io_stats_snapshot(struct oti_io_stat out[OTI_IO_CAT_N]);
+void otilink_io_stats_reset(void);
+const char *otilink_io_cat_name(int cat);
+unsigned otilink_io_max_ms(int cat);       /* 0 = 没有样本 */
+unsigned otilink_io_avg_ms(int cat);       /* 0 = 没有样本 */
+unsigned long otilink_io_slow_count(int cat);
 
 /* 便捷封装 */
 int  otilink_send_hid(struct otilink_dev *d, int type, const uint8_t pkt[OTI_HID_PKT_LEN]);
@@ -162,6 +197,8 @@ int  otilink_frame_check(const uint8_t frame[OTI_FRAME_SIZE]);  /* 1=有效数�
  *               → 必须**立刻** otilink_send_frame()，中间不要插别的操作
  *   0x01/0x00/0x08/0x10 = 复位（清收发队列），通常是链路未就绪/对端未消费 */
 int  otilink_msg_read(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx);
+int  otilink_msg_read_to(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx,
+                         int timeout_ms);
 
 /* 帧写：0xD9/0x2A/0xFF + 64KB OUT。**必须在收到 0x06/0x07 授权后立刻调用**，
  * 否则设备返回 key=0x9 ASC=0x81/0x85/0x86（厂商语义：Tx_No_image / Image_Conflict）。 */

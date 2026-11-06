@@ -230,8 +230,10 @@ static void tx_send_done(struct oti_xfer_tx *t)
         memcpy(b + 28, t->name, nl);
     t->ops->send_clip(t->ops->user, OTI_CLIP_FMT_CTRL, t->fid, b, 28 + nl);
     t->phase = 1;
-    t->wait_deadline_ms = now_ms() + 30000;
-    xlog(t, "  %s 全部 %u 片已发出，等待对端校验（crc=%08x）…", t->name, t->nparts, t->crc);
+    t->wait_deadline_ms = now_ms() + 120000;   /* 大文件在慢链路上收端可能落后 >30s */
+    t->verdict_resend_ms = now_ms() + 5000;
+    t->retx_resend_ms = now_ms() + 10000;
+    xlog(t, "  %s 全部 %u 片已发出，等待对端校验（crc=%08x，最长 120s）…", t->name, t->nparts, t->crc);
 }
 
 void oti_xfer_tx_verdict(struct oti_xfer_tx *t, uint16_t flags, uint32_t resume_from,
@@ -279,7 +281,18 @@ int oti_xfer_tx_poll(struct oti_xfer_tx *t)
     pthread_mutex_unlock(&t->lk);
 
     if (have) {
+        /* 裁决帧现在由对端**冗余发 3 份**抗丢帧（见 windows/otiagent.ps1 / 本轮改动）：
+           同一份裁决会被收到多次。只在"正在等裁决"（phase==1）时处理，其余一律忽略，
+           否则重复的 OK 会把多文件批次误当成"已全部完成"（实测：2 个文件只传了第 1 个）。
+           ABORT 不受此限（幂等，任何时候都该生效）。 */
+        if (t->phase != 1 && !(flags & OTI_XFER_ABORT)) {
+            free(map);
+            map = NULL;
+            xlog(t, "  忽略重复裁决 flags=0x%x（phase=%d）", flags, t->phase);
+            return 1;
+        }
         if (flags & OTI_XFER_OK) {
+            t->phase = 0;                 /* 先落态，重复裁决就不会再进这个分支 */
             double sec = (now_ms() - t->t_start_ms) / 1000.0;
             double mb = (t->total / 1048576.0);
             xlog(t, "✔ %s 传送完成（%llu 字节，%.1f 秒，%.1f MB/s）", t->name,
@@ -361,9 +374,51 @@ int oti_xfer_tx_poll(struct oti_xfer_tx *t)
     map = NULL;
 
     if (t->phase == 1) {                     /* 等裁决 */
-        if (now_ms() > t->wait_deadline_ms) {
-            oti_xfer_tx_abort(t, "等待对端校验超时（30 秒）");
+        long now = now_ms();
+        if (now > t->wait_deadline_ms) {
+            oti_xfer_tx_abort(t, "等待对端校验超时（120 秒）");
             return 0;
+        }
+        /* 缺片补发后**主动重复**：RESUME 裁决也是单帧、会丢（实测 10+ 份只到 1 份）——
+           不能只等下一次 RESUME，否则补发的片丢了就永久卡住。每 10s 把缺片再补一遍。 */
+        if (t->todo && t->todo_n > 0 && now >= t->retx_resend_ms) {
+            t->retx_resend_ms = now + 10000;
+            /* 逐片确认**真正入队/写出**：send_wait 队列满或写失败会返回非 0，
+               以前忽略 rc 直接连发 → 帧根本没进队列，接收端永远差那几片（实测 23 片一封不到）。
+               队列只有 32 槽，一次连发 69 帧必然大量返回 -2。这里逐片退避重试。 */
+            int sent_ok = 0;
+            for (uint32_t i = 0; i < t->todo_n; i++) {
+                int rc = 0, tries = 0;
+                do {
+                    rc = tx_send_part(t, t->todo[i]);
+                    if (rc != 0)
+                        usleep(5 * 1000);
+                } while (rc != 0 && ++tries < 40);
+                if (rc != 0) {
+                    xlog(t, "  [warn] 补发第 %u 片失败 rc=%d（本轮发送 %d/%u 片后放弃）",
+                         t->todo[i], rc, sent_ok, t->todo_n);
+                    break;
+                }
+                sent_ok++;
+                usleep(2000);           /* 逐片小间隔：别把 32 槽队列一次打满 */
+            }
+            xlog(t, "  未收到裁决，主动补发缺片（逐片确认入队 %d/%u）", sent_ok, t->todo_n);
+        }
+        /* DONE 帧同样是单帧，丢了收端就永远不裁决 → 每 5s 重发（幂等） */
+        if (now >= t->verdict_resend_ms) {
+            t->verdict_resend_ms = now + 5000;
+            uint8_t b[64];
+            size_t nl = strlen(t->name);
+            w16(b + 0, OTI_XFER_DONE);
+            w16(b + 2, 0);
+            w64(b + 4, t->total);
+            w32(b + 12, t->crc);
+            w32(b + 16, t->nparts);
+            w32(b + 20, 0);
+            w32(b + 24, (uint32_t)nl);
+            if (nl)
+                memcpy(b + 28, t->name, nl);
+            t->ops->send_clip(t->ops->user, OTI_CLIP_FMT_CTRL, t->fid, b, 28 + nl);
         }
         return 1;
     }
@@ -407,6 +462,10 @@ int oti_xfer_tx_poll(struct oti_xfer_tx *t)
         else
             t->sent_parts++;
         t->done_parts++;
+        /* 发送端限速（2026-11-06 真机）：接收端处理约 50 片/秒（3.2MB/s），而设备缓冲很小；
+           猛发会把设备写堵住，单次帧写变成 ~1.28s —— 期间 HID 注入写排在后面，鼠标直接冻结
+           （hidlat 实测 MAXGAP=1284ms）。按接收速率给每片留 20ms，鼠标就不受影响。 */
+        usleep(20 * 1000);
     }
 
     long now = now_ms();
@@ -618,7 +677,9 @@ int oti_xfer_rx_ctrl(struct oti_xfer_rx *r, uint32_t fid, uint16_t kind, uint16_
     if (kind != OTI_XFER_DONE)
         return -1;
     if (!r->active || r->fid != fid) {
-        rlog(r, "[warn] 收到未知传输的 DONE（fid=%u），回 ABORT", fid);
+        /* 已完成的 DONE 重发不应回 ABORT：多文件批次共用同一 fid，
+           迟到的 DONE 回 ABORT 会把整批后续文件一起终止（与 Windows 侧同修）。 */
+        rlog(r, "[warn] 收到已完成/未知传输的 DONE（fid=%u），忽略", fid);
         return -1;
     }
     if (nparts != r->nparts || total != r->total) {

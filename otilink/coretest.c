@@ -9,6 +9,10 @@
  *   3) 在对端屏幕上**继续往外推** → 回程（SWITCH_TO_LOCAL）★ 本轮新增
  *   4) 刚交出去时的抖动（±1px）**不能**误判成回程
  *   5) 左右两个方向都要对（远端入口边 = 本机出口边的对面）
+ *   6) 2026-11-06 第 61 轮：回程主判据改成"真实光标贴入口边 + 继续外推 ≥16
+ *      未缩放计数"（1e~1j）。重点回归：20~50ms 一条遥测时，连续"在边"的遥测
+ *      不能把外推计数清零（否则慢推永远回不来）；遥测过期时冻结判定、绝不
+ *      退回"计数 100 就揪回"；从未收到 CURSOR 的旧对端才走兼容计数判据。
  *
  * 编译：make coretest && ./coretest
  */
@@ -55,6 +59,51 @@ static otikm_act push(otikm_core *c, int dx, int dy, int times)
         act = otikm_core_local_mouse(c, &m, &sw);
         if (act == OTI_ACT_SWITCH_TO_REMOTE || act == OTI_ACT_SWITCH_TO_LOCAL)
             return act;                     /* 交接动作只发生一次 */
+    }
+    return act;
+}
+
+/* 带时间戳的推位移：用于"对端光标回传"测试（回传新鲜度按 now_ms 判定）。 */
+static otikm_act push_at(otikm_core *c, int dx, int dy, int times, long t0, long step)
+{
+    oti_mouse_evt m;
+    oti_switch_evt sw;
+    otikm_act act = OTI_ACT_LOCAL;
+    for (int i = 0; i < times; i++) {
+        memset(&m, 0, sizeof(m));
+        m.dx = (int16_t)dx;
+        m.dy = (int16_t)dy;
+        otikm_core_set_now(c, t0 + (long)i * step);
+        act = otikm_core_local_mouse(c, &m, &sw);
+        if (act == OTI_ACT_SWITCH_TO_REMOTE || act == OTI_ACT_SWITCH_TO_LOCAL)
+            return act;
+    }
+    return act;
+}
+
+/* 小步推位移 + 周期性插入"仍在入口边"的 CURSOR 遥测。
+   2026-11-06 起回程主判据依赖 20~50ms 一条的真实光标遥测；这里用它模拟
+   "原生泵"节奏，回归点：连续多条"在边"遥测**不能**把外推计数清零
+   （旧实现每条遥测都重锚 → 慢推永远攒不到 16 → 真机"回不来"）。
+   tel_every=0 表示不发遥测（模拟遥测断档）。 */
+static otikm_act push_step_tel(otikm_core *c, int dx, int dy, int times,
+                               long t0, long step, int tel_every,
+                               int tx, int ty, int tw, int th)
+{
+    oti_mouse_evt m;
+    oti_switch_evt sw;
+    otikm_act act = OTI_ACT_LOCAL;
+    for (int i = 0; i < times; i++) {
+        long t = t0 + (long)i * step;
+        if (tel_every > 0 && i % tel_every == 0)
+            otikm_core_set_remote_cursor(c, tx, ty, tw, th, t);
+        memset(&m, 0, sizeof(m));
+        m.dx = (int16_t)dx;
+        m.dy = (int16_t)dy;
+        otikm_core_set_now(c, t);
+        act = otikm_core_local_mouse(c, &m, &sw);
+        if (act == OTI_ACT_SWITCH_TO_REMOTE || act == OTI_ACT_SWITCH_TO_LOCAL)
+            return act;
     }
     return act;
 }
@@ -135,6 +184,134 @@ int main(void)
     } else {
         printf("  [PASS] pending 几何在下次交出去时生效（rem_w=%d，rem_x=%d）\n", c.rem_w, c.rem_x);
     }
+
+    /* ---- 1e) 真实光标主判据（2026-11-06 第 61 轮重写）----
+       主判据 = 远端光标被确认贴在入口边（±edge_px*4）**且**用户继续向入口边
+       外推的未缩放位移累计 ≥ OTI_REM_CURSOR_PUSH(16)。
+       回归点：20~50ms 一条遥测时，**连续"在边"的遥测不能把累计清零**，
+       否则慢推（2px/次）永远攒不到 16 —— 真机现场"回不来"的核心回归。 */
+    printf("=== 1e) 真实光标主判据：贴边 + 继续外推 16 计数才回（慢推跨遥测帧累计）===\n");
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE,
+           "先交出去（Kylin 左出 → Windows 右入口边）");
+    checks++;
+    if (c.rem_entry_x != 1) { fails++; printf("  [FAIL] 远端入口边应为右(1)，实得 %d\n", c.rem_entry_x); }
+    else printf("  [PASS] 远端入口边 = Windows 右边缘（rem_entry_x=1）\n");
+    /* 本段第一帧遥测：hid_park 之后 Windows 光标贴在虚拟桌面右边缘（1920x1080）。 */
+    otikm_core_set_now(&c, 1000);
+    otikm_core_set_remote_cursor(&c, 1920 - 1, 540, 1920, 1080, 1000);
+    /* 2 计数/次、10ms/次、每 3 次一条"仍在边"遥测（30ms ≈ 原生泵节奏）。
+       16 计数会跨 3 条遥测 —— 旧实现每条都清零，永远回不来。 */
+    expect(push_step_tel(&c, 2, 0, 7, 1010, 10, 3, 1920 - 1, 540, 1920, 1080),
+           OTI_ACT_TO_REMOTE, "贴边慢推 14 计数（跨 3 条遥测帧）→ 还不回");
+    expect(push_step_tel(&c, 2, 0, 1, 1080, 10, 1, 1920 - 1, 540, 1920, 1080),
+           OTI_ACT_TO_REMOTE, "第 15 计数 → 还不回");
+    expect(push_step_tel(&c, 2, 0, 1, 1090, 10, 1, 1920 - 1, 540, 1920, 1080),
+           OTI_ACT_SWITCH_TO_LOCAL, "第 16 计数 → 回程（连续遥测帧没有重锚清零）");
+
+    /* ---- 1f) 贴边抖动、停在边上没继续外推 → 不回程 ---- */
+    printf("=== 1f) 贴边抖动、或停在边上不再外推 → 不回 ===\n");
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "先交出去");
+    otikm_core_set_now(&c, 1000);
+    otikm_core_set_remote_cursor(&c, 1920 - 1, 540, 1920, 1080, 1000);
+    {
+        otikm_act a = OTI_ACT_LOCAL;
+        for (int i = 0; i < 20; i++)
+            a = push_step_tel(&c, (i & 1) ? 1 : -1, 0, 1, 1010 + i * 20, 20, 1,
+                              1920 - 1, 540, 1920, 1080);
+        expect(a, OTI_ACT_TO_REMOTE, "贴边 ±1 抖动 20 次（净 0）→ 不回");
+    }
+    expect(push_step_tel(&c, 0, 0, 30, 1500, 20, 5, 1920 - 1, 540, 1920, 1080),
+           OTI_ACT_TO_REMOTE, "光标停在入口边、用户没继续外推（dx=0）→ 不回");
+
+    /* ---- 1g) 遥测过期不误回（2026-11-06 现场 bug：回传过期后净计数到 100 被揪回）----
+       规则：只要曾经收到过 CURSOR，过期时**冻结**判定、绝不退回计数判据；
+       累计计数保留，新遥测一到就按最新值判（用户已经推够 16 → 立即回）。 */
+    printf("=== 1g) 遥测过期不误回；新遥测恢复后按累计外推立即判 ===\n");
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "先交出去");
+    otikm_core_set_now(&c, 1000);
+    otikm_core_set_remote_cursor(&c, 1920 - 1, 540, 1920, 1080, 1000);
+    expect(push_step_tel(&c, 0, 0, 1, 1010, 10, 1, 1920 - 1, 540, 1920, 1080),
+           OTI_ACT_TO_REMOTE, "先消费一帧新鲜遥测（确认贴边，外推计数从 0 起算）");
+    expect(push_step_tel(&c, 127, 0, 1, 2000, 10, 0, 0, 0, 0, 0),
+           OTI_ACT_TO_REMOTE, "遥测过期 1000ms + 贴边推 127 计数 → 不误回（计数判据已禁用）");
+    expect(push_step_tel(&c, 127, 0, 1, 2010, 10, 0, 0, 0, 0, 0),
+           OTI_ACT_TO_REMOTE, "过期期累计 254 计数 → 仍不回（绝不退回计数判据）");
+    expect(push_step_tel(&c, 1, 0, 1, 2020, 10, 1, 1920 - 1, 540, 1920, 1080),
+           OTI_ACT_SWITCH_TO_LOCAL, "新遥测确认在入口边 → 累计外推立即触发回程");
+
+    /* 遥测恢复但光标已不在入口边 → 旧累计作废，必须重新走到边再攒 16（入口边锚定）*/
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "再交出去");
+    otikm_core_set_now(&c, 1000);
+    otikm_core_set_remote_cursor(&c, 1920 - 1, 540, 1920, 1080, 1000);
+    expect(push_step_tel(&c, 0, 0, 1, 1010, 10, 1, 1920 - 1, 540, 1920, 1080),
+           OTI_ACT_TO_REMOTE, "先消费一帧新鲜遥测（确认贴边）");
+    expect(push_step_tel(&c, 127, 0, 1, 2000, 10, 0, 0, 0, 0, 0),
+           OTI_ACT_TO_REMOTE, "过期期推 127 计数（暂不判）");
+    expect(push_step_tel(&c, 127, 0, 1, 2010, 10, 1, 1000, 540, 1920, 1080),
+           OTI_ACT_TO_REMOTE, "新遥测显示光标远离入口边 → 旧累计作废、不回");
+    expect(push_step_tel(&c, 127, 0, 1, 2400, 10, 1, 1920 - 1, 540, 1920, 1080),
+           OTI_ACT_TO_REMOTE, "刚到边的那一拍不计入（127 计数不复用）");
+    expect(push_step_tel(&c, 2, 0, 7, 2410, 10, 2, 1920 - 1, 540, 1920, 1080),
+           OTI_ACT_TO_REMOTE, "到边后重新攒 14 计数 → 还不回");
+    expect(push_step_tel(&c, 2, 0, 1, 2490, 10, 1, 1920 - 1, 540, 1920, 1080),
+           OTI_ACT_SWITCH_TO_LOCAL, "重新攒到 16 计数 → 回（入口边重锚生效）");
+
+    /* ---- 1h) 零软件/旧对端兼容：从未收到过 CURSOR → 旧计数判据 ---- */
+    printf("=== 1h) 零软件/旧对端兼容：从未有 CURSOR → 旧计数判据（阈值 100）===\n");
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "零软件端：先交出去");
+    expect(push_at(&c, 99, 0, 1, 5000, 10),
+           OTI_ACT_TO_REMOTE, "从未有回传：净推回 99 计数 → 还不回（阈值 100）");
+    expect(push_at(&c, 1, 0, 1, 5010, 10),
+           OTI_ACT_SWITCH_TO_LOCAL, "第 100 计数 → 旧计数判据回程（兼容路径）");
+
+    /* ---- 1i) 左/右两方向都要对（镜像方向也走真实光标判据）---- */
+    printf("=== 1i) 右出 / 左回（Windows 左入口边），同样用真实光标判 ===\n");
+    setup(&c);
+    c.mx = 1700;
+    expect(push(&c, 40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "本机往右推到边缘 → 交出去");
+    checks++;
+    if (c.rem_entry_x != 0) { fails++; printf("  [FAIL] 远端入口边应为左(0)，实得 %d\n", c.rem_entry_x); }
+    else printf("  [PASS] 远端入口边 = Windows 左边缘（rem_entry_x=0）\n");
+    otikm_core_set_now(&c, 1000);
+    otikm_core_set_remote_cursor(&c, 0, 540, 1920, 1080, 1000);
+    expect(push_step_tel(&c, -2, 0, 7, 1010, 10, 3, 0, 540, 1920, 1080),
+           OTI_ACT_TO_REMOTE, "贴左边缘慢推 14 计数 → 还不回");
+    expect(push_step_tel(&c, -2, 0, 2, 1080, 10, 1, 0, 540, 1920, 1080),
+           OTI_ACT_SWITCH_TO_LOCAL, "累计到 16 计数 → 回程（镜像方向）");
+
+    /* ---- 1j) 贴边几何用 CURSOR 载荷自带的虚拟桌面（现场 3584x1152），不用 HELLO ---- */
+    printf("=== 1j) 贴边几何/容差：用 CURSOR 载荷的虚拟桌面（3584x1152）===\n");
+    setup(&c);                                   /* HELLO 初值 1920x1080 */
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "先交出去");
+    otikm_core_set_now(&c, 1000);
+    otikm_core_set_remote_cursor(&c, 3583, 540, 3584, 1152, 1000);
+    expect(push_step_tel(&c, 2, 0, 10, 1010, 10, 4, 3583, 540, 3584, 1152),
+           OTI_ACT_SWITCH_TO_LOCAL,
+           "按 3584 右边缘判贴边 → 攒 16 计数回程（若用 HELLO 1920 会把 3583 当越界）");
+    /* 容差 = edge_px*4 = 16 远端像素：离边 16px 算贴边，17px 不算 */
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "再交出去");
+    otikm_core_set_now(&c, 1000);
+    otikm_core_set_remote_cursor(&c, 3584 - 1 - 16, 540, 3584, 1152, 1000);
+    expect(push_step_tel(&c, 2, 0, 10, 1010, 10, 4, 3584 - 1 - 16, 540, 3584, 1152),
+           OTI_ACT_SWITCH_TO_LOCAL, "离边 16px（容差内）→ 算贴边，攒 16 计数可回");
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "再交出去");
+    otikm_core_set_now(&c, 1000);
+    otikm_core_set_remote_cursor(&c, 3584 - 1 - 17, 540, 3584, 1152, 1000);
+    expect(push_step_tel(&c, 127, 0, 4, 1010, 10, 1, 3584 - 1 - 17, 540, 3584, 1152),
+           OTI_ACT_TO_REMOTE, "离边 17px（容差外）→ 推 508 计数也不回（真实光标不到边）");
+
+    /* 从未收到回传（零软件端/旧 agent）→ 旧计数判据仍是唯一回程方式 */
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "零软件端：先交出去");
+    expect(push_at(&c, 127, 0, 1, 5000, 10),
+           OTI_ACT_SWITCH_TO_LOCAL, "从未有回传 → 旧计数判据仍能回程（兼容路径）");
 
     printf("=== 2) 右出 / 左回（镜像方向）===\n");
     setup(&c);

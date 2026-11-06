@@ -4,7 +4,9 @@
 #       从而在 Linux(主控) ↔ Windows(被控) 之间实现键鼠共享与剪贴板共享。
 #
 # 组成（单文件、零安装）：
-#   - 内嵌 C#（Add-Type）：CRC32、消息编解码、65536 帧打包/校验、SPTI（IOCTL_SCSI_PASS_THROUGH_DIRECT）
+#   - 内嵌 C#（Add-Type）：CRC32、消息编解码、65536 帧打包/校验、SPTI（IOCTL_SCSI_PASS_THROUGH_DIRECT）、
+#     **CablePump 原生线缆泵线程**（2026-11-06：设备读/写从 PS 主循环搬进后台 C# 线程，
+#     修"鼠标冻结"根因 —— PS 主循环卡 1.3~9s 会让对端 64KB 帧写阻塞 250~700ms，堵死同队列 HID）
 #   - PowerShell 外壳：剪贴板（Get/Set-Clipboard）、注入（SendInput P/Invoke）、主循环
 #
 # 用法：
@@ -77,6 +79,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+# BuildTag：改本文件必须 bump（日志证据行/部署核对用；与 otiagent2.cs 的 BuildTag 分开）。
+#   pump-throttle-1 → nativepump-1：线缆 I/O 从 PowerShell 主循环搬进 Add-Type 的 C# 后台泵线程。
+#   nativepump-2：锁屏时 Set-Clipboard 抛 ExternalException 会把代理整个带走 —— CLIP 文本应用加 catch（2026-11-06 真机）。
+$script:BuildTag = 'nativepump-23'
 
 # ---- 单实例守卫（L4 的剪贴板代理版）----
 # 同一条线缆帧管道**只能有一个读者**。两个实例会互相抢走发送授权消息与帧，症状是
@@ -97,10 +103,16 @@ if ($Cable -and -not $Selftest -and -not $Scan) {
     }
 }
 
+Write-Host ("OTiLink 剪贴板代理 build " + $script:BuildTag)
+
 # ============================ 内嵌 C# ============================
 $cs = @'
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 public static class Oti
 {
@@ -430,6 +442,10 @@ public static class Oti
     // 整个虚拟桌面（所有显示器）的尺寸；绝对坐标模式用它，才能到达副屏。
     public static int VirtW() { return GetSystemMetrics(SM_CXVIRTUALSCREEN); }
     public static int VirtH() { return GetSystemMetrics(SM_CYVIRTUALSCREEN); }
+    // 虚拟桌面左上角（副屏在主屏左侧/上方时是负数）。回传光标时要减去它，
+    // 归一化到 0..VirtW-1，远端主控端才能直接用 rem_w/rem_h 和边缘比较。
+    public static int VirtX() { return GetSystemMetrics(SM_XVIRTUALSCREEN); }
+    public static int VirtY() { return GetSystemMetrics(SM_YVIRTUALSCREEN); }
 
     // x,y 是"对端屏幕"（主显示器）坐标系下的像素位置；MOUSEEVENTF_ABSOLUTE 用的是
     // 整个虚拟桌面并归一化到 0..65535，所以这里要按虚拟桌面换算。
@@ -489,6 +505,430 @@ public static class Oti
         inp[0].type = INPUT_MOUSE;
         inp[0].U.mi = new MOUSEINPUT { mouseData = (uint)(notches * 120), dwFlags = MOUSEEVENTF_WHEEL };
         SendInput(1, inp, Marshal.SizeOf(typeof(INPUT)));
+    }
+}
+// ============================ 线缆原生泵（CablePump）============================
+// 为什么需要它（2026-11-06 真机证据，见 /tmp/redesign-brief.md §1）：
+//   PowerShell 主循环每轮要 1.3~9 秒（剪贴板/图片/大文件处理都在这一条线程上），期间
+//   线缆设备**没人在读**。对端（麒麟）写 64KB 帧时会在 SCSI 命令里阻塞 250~700ms；
+//   线缆是单队列设备，HID 注入写排在同一条设备队列后面 → 鼠标冻结 100ms~2.5s。
+//   把设备 I/O 搬进这条原生后台线程后（fastpump 原型实测）：读消息 ~1ms、帧读写 2~4ms，
+//   对端 64KB 帧写不再阻塞，麒麟侧 HID 写最大间隔从 372~482ms 降到 ~14ms。
+//
+// 约束（违反就回到老故障）：
+//   * 线程只碰设备与内存队列，**绝不回调 PowerShell**，也绝不因为 PS 慢而停读；
+//   * PowerShell 侧只做 EnqueueTx / TryDequeueRx（微秒级），不再做任何 SPTI；
+//   * 0x06/0x07 是**发送授权窗口**：每次授权最多写 2 帧就回到消息读循环（限量原因见 Run），
+//     写帧期间不插别的设备操作（与 otilink/otitrans.c 的 cable_pump_once_locked 语义一致）。
+public static class CablePump
+{
+    public const string BuildTag = "nativepump-23";
+    public const int QCAP = 256;   // 每个方向队列容量（大文件分片突发：64 太小，PS 跟不上会丢帧）
+    // 大文件传输期间**暂停光标遥测**：单队列设备上双向同时写帧会互相堵
+    // （实测两侧帧写都出现 ~1.28s 的对称卡顿 → 传输速率掉到 0.1~0.4MB/s）。
+    public static volatile bool SuppressCursor = false;
+    const string LogPath = @"C:\Users\Public\cable.log";
+    const int CURSOR_MS = 150;               // 光标遥测周期 40→150ms（6.7/s）：回程判据 TTL 300ms 内足够；
+                                             // 40ms(25/s) 会超过设备授权写速、把 ACK/CLIP 挤到队后（2026-11-06 实测）
+    const int ROLE_MS = 1000;                // ROLE 重发周期
+    const int HELLO_MS = 10000;              // HELLO / 注入模式重发周期
+    const int SLOW_MS = 30;                  // 单次设备操作超过它就打 SLOWOP（证据行）
+    const int MAX_ERRORS = 200;              // 连续失败阈值：线程退出，由 PowerShell 重启
+
+    static readonly object lk = new object();
+    static readonly System.Collections.Generic.Queue<byte[]> txq =
+        new System.Collections.Generic.Queue<byte[]>();
+    static readonly System.Collections.Generic.Queue<byte[]> rxq =
+        new System.Collections.Generic.Queue<byte[]>();
+    static Thread th;
+    static IntPtr hDev = IntPtr.Zero;
+    static string devName = "";
+    static volatile bool stopFlag;
+    static volatile bool alive;
+    static volatile string lastErr = "";
+    static int gen;                          // 线程代际：旧线程迟到的退出不能污染新线程
+    static byte[] rolePl;                    // 最新 ROLE 载荷（12B）
+    static byte[] helloPl;                   // 最新 HELLO 载荷（4B）
+    static int modeVal = -1;                 // 最新注入模式（type 9，1B；-1=还没设置）
+    static volatile bool roleForce;
+    static volatile bool helloForce;
+    static volatile bool modeForce;
+    static long nRx, nTx, maxReadMs, maxWriteMs, resets, dropTx, dropRx, slowOps, badFrames;
+    static uint lastRxTick, lastDrainTick, lastCursorTick, lastRoleTick,
+                lastHelloTick, lastModeTick, lastSlowLogTick;
+
+    // ---------------- 对 PowerShell 暴露的状态 ----------------
+    public static string Build { get { return BuildTag; } }
+    public static bool Alive { get { return alive; } }
+    public static string LastErr { get { return lastErr; } }
+    public static int PendingTx { get { lock (lk) { return txq.Count; } } }
+    public static int PendingRx { get { lock (lk) { return rxq.Count; } } }
+    public static long Resets { get { return resets; } }
+    public static long DropTx { get { return dropTx; } }
+    public static long DropRx { get { return dropRx; } }
+    public static long SlowCount { get { return slowOps; } }
+    public static long BadFrames { get { return badFrames; } }
+    public static long IdleRxMs { get { return (long)(uint)(Tick() - lastRxTick); } }
+    public static long TxStuckMs
+    {
+        get
+        {
+            bool empty;
+            lock (lk) { empty = (txq.Count == 0); }
+            if (empty) return 0;
+            return (long)(uint)(Tick() - lastDrainTick);
+        }
+    }
+    // 证据行格式固定（Lead/verify-hw 会 grep）：
+    //   PUMP rx=N tx=N maxread=Nms maxwrite=Nms resets=N drop=N
+    public static string GetStats()
+    {
+        return "rx=" + nRx + " tx=" + nTx + " maxread=" + maxReadMs + "ms maxwrite=" + maxWriteMs +
+               "ms resets=" + resets + " drop=" + (dropTx + dropRx) + " slow=" + slowOps +
+               " bad=" + badFrames;
+    }
+
+    // ---------------- 生命周期 ----------------
+    public static bool Start(string devPath)
+    {
+        Stop();
+        if (devPath == null || devPath.Length == 0) { lastErr = "no device path"; return false; }
+        IntPtr h = Oti.OpenDevice(devPath);
+        if (!Oti.IsValid(h))
+        {
+            lastErr = "open " + devPath + " err=" + Marshal.GetLastWin32Error();
+            Log("CABLEPUMP open fail " + lastErr);
+            return false;
+        }
+        int g;
+        lock (lk)
+        {
+            gen++;
+            g = gen;
+            hDev = h;
+            devName = devPath;
+            stopFlag = false;
+            alive = true;
+            lastErr = "";
+            txq.Clear();
+            rxq.Clear();
+            nRx = 0; nTx = 0; maxReadMs = 0; maxWriteMs = 0;
+            resets = 0; dropTx = 0; dropRx = 0; slowOps = 0; badFrames = 0;
+            uint t = Tick();
+            lastRxTick = t; lastDrainTick = t; lastCursorTick = t;
+            lastRoleTick = t; lastHelloTick = t; lastModeTick = t; lastSlowLogTick = t;
+            roleForce = true; helloForce = true; modeForce = true;
+        }
+        Thread t2 = new Thread(delegate() { Run(g); });
+        t2.IsBackground = true;
+        t2.Name = "oti-cable-pump";
+        lock (lk) { th = t2; }
+        t2.Start();
+        Log("CABLEPUMP start build=" + BuildTag + " dev=" + devPath);
+        return true;
+    }
+
+    // 停止线程并关闭设备。若线程卡在设备调用里（单次最长 5s 超时），先 Join 再关句柄把它踹醒。
+    public static void Stop()
+    {
+        Thread t;
+        IntPtr h;
+        lock (lk)
+        {
+            stopFlag = true;
+            gen++;
+            t = th; th = null;
+            h = hDev; hDev = IntPtr.Zero;
+            alive = false;
+        }
+        if (t != null) { try { t.Join(1500); } catch { } }
+        if (h != IntPtr.Zero) { try { Oti.CloseDevice(h); } catch { } }
+        if (t != null && t.IsAlive) { try { t.Join(4000); } catch { } }
+    }
+
+    // ---------------- 与 PowerShell 交换帧体 ----------------
+    public static int EnqueueTx(byte[] body)
+    {
+        if (body == null || body.Length == 0) return -1;
+        if (body.Length > Oti.FRAME_BODY) return -2;
+        lock (lk)
+        {
+            if (txq.Count == 0) lastDrainTick = Tick();
+            while (txq.Count >= QCAP) { txq.Dequeue(); dropTx++; }
+            txq.Enqueue(body);
+        }
+        return 0;
+    }
+
+    public static bool TryDequeueRx(out byte[] body)
+    {
+        lock (lk)
+        {
+            if (rxq.Count > 0) { body = rxq.Dequeue(); return true; }
+        }
+        body = null;
+        return false;
+    }
+
+    // ROLE/HELLO/注入模式：PS 更新载荷后由泵线程按 1s/10s 节奏重发（PS 卡住也不断心跳）。
+    public static void SetRolePayload(byte[] pl)
+    {
+        if (pl == null) return;
+        lock (lk) { rolePl = pl; }
+        roleForce = true;
+    }
+    public static void SetHelloPayload(byte[] pl)
+    {
+        if (pl == null) return;
+        lock (lk) { helloPl = pl; }
+        helloForce = true;
+    }
+    public static void SetModePayload(byte mode)
+    {
+        lock (lk) { modeVal = (int)mode; }
+        modeForce = true;
+    }
+
+    // ---------------- 线程主体 ----------------
+    static void Run(int g)
+    {
+        byte[] msg = new byte[16];
+        byte[] frame = new byte[65536];
+        byte[] wframe = new byte[65536];
+        IntPtr h;
+        lock (lk) { h = hDev; }
+        int fail = 0;          // ReadMsgP 连续失败
+        int rfail = 0;         // ReadFrame28 连续失败
+        int wfail = 0;         // WriteFrame 连续失败
+        bool dead = false;
+        Log("CABLEPUMP thread up dev=" + devName + " gen=" + g);
+        try
+        {
+            while (!stopFlag && g == gen)
+            {
+                uint now = Tick();
+                FillBackground(now);
+                int pending;
+                lock (lk) { pending = txq.Count; }
+                if (pending > 100) pending = 100;
+                long t0 = Stopwatch.GetTimestamp();
+                int rc = Oti.ReadMsgP(h, msg, (ushort)pending);
+                long ms = MsSince(t0);
+                if (ms > maxReadMs) maxReadMs = ms;
+                if (rc != 0)
+                {
+                    fail++;
+                    if (fail >= MAX_ERRORS)
+                    {
+                        Fail("ReadMsgP 连续失败 " + fail + " 次（rc=" + rc + "）");
+                        dead = true;
+                        break;
+                    }
+                    Thread.Sleep(10);
+                    continue;
+                }
+                fail = 0;
+                byte ty = msg[0];
+                if (ty == 0x05)
+                {
+                    // 对端有帧：一次最多读 4 帧（与 otilink 一致，缩短单次占用）。
+                    // **背压**：PS 主循环跟不上时（大文件分片 226 帧/s 而 PS ~50 帧/s）绝不读进来丢掉——
+                    // 让帧留在设备缓冲里，对端写帧自然变慢 → 发送端 send_wait 被限速，靠"慢"而不是"丢"。
+                    int n = ((int)msg[1] << 8) | (int)msg[2];
+                    if (n > 4) n = 4;
+                    lock (lk) { if (rxq.Count >= QCAP - 8) n = 0; }
+                    for (int i = 0; i < n && !stopFlag && g == gen; i++)
+                    {
+                        long t1 = Stopwatch.GetTimestamp();
+                        int frc = Oti.ReadFrame28(h, frame);
+                        long fms = MsSince(t1);
+                        if (fms > maxReadMs) maxReadMs = fms;
+                        if (frc != 0)
+                        {
+                            rfail++;
+                            if (rfail >= MAX_ERRORS)
+                            {
+                                Fail("ReadFrame28 连续失败 " + rfail + " 次（rc=" + frc + "）");
+                                dead = true;
+                            }
+                            break;
+                        }
+                        rfail = 0;
+                        lastRxTick = Tick();
+                        if (Oti.FrameCheck(frame) != 1) { badFrames++; continue; }   // 空闲/非法帧
+                        int len = Oti.FrameBodyLen(frame);
+                        if (len <= 0) { badFrames++; continue; }   // 空帧/长度非法
+                        byte[] b = new byte[len];
+                        if (len > 0) Array.Copy(frame, Oti.FRAME_HEAD, b, 0, len);
+                        lock (lk)
+                        {
+                            while (rxq.Count >= QCAP) { rxq.Dequeue(); dropRx++; }
+                            rxq.Enqueue(b);
+                        }
+                        nRx++;
+                    }
+                }
+                else if (ty == 0x06 || ty == 0x07)
+                {
+                    // 发送授权窗口：**一次把 txq 写完**（与旧 PowerShell 泵/厂商语义一致）。
+                    // 2026-11-06 真机教训：限量 2 帧时，ACK/CLIP 长期排在 CURSOR 之后，抓不住
+                    // 授权窗口 → 对端 1.5s 收不到 ACK → 重发风暴；现场还表现为"Windows→麒麟
+                    // 的剪贴板帧干脆到不了"。实测帧写 2~4ms，整队通常 <30ms；慢对端由麒麟侧退避兜底。
+                    for (int w = 0; w < QCAP && !stopFlag && g == gen; w++)
+                    {
+                        byte[] body;
+                        lock (lk)
+                        {
+                            if (txq.Count == 0) break;
+                            body = txq.Peek();
+                        }
+                        Oti.FramePack(body, body.Length, wframe);
+                        long t2 = Stopwatch.GetTimestamp();
+                        int wrc = Oti.WriteFrame(h, wframe);
+                        long wms = MsSince(t2);
+                        if (wms > maxWriteMs) maxWriteMs = wms;
+                        if (wms > SLOW_MS) SlowOp(wms);
+                        if (wrc != 0)
+                        {
+                            lock (lk) { if (txq.Count > 0) txq.Dequeue(); }
+                            dropTx++;
+                            wfail++;
+                            if (wfail >= MAX_ERRORS)
+                            {
+                                Fail("WriteFrame 连续失败 " + wfail + " 次（rc=" + wrc + "）");
+                                dead = true;
+                            }
+                            break;
+                        }
+                        wfail = 0;
+                        lock (lk)
+                        {
+                            if (txq.Count > 0) txq.Dequeue();
+                            lastDrainTick = Tick();
+                        }
+                        nTx++;
+                    }
+                }
+                else
+                {
+                    resets++;          // 0x00/0x01/0x08/0x10：链路未就绪/复位
+                    Thread.Sleep(5);
+                }
+                if (dead) break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Fail("线程异常 " + ex.GetType().Name + ": " + ex.Message);
+        }
+        finally
+        {
+            bool cur;
+            lock (lk) { cur = (g == gen); }
+            if (cur) alive = false;
+            Log("CABLEPUMP thread exit gen=" + g + " err=" + lastErr);
+        }
+    }
+
+    // 每轮补背景帧：CURSOR(11, 40ms) / ROLE(10, 1s) / HELLO(8+9, 10s)
+    static void FillBackground(uint now)
+    {
+        uint cursorPeriod = SuppressCursor ? 1000u : (uint)CURSOR_MS;
+        if ((uint)(now - lastCursorTick) >= cursorPeriod)
+        {
+            lastCursorTick = now;
+            int pend;
+            lock (lk) { pend = txq.Count; }
+            // 队列里有积压就**不发光标遥测**：ACK/CLIP 必须优先出队（ACK 迟到 1.5s 会引发重发风暴）；
+            // 光标是"最新值"语义，晚一点/少几帧无所谓（回程判据 TTL 300ms）。
+            if (pend < 8)
+            {
+                byte[] pl = CursorPayload();
+                if (pl != null) EnqueueTx(Oti.Encode(11, 0, pl, 8));
+            }
+        }
+        if (roleForce || (uint)(now - lastRoleTick) >= ROLE_MS)
+        {
+            lastRoleTick = now;
+            roleForce = false;
+            byte[] pl;
+            lock (lk) { pl = rolePl; }
+            if (pl != null) EnqueueTx(Oti.Encode(10, 0, pl, pl.Length));
+        }
+        if (helloForce || (uint)(now - lastHelloTick) >= HELLO_MS)
+        {
+            lastHelloTick = now;
+            helloForce = false;
+            byte[] pl;
+            lock (lk) { pl = helloPl; }
+            if (pl != null) EnqueueTx(Oti.Encode(8, 0, pl, pl.Length));
+        }
+        if (modeForce || (uint)(now - lastModeTick) >= HELLO_MS)
+        {
+            lastModeTick = now;
+            modeForce = false;
+            int mv;
+            lock (lk) { mv = modeVal; }
+            if (mv >= 0)
+            {
+                byte[] mb = new byte[1];
+                mb[0] = (byte)mv;
+                EnqueueTx(Oti.Encode(9, 0, mb, 1));
+            }
+        }
+    }
+
+    // 与 PS 原 Send-Cursor **逐字节一致**：x,y 减去虚拟桌面左上角（int16），再带 u16 virtW/virtH。
+    // 麒麟侧（主控）用它判断"回程手势是否真的到了屏幕边缘"、以及交接时估算指针落点。
+    public static byte[] CursorPayload()
+    {
+        Oti.POINT p;
+        if (!Oti.GetCursorPos(out p)) return null;
+        int x = p.X - Oti.VirtX();
+        int y = p.Y - Oti.VirtY();
+        if (x < 0) x = 0; else if (x > 32767) x = 32767;
+        if (y < 0) y = 0; else if (y > 32767) y = 32767;
+        int vw = Oti.VirtW();
+        int vh = Oti.VirtH();
+        if (vw < 0) vw = 0; else if (vw > 65535) vw = 65535;
+        if (vh < 0) vh = 0; else if (vh > 65535) vh = 65535;
+        byte[] pl = new byte[8];
+        Oti.Put16(pl, 0, (ushort)x);
+        Oti.Put16(pl, 2, (ushort)y);
+        Oti.Put16(pl, 4, (ushort)vw);
+        Oti.Put16(pl, 6, (ushort)vh);
+        return pl;
+    }
+
+    static uint Tick() { return unchecked((uint)Environment.TickCount); }
+    static long MsSince(long t0)
+    {
+        return (Stopwatch.GetTimestamp() - t0) * 1000L / Stopwatch.Frequency;
+    }
+    static void SlowOp(long ms)
+    {
+        slowOps++;
+        uint now = Tick();
+        if ((uint)(now - lastSlowLogTick) >= 5000)   // 限速 1 条/5s，长时间慢链路也不会把日志刷爆
+        {
+            lastSlowLogTick = now;
+            Log("SLOWOP frame-write " + ms + "ms (peer consume slow / device busy)");
+        }
+    }
+    static void Fail(string s)
+    {
+        lastErr = s;
+        Log("CABLEPUMP error: " + s);
+    }
+    // 设备线程自己的日志（不经过 PowerShell）。只有启动/慢操作/错误/退出才写，绝不高频刷盘。
+    static void Log(string s)
+    {
+        try
+        {
+            System.IO.File.AppendAllText(LogPath,
+                DateTime.Now.ToString("HH:mm:ss.fff") + " " + s + "\r\n");
+        }
+        catch { }
     }
 }
 '@
@@ -1350,6 +1790,32 @@ if ($Selftest) {
     Chk ([Oti]::OffsetOf('SenseInfoOffset') -eq 32) "SenseInfoOffset 偏移 = $([Oti]::OffsetOf('SenseInfoOffset'))（期望 32）"
     Chk ([Oti]::OffsetOf('Cdb') -eq 36) "Cdb 偏移 = $([Oti]::OffsetOf('Cdb'))（期望 36）"
 
+    # ---- 线缆原生泵（CablePump）离线自检：队列/统计/光标载荷/无效设备（绝不碰真设备）----
+    Chk ([CablePump]::BuildTag -eq 'nativepump-2') "线缆泵 BuildTag = $([CablePump]::BuildTag)"
+    Chk (([CablePump]::GetStats()) -match '^rx=\d+ tx=\d+ maxread=\d+ms maxwrite=\d+ms resets=\d+ drop=\d+') "泵统计格式可 grep（$([CablePump]::GetStats())）"
+    $rc1 = [CablePump]::EnqueueTx([Oti]::Encode(5, 0, $null, 0))
+    Chk ($rc1 -eq 0 -and [CablePump]::PendingTx -ge 1) "入队成功（rc=$rc1 pending=$([CablePump]::PendingTx)）"
+    $rc2 = [CablePump]::EnqueueTx($null)
+    Chk ($rc2 -ne 0) "空载荷入队被拒（rc=$rc2）"
+    $big = New-Object byte[] ([Oti]::FRAME_BODY + 1)
+    $rc3 = [CablePump]::EnqueueTx($big)
+    Chk ($rc3 -ne 0) "超大载荷入队被拒（rc=$rc3）"
+    $cpl = [CablePump]::CursorPayload()
+    $cok = $false; $ct = [uint16]0
+    if ($null -ne $cpl -and $cpl.Length -eq 8) {
+        $cbody = [Oti]::Encode(11, 0, $cpl, 8)
+        $cs2 = [uint32]0; $cpl2 = $null
+        $cok = [Oti]::Decode($cbody, $cbody.Length, [ref]$ct, [ref]$cs2, [ref]$cpl2)
+    }
+    if ($cok -and $ct -eq 11) {
+        Chk $true "CURSOR(11) 遥测帧可解码（virt=$([BitConverter]::ToUInt16($cpl,4))x$([BitConverter]::ToUInt16($cpl,6))）"
+    } else {
+        Write-Host "  [SKIP] CURSOR(11) 遥测载荷（当前会话读不到光标；真机运行时才会用到）"
+    }
+    $sok = [CablePump]::Start('\\.\Q:')
+    Chk ((-not $sok) -and ([CablePump]::LastErr -ne '')) "无效设备启动失败并留下 err（$([CablePump]::LastErr)）"
+    [void][CablePump]::Stop()
+
     Write-Host ""
     if ($fail -eq 0) { Write-Host "全部通过"; exit 0 } else { Write-Host "有失败（$fail 项）"; exit 1 }
 }
@@ -1433,7 +1899,45 @@ function Find-CableDevice {
 
 # ============================ 正常模式 ============================
 $useTcp = ($Tcp -ne '')
+$useCable = ($Cable -and -not $useTcp)
 $h = [IntPtr]::Zero
+# DPI 感知要尽早：泵线程的 GetCursorPos/GetSystemMetrics 与注入坐标都按物理像素算，
+# SetProcessDPIAware 只对**之后**的调用生效（之前放在下面，泵线程可能先跑起来）。
+try { [void][Oti]::SetProcessDPIAware() } catch {}
+
+# ---- 线缆泵控制（设备 I/O 全部在 Add-Type 里的 C# 后台线程，原因见 CablePump 注释）----
+# 为什么 PowerShell 不再持有设备：同一条帧管道**只能有一个读者**；PS 主循环会被剪贴板/
+# 图片/大文件处理卡 1.3~9 秒（真机测量），它一停读，对端 64KB 帧写就阻塞 250~700ms，
+# 同单队列的 HID 注入写被堵 → 鼠标冻结。泵线程把设备读/写与 PS 处理完全解耦。
+$script:pumpOn = $false
+function Start-CablePump([string]$devPath) {
+    if (-not $devPath) { return $false }
+    [void][CablePump]::Stop()
+    if ([CablePump]::Start($devPath)) {
+        $script:pumpOn = $true
+        Write-Host ("线缆泵: build {0} dev={1}（原生 C# 后台线程独占设备；PS 主循环只跟内存队列打交道）" -f [CablePump]::BuildTag, $devPath)
+        return $true
+    }
+    $script:pumpOn = $false
+    Write-Host ("[FAIL] 线缆泵: 启动失败 dev={0} err={1}" -f $devPath, [CablePump]::LastErr)
+    return $false
+}
+# 会话自愈：泵线程退出（连续读写失败）或链路卡死（20s 无入帧且发送队列 10s 排不空）时，
+# 用原有 Find-CableDevice 重新发现（拔插后盘符可能变）再重启泵。
+function Restart-CablePump([string]$why) {
+    Write-Host ("线缆泵: 重启（{0}；err={1}）" -f $why, [CablePump]::LastErr)
+    [void][CablePump]::Stop()
+    Start-Sleep -Milliseconds 300
+    $dev = Find-CableDevice
+    if (-not $dev) { $dev = $Device }
+    if (-not $dev) {
+        Write-Host "线缆泵: 重启失败（找不到线缆设备；插好了吗？）"
+        return $false
+    }
+    if (Start-CablePump $dev) { $script:Device = $dev; return $true }
+    return $false
+}
+
 if ($useTcp) {
     $parts = $Tcp -split ':'
     $client = New-Object System.Net.Sockets.TcpClient
@@ -1448,128 +1952,49 @@ if ($useTcp) {
         $Device = Find-CableDevice
         if (-not $Device) { Write-Host "没找到线缆设备；可用 -Scan 诊断，或 -Tcp host:port"; exit 2 }
     }
-    $h = [Oti]::OpenDevice($Device)
-    if (-not [Oti]::IsValid($h)) {
-        Write-Host ("打不开 {0}（err={1}）—— 试试自动发现" -f $Device, [Runtime.InteropServices.Marshal]::GetLastWin32Error())
-        $alt = Find-CableDevice
-        if ($alt -and $alt -ne $Device) { $Device = $alt; $h = [Oti]::OpenDevice($Device) }
+    if ($useCable) {
+        # 线缆模式：设备句柄**只由泵线程持有**。PowerShell 绝不 OpenDevice（否则两个读者抢管道）。
+        if (-not (Start-CablePump $Device)) {
+            $alt = Find-CableDevice
+            if ($alt -and $alt -ne $Device) { $Device = $alt; [void](Start-CablePump $Device) }
+        }
+        if (-not $script:pumpOn) {
+            Write-Host ("[FAIL] 线缆泵起不来（{0}）—— 设备被别的程序独占/拔掉了？退出让看门狗重拉" -f $Device)
+            exit 1
+        }
+        Write-Host "设备已交给线缆泵: $Device"
+        Write-Host "线缆对等循环模式（消息管道 + 授权门控发送；I/O 在原生泵线程，PS 只处理帧内容）"
+    } else {
+        $h = [Oti]::OpenDevice($Device)
+        if (-not [Oti]::IsValid($h)) {
+            Write-Host ("打不开 {0}（err={1}）—— 试试自动发现" -f $Device, [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+            $alt = Find-CableDevice
+            if ($alt -and $alt -ne $Device) { $Device = $alt; $h = [Oti]::OpenDevice($Device) }
+        }
+        if (-not [Oti]::IsValid($h)) {
+            Write-Host ("打不开 {0} —— SPTI 需要管理员权限，或被别的程序独占" -f $Device)
+            exit 1
+        }
+        Write-Host "设备已打开: $Device"
     }
-    if (-not [Oti]::IsValid($h)) {
-        Write-Host ("打不开 {0} —— SPTI 需要管理员权限，或被别的程序独占" -f $Device)
-        exit 1
-    }
-    Write-Host "设备已打开: $Device"
-    if ($useCable) { Write-Host "线缆对等循环模式（两条管道 + 授权门控发送）" }
     Write-Host ("鼠标注入模式: {0}" -f $(if ($MouseMode -eq 'absolute') { 'absolute（绝对坐标，1:1 无加速）' } else { 'native（相对位移，走 Windows 指针速度/加速）' }))
 }
 
-# ============================ 线缆对等循环（两条管道 + 授权门控）============================
+# ============================ 线缆对等循环（协议说明）============================
 # 协议依据（NOTES §33/§34）：
 #   消息管道 0xD8/0x00/0x03 + IN 16B，CDB[3..4]=本机待发帧数
 #   0x05 → be16(m[1..2]) 帧数 → 0xD9/0x28/0x64 读 64KB 帧
-#   0x06/0x07 → 发送授权 → 必须【立刻】用 0xD9/0x2A/0xFF 写帧
+#   0x06/0x07 → 发送授权 → 立刻用 0xD9/0x2A/0xFF 写帧（**每次授权最多 2 帧**，见 CablePump：
+#              一次清空 txq 会让 11 帧剪贴板大图占设备 40ms，贴住 HID maxgap 验收阈值）
 #   0x01/0x00/0x08/0x10 → 复位（链路未就绪/对端未消费）
-try { [void][Oti]::SetProcessDPIAware() } catch {}   # DPI 感知：坐标全部按物理像素，避免缩放错位
-$useCable = ($Cable -and -not $useTcp)
-$script:txq = New-Object System.Collections.Queue
-$script:rxq = New-Object System.Collections.Queue
-$script:cableResets = 0
-$script:cableFail = 0
-$script:cableTxDropped = 0
-# 会话自愈用的时间戳/计数（判据见 Pump-Cable 顶部）
-$script:lastFrameMs = Get-Date      # 上次**收到帧**的时刻
-$script:lastDrainMs = Get-Date      # 上次发送队列**减少**的时刻
-$script:lastTxqCount = 0
+# 以上设备交互**全部在 CablePump 后台线程里**；PowerShell 只通过内存队列交换帧体，
+# 授权窗口内不会有任何 PS 侧设备操作插进来（泵线程独占设备，这也是不用 io 锁的原因）。
+$script:lastPumpLog = Get-Date       # 5s 一行 PUMP 证据行
+$script:lastPumpCheck = Get-Date     # 2s 一次健康检查
+$script:lastPumpRestart = [DateTime]::MinValue
 
-# 缓冲区只分配一次（教训：原来每轮循环都 New-Object byte[] 65536，
-# 每秒上千次分配造成 GC 风暴，整台机器都会变卡）
-$script:frameBuf = New-Object byte[] 65536
-$script:msgBuf = New-Object byte[] 16
-
-function Pump-Cable {
-    if (-not $useCable) { return $false }
-    # ---- 会话自愈（第 46 轮续）：消息管道"看起来正常"但数据完全不动时必须主动重开 ----
-    # 真机故障（re/NOTES.md §57）：ReadMsgP 一直成功（cableFail 恒为 0），但对端写命令被拒
-    # rc=524546、帧静默丢失 → 下面的 cableFail>=60 重连**永远不触发**，链路卡死只能人工拔插。
-    # 判据（两条都要满足，避免"对端本来是零软件、根本没帧"时误重开）：
-    #   ① 20 秒没收到任何帧；且 ② 发送队列积压超过 10 秒没有减少（有东西发不出去）。
-    $nowT = Get-Date
-    if ($script:txq.Count -lt $script:lastTxqCount) { $script:lastDrainMs = $nowT }
-    $script:lastTxqCount = $script:txq.Count
-    if ($script:txq.Count -eq 0) { $script:lastDrainMs = $nowT }
-    $idleRx = ($nowT - $script:lastFrameMs).TotalSeconds
-    $stuckTx = ($nowT - $script:lastDrainMs).TotalSeconds
-    if ($idleRx -gt 20 -and $stuckTx -gt 10) {
-        Write-Host ("会话自愈：{0:N0}s 无入帧且发送队列 {1:N0}s 未排空 → 重开线缆设备" -f $idleRx, $stuckTx)
-        [Oti]::CloseDevice($h)
-        Start-Sleep -Milliseconds 300
-        $h = [Oti]::OpenDevice($Device)
-        if (-not [Oti]::IsValid($h)) {
-            $alt = Find-CableDevice
-            if ($alt) { $Device = $alt; $h = [Oti]::OpenDevice($Device) }
-        }
-        if ([Oti]::IsValid($h)) { Write-Host "会话自愈：已重新连接 $Device" }
-        else { Write-Host "会话自愈：重连失败（设备插好了吗？）" }
-        $script:txq.Clear(); $script:rxq.Clear()
-        $script:lastFrameMs = $nowT; $script:lastDrainMs = $nowT; $script:cableFail = 0
-        return $false
-    }
-    $pending = [uint16][Math]::Min($script:txq.Count, 100)
-    if ([Oti]::ReadMsgP($h, $script:msgBuf, $pending) -ne 0) {
-        # 永久运行要能扛住拔插：连续失败到一定次数就尝试重新打开设备
-        $script:cableFail++
-        if ($script:cableFail -ge 60) {
-            $script:cableFail = 0
-            Write-Host "设备连续读取失败，尝试重连 $Device …"
-            [Oti]::CloseDevice($h)
-            Start-Sleep -Milliseconds 500
-            $h = [Oti]::OpenDevice($Device)
-            if (-not [Oti]::IsValid($h)) {
-                # 拔插后盘符可能变了：重新发现一次（这是"拔线重插要复原"的关键）
-                Write-Host "  原设备打不开，重新自动发现…"
-                $alt = Find-CableDevice
-                if ($alt) { $Device = $alt; $h = [Oti]::OpenDevice($Device) }
-            }
-            if ([Oti]::IsValid($h)) {
-                $script:txq.Clear(); $script:rxq.Clear()
-                Write-Host "已重新连接 $Device"
-            } else {
-                Write-Host "重连失败（设备是否已插好？）"
-            }
-        }
-        return $false
-    }
-    $script:cableFail = 0
-    $t0 = $script:msgBuf[0]
-    if ($t0 -eq 0x05) {
-        $n = ([int]$script:msgBuf[1] -shl 8) -bor [int]$script:msgBuf[2]
-        for ($i = 0; $i -lt $n; $i++) {
-            if ($script:rxq.Count -ge 16) { break }         # 队列满：留在设备侧下次再取
-            if ([Oti]::ReadFrame28($h, $script:frameBuf) -ne 0) { break }
-            $script:lastFrameMs = Get-Date                     # 入帧时刻（会话自愈判据①）
-            if ([Oti]::FrameCheck($script:frameBuf) -ne 1) { continue }  # 空闲/非法帧丢弃
-            $l = [Oti]::FrameBodyLen($script:frameBuf)
-            if ($l -lt 0) { continue }
-            $b = New-Object byte[] $l                       # 只有真收到帧才分配
-            if ($l -gt 0) { [Array]::Copy($script:frameBuf, 20, $b, 0, $l) }
-            $script:rxq.Enqueue($b)
-        }
-        return $true
-    }
-    if ($t0 -eq 0x06 -or $t0 -eq 0x07) {
-        $did = $false
-        while ($script:txq.Count -gt 0) {                   # 授权：立刻写，中间不插别的设备操作
-            $b = $script:txq.Dequeue()
-            [Oti]::FramePack($b, $b.Length, $script:frameBuf)
-            if ([Oti]::WriteFrame($h, $script:frameBuf) -eq 0) { $did = $true }
-            else { $script:cableTxDropped++ }
-        }
-        return $did
-    }
-    $script:cableResets++
-    return $false
-}
-
+# 注意：原 `Pump-Cable`（PS 侧 SPTI 读消息/读帧/写帧）已删除 —— 设备 I/O 全部搬到
+# Add-Type 里的 CablePump 后台线程；主循环只调用 [CablePump]::TryDequeueRx 取帧体。
 function Read-Exact([System.IO.Stream]$st, [int]$n, [int]$deadlineMs) {
     $buf = New-Object byte[] $n
     $off = 0
@@ -1603,15 +2028,14 @@ function TxBody([byte[]]$body) {
         return 0
     }
     if ($useCable) {
-        $script:txq.Enqueue($body)
-        # ⚠️ 绝不在这里等：原来最多等 5 秒，一旦对端授权慢，主循环就被卡住 5 秒 ——
-        #    期间**读不到任何帧**。真机实测症状：对端 ROLE 变成每 5.2 / 10.4 秒才收到一条，
-        #    剪贴板大面积"未确认"。队列由主循环每轮的 Pump-Cable 推进；可靠性交给 ACK/重发。
-        [void](Pump-Cable)     # 必须 [void]：PowerShell 会把未接住的返回值拼进本函数返回值
-        return 0
+        # 入 C# 泵线程的发送队列（微秒级，不阻塞主循环）；真正的设备写在泵线程里完成。
+        # ⚠️ 绝不在这里等设备：原来最多等 5 秒，一旦对端授权慢，主循环就被卡住 5 秒 ——
+        #    期间**读不到任何帧**。可靠性交给队列 + ACK/重发。
+        return [CablePump]::EnqueueTx($body)
     }
-    [Oti]::FramePack($body, $body.Length, $fr)
-    return [Oti]::WriteFrame($h, $fr)
+    # 非 cable / 非 TCP 的旧 SPTI 直连路径（保留原行为，别让旧模式回归）
+    [Oti]::FramePack($body, $body.Length, $script:frame)
+    return [Oti]::WriteFrame($h, $script:frame)
 }
 
 $frame = New-Object byte[] 65536
@@ -1908,8 +2332,9 @@ OTiLink 被控端
 收到消息    : $rx 条
 注入次数    : $injected 次
 剪贴板发块  : $txClip
-线缆复位    : $($script:cableResets) 次
-写失败丢弃  : $($script:cableTxDropped) 次
+线缆泵      : $(if ($useCable) { if ([CablePump]::Alive) { '运行中' } else { '已停止（主循环会自动重启）' } } else { '未启用（非 cable 模式）' })
+线缆复位    : $(if ($useCable) { [CablePump]::Resets } else { 0 }) 次
+丢弃/慢写   : $(if ($useCable) { "" + [CablePump]::DropTx + " / " + [CablePump]::SlowCount } else { '0 / 0' })
 主控端屏幕  : $(if ($script:peerW) { "$($script:peerW)x$($script:peerH)" } else { '未上报' })
 "@
 }
@@ -1917,6 +2342,7 @@ $script:quit = $false
 
 $script:peerW = 0; $script:peerH = 0
 $lastHello = [DateTime]::MinValue
+$lastCursorTx = [DateTime]::MinValue
 function Send-Hello {
     # 把本机屏幕几何告诉对端：主控端据此把指针位置换算到本机坐标系
     $pl = New-Object byte[] 4
@@ -1928,12 +2354,39 @@ function Send-Hello {
     $mb[0] = if ($MouseMode -eq 'absolute') { 0 } else { 1 }
     $mbody = [Oti]::Encode(9, 0, $mb, 1)
     if ($useCable) {
-        $script:txq.Enqueue($body)      # 交给 Pump-Cable 发，不阻塞
-        $script:txq.Enqueue($mbody)
+        # 载荷交给泵线程缓存，由它每 10s 重发（PS 主循环被剪贴板卡住也不断心跳）。
+        # PS 仍保持 10s 调用节奏：Set*Payload 只更新缓存+触发一次立即发送，不重复入队。
+        [CablePump]::SetHelloPayload($pl)
+        [CablePump]::SetModePayload([byte]$mb[0])
     } else {
         [void](TxBody $body)
         [void](TxBody $mbody)
     }
+}
+
+# 回传本机光标真实位置（OTI_MSG_CURSOR=11）：麒麟侧（主控）用它判断
+# “回程手势是否真的到了屏幕边缘”。为什么需要：HID 鼠标只有相对计数，而 Windows 的
+# “提高指针精确度”会让净计数与像素位置漂移 —— 真机实测：快左移 + 慢右移后净计数 +100，
+# 光标却还离右边缘 1068px，于是提前回程（用户报障“没到边就到 kylin”）。
+# 坐标归一化到虚拟桌面左上角（减 SM_X/YVIRTUALSCREEN），与 HELLO 的 VirtW/H 同系。
+function Send-Cursor {
+    # cable 模式：泵线程每 40ms 自己 GetCursorPos 生成并发送（比 PS 的 500ms 新鲜 12 倍），
+    # 这里直接 no-op；TCP/旧 SPTI 模式保持原逻辑不变。
+    if ($useCable) { return }
+    $p = New-Object Oti+POINT
+    if (-not [Oti]::GetCursorPos([ref]$p)) { return }
+    $x = $p.X - [Oti]::VirtX()
+    $y = $p.Y - [Oti]::VirtY()
+    if ($x -lt 0) { $x = 0 } elseif ($x -gt 32767) { $x = 32767 }
+    if ($y -lt 0) { $y = 0 } elseif ($y -gt 32767) { $y = 32767 }
+    $pl = New-Object byte[] 8
+    [BitConverter]::GetBytes([int16]$x).CopyTo($pl, 0)
+    [BitConverter]::GetBytes([int16]$y).CopyTo($pl, 2)
+    # 带上虚拟桌面尺寸：不依赖 HELLO 的 10s 节奏，otikm 刚重启后的第一次交接也能立刻判边。
+    [BitConverter]::GetBytes([uint16][Oti]::VirtW()).CopyTo($pl, 4)
+    [BitConverter]::GetBytes([uint16][Oti]::VirtH()).CopyTo($pl, 6)
+    $body = [Oti]::Encode(11, 0, $pl, 8)
+    [void](TxBody $body)
 }
 
 # ============================ 角色协商（OTI_MSG_ROLE=10）============================
@@ -2063,15 +2516,36 @@ function Get-IdleMs {
 #    每 3 秒对每个设备查一次会**卡住线缆泵**（帧静默丢失、对端写命令被拒 rc=524546）。
 #    RemovalPolicy 在设备插着的时候不会变 → 按 InstanceId 缓存，只在首次见到时查。
 $script:rolePolCache = @{}
+# 读 RemovalPolicy 的 PnP 属性调用与 CIM 一样会**在 agent 进程内挂死**（实测：
+# 主循环卡在 Update-LocalInput 的 Where-Object→Test-HotplugInput，剪贴板/键鼠全哑）。
+# 用独立 runspace + 1.2s 超时；超时按"可热插拔"处理并本次会话停用该探测。
+$script:pnpPropBroken = $false
 function Test-HotplugInput([string]$instanceId) {
     if ($script:rolePolCache.ContainsKey($instanceId)) { return $script:rolePolCache[$instanceId] }
     $v = $true
-    try {
-        $pol = (Get-PnpDeviceProperty -InstanceId $instanceId -KeyName 'DEVPKEY_Device_RemovalPolicy' -EA Stop).Data
-        $v = ([int]$pol -ne 1)        # 1 = EXPECT_NO_REMOVAL = 内置/不可移除
-    } catch {
-        Write-Host ("  ROLE [warn] 读不到 " + $instanceId + " 的 RemovalPolicy，按可热插拔处理")
-        $v = $true
+    if (-not $script:pnpPropBroken) {
+        $ps = [PowerShell]::Create()
+        [void]$ps.AddScript("try { (Get-PnpDeviceProperty -InstanceId '" + $instanceId +
+            "' -KeyName 'DEVPKEY_Device_RemovalPolicy' -ErrorAction Stop).Data } catch { 'ERR' }")
+        try {
+            $h = $ps.BeginInvoke()
+            if (-not $h.AsyncWaitHandle.WaitOne(1200)) {
+                try { $ps.Stop() } catch { }
+                $script:pnpPropBroken = $true
+                Write-Host ("  ROLE [warn] PnP 属性查询超时（" + $instanceId + "）→ 本次会话停用 RemovalPolicy 探测，按可热插拔处理")
+            } else {
+                $r = $ps.EndInvoke($h)
+                if ($null -ne $r -and "$r" -ne 'ERR' -and "$r" -ne '') {
+                    $v = ([int]"$r" -ne 1)        # 1 = EXPECT_NO_REMOVAL = 内置/不可移除
+                } else {
+                    Write-Host ("  ROLE [warn] 读不到 " + $instanceId + " 的 RemovalPolicy，按可热插拔处理")
+                }
+            }
+        } catch {
+            Write-Host ("  ROLE [warn] 读不到 " + $instanceId + " 的 RemovalPolicy，按可热插拔处理")
+        } finally {
+            try { $ps.Dispose() } catch { }
+        }
     }
     $script:rolePolCache[$instanceId] = $v
     return $v
@@ -2090,15 +2564,49 @@ $script:probeJob = $null
 #    取值是权衡：**20 秒**（检测键鼠换边 ≤20s；更长会拖慢换主控、甚至两端同时主控）。
 #    根治方向：改用 Raw Input（GetRawInputDeviceList，无 WMI），或在后台 **runspace** 里跑
 #    （而不是每几秒起子进程）。见 re/NOTES.md §58。
+# WMI/CIM 调用在个别机器上会**永久挂住**（实测本机 agent 进程内 Get-CimInstance 卡死，
+# 而新开的 PowerShell 又是 0.3s 返回 → 不是 WMI 服务坏，是该 host 的 WMI 客户端状态）。
+# 主循环要是卡在这里，剪贴板/键鼠全哑（现场"Windows→麒麟文字文件都不行"）。
+# 用独立 runspace + 超时兜底：超时就放弃本轮并标记坏掉，后续用 Raw Input 兜底，绝不再挂。
+$script:cimBroken = $false
+function Get-CimTimed([string]$cls, [int]$ms) {
+    if ($script:cimBroken) { return $null }
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript('@(Get-CimInstance ' + $cls + ' -ErrorAction SilentlyContinue)')
+    try {
+        $h = $ps.BeginInvoke()
+        if (-not $h.AsyncWaitHandle.WaitOne($ms)) {
+            try { $ps.Stop() } catch { }
+            try { $ps.Dispose() } catch { }
+            $script:cimBroken = $true
+            Write-Host ("  [warn] CIM 查询 " + $cls + " 超时 " + $ms + "ms → 本次会话停用 WMI 本机输入探测（改用 Raw Input/上次值）")
+            return $null
+        }
+        $r = $ps.EndInvoke($h)
+        return $r
+    } catch {
+        $script:cimBroken = $true
+        return $null
+    } finally {
+        try { $ps.Dispose() } catch { }
+    }
+}
+
 function Update-LocalInput {
     # 用 Win32_Keyboard / Win32_PointingDevice（简单 CIM 类）替代 Get-PnpDevice：
     # 实测同样 5 个设备，Get-PnpDevice **1267ms** vs CIM **328ms**。这个耗时就是主循环被
     # 阻塞的时间（阻塞期间一帧都收不到）—— 越短，帧丢得越少、换边检测才能更快。
-    $kbd = @(); $mou = @()
-    try { $kbd = @(Get-CimInstance Win32_Keyboard -EA SilentlyContinue) } catch {}
-    try { $mou = @(Get-CimInstance Win32_PointingDevice -EA SilentlyContinue) } catch {}
-    $kbd = @($kbd | Where-Object { $_.PNPDeviceID -and $_.PNPDeviceID -notmatch 'VID_0EA0&PID_2213' -and (Test-HotplugInput $_.PNPDeviceID) })
-    $mou = @($mou | Where-Object { $_.PNPDeviceID -and $_.PNPDeviceID -notmatch 'VID_0EA0&PID_2213' -and (Test-HotplugInput $_.PNPDeviceID) })
+        $kbd = @(); $mou = @()
+    $rk = Get-CimTimed 'Win32_Keyboard' 1500
+        $rm = Get-CimTimed 'Win32_PointingDevice' 1500
+        if ($null -ne $rk) { $kbd = @($rk | Where-Object { $_ }) }
+    if ($null -ne $rm) { $mou = @($rm | Where-Object { $_ }) }
+    if ($null -eq $rk -or $null -eq $rm) {
+        # 超时：不动 roleHasLocal（不知道就别乱改角色），下次循环再说；已经置 cimBroken 就不再试。
+        return
+    }
+        $kbd = @($kbd | Where-Object { $_.PNPDeviceID -and $_.PNPDeviceID -notmatch 'VID_0EA0&PID_2213' -and (Test-HotplugInput $_.PNPDeviceID) })
+        $mou = @($mou | Where-Object { $_.PNPDeviceID -and $_.PNPDeviceID -notmatch 'VID_0EA0&PID_2213' -and (Test-HotplugInput $_.PNPDeviceID) })
     $nl = 0; if ($kbd.Count -gt 0 -or $mou.Count -gt 0) { $nl = 1 }
     if ($nl -ne $script:roleHasLocal) {
         $script:roleHasLocal = $nl
@@ -2264,12 +2772,19 @@ function Send-Role {
     [Oti]::Put32($pl, 4, [uint32]$script:roleBoot)
     [Oti]::Put32($pl, 8, [uint32](Get-RoleInputAge))
     $body = [Oti]::Encode(10, 0, $pl, 12)
-    if ($useCable) { $script:txq.Enqueue($body) }   # 与 Send-Hello 一致：不阻塞主循环
-    else { [void](TxBody $body) }
+    if ($useCable) {
+        # 泵线程缓存该 12B 载荷并每 1s 重发；PS 仍每 1s 调用一次（输入年龄会变），
+        # Set 只刷新缓存+触发一次立即发送，不会额外多一帧。
+        [CablePump]::SetRolePayload($pl)
+    } else {
+        [void](TxBody $body)
+    }
 }
 
 Update-LocalInput
+
 try { $rawN = @([OtiRaw]::Names()).Count; Write-Host ("RAW 设备数=" + $rawN + "（>0 表示可用 Raw Input 替代 Get-PnpDevice）") } catch { Write-Host ("RAW 探测失败: " + $_.Exception.Message) }
+
 Write-Host ("ROLE 初始化: boot={0:x8} hasLocal={1} want={2} state=slave（Windows 侧 grab=跑 otiagent2）" -f $script:roleBoot, $script:roleHasLocal, $script:roleWant)
 
 # ============================ 大文件流式传输（format 4/5）============================
@@ -2290,7 +2805,7 @@ function New-TxState {
     @{ active=$false; fid=[uint32]0; paths=@(); cur=0; fs=$null; name=''; total=[uint64]0;
        nparts=0; sent=0; crc=[uint32]0; crcDone=$false; phase=0; deadline=(Get-Date);
        rounds=0; t0=(Get-Date); lastLog=(Get-Date); done=0; bytes=[uint64]0;
-       todo=$null; todoI=0; doneParts=0; failStreak=0 }
+       todo=$null; todoI=0; doneParts=0; failStreak=0; verdictResend=(Get-Date) }
 }
 function New-RxState {
     @{ active=$false; fid=[uint32]0; fs=$null; name=''; path=''; partPath=''; total=[uint64]0;
@@ -2338,10 +2853,8 @@ function Send-FileCtrl([uint32]$fid, [uint16]$kind, [uint16]$flags, [uint64]$tot
     if ($nb.Length -gt 0) { [Array]::Copy($nb, 0, $pl, 48, $nb.Length) }
     if ($maplen -gt 0) { [Array]::Copy($missMap, 0, $pl, 48 + $nb.Length, $maplen) }
     $msg = [Oti]::Encode(4, $fid, $pl, $pl.Length)
-    $q0 = $script:txq.Count
     $rc = TxBody $msg
-    $q1 = $script:txq.Count
-    if ($q1 -gt 0 -or $rc -ne 0) { Write-Host "  [warn] 裁决发出去了吗？rc=$rc 队列 $q0→$q1（kind=$kind flags=$flags）" }
+    if ($rc -ne 0) { Write-Host "  [warn] 裁决入队/发送失败 rc=$rc（kind=$kind flags=$flags）" }
     return $rc
 }
 
@@ -2423,19 +2936,29 @@ function Send-TxPart([int]$idx) {
     [Oti]::Put32($pl, 40 + $nb.Length, [uint32]$n)
     if ($n -gt 0) { [Array]::Copy($buf, 0, $pl, 44 + $nb.Length, $n) }
     $msg = [Oti]::Encode(4, $t.fid, $pl, 44 + $nb.Length + $n)
+    # 发送端背压：设备写入速度有限，泵队列积压时等一等（此前直接入队 → 队列满静默丢帧，
+    # 实测 184MB 传输首轮丢 800+ 片）。与麒麟侧 send_wait 的阻塞语义对齐。
+    $bpN = 0
+    while ([CablePump]::PendingTx -gt 192 -and $bpN -lt 1000) {
+        Start-Sleep -Milliseconds 2
+        $bpN++
+    }
     $wrc = TxBody $msg
     if ($wrc -eq 0) {
         if ($t.todo) { $t.todoI++ } else { $t.sent++ }
         $t.doneParts++
     }
+    # 发送端限速：接收端/设备消化约 3MB/s，猛发会让设备写阻塞 ~1.28s，
+    # 期间 HID 注入写被堵 → 鼠标冻结（hidlat 实测 MAXGAP=1284ms）。
+    Start-Sleep -Milliseconds 20
     return $wrc
 }
 
 function Step-FileTx {
     # 接收端超时清理（对端掉线/中断时别把 .part 文件永远留着）
     $r = $script:fileRx
-    if ($r.active -and ((Get-Date) - $r.lastPart).TotalSeconds -gt 60) {
-        Write-Host "  [warn] 大文件接收超时（60 秒无新片），丢弃 $($r.name)（$($r.got)/$($r.nparts) 片）"
+    if ($r.active -and ((Get-Date) - $r.lastPart).TotalSeconds -gt 180) {
+        Write-Host "  [warn] 大文件接收超时（180 秒无新片），丢弃 $($r.name)（$($r.got)/$($r.nparts) 片）"
         try { if ($r.fs) { $r.fs.Close() } } catch { }
         try { Remove-Item -LiteralPath $r.partPath -Force -ErrorAction SilentlyContinue } catch { }
         $script:fileRx = New-RxState
@@ -2447,7 +2970,12 @@ function Step-FileTx {
     # 我这边 fid 大就先停，等对端传完（两边比较的是同一对数 → 不会双双停住）。
     if ($script:fileRx.active -and $t.fid -gt $script:fileRx.fid) { return }
     if ($t.phase -eq 1) {                       # 等裁决
-        if (((Get-Date) - $t.deadline).TotalSeconds -gt 30) { Abort-FileTx "等待对端校验超时（30 秒）" }
+        if (((Get-Date) - $t.deadline).TotalSeconds -gt 120) { Abort-FileTx "等待对端校验超时（120 秒）" }
+        # DONE 单帧丢失 → 收端永不裁决：每 5s 重发（幂等）
+        if ((Get-Date) -ge $t.verdictResend) {
+            $t.verdictResend = (Get-Date).AddSeconds(5)
+            [void](Send-FileCtrl $t.fid 1 0 $t.total $t.crc $t.nparts 0 $t.name)
+        }
         return
     }
     if ($null -eq $t.fs) {
@@ -2492,8 +3020,9 @@ function Step-FileTx {
     if ($allSent -and $t.phase -eq 0) {
         $rc = Send-FileCtrl $t.fid 1 0 $t.total $t.crc $t.nparts 0 $t.name
         $t.phase = 1
-        $t.deadline = (Get-Date).AddSeconds(30)
-        Write-Host "  [xfer] $($t.name) 全部 $($t.nparts) 片已发出，等待对端校验（crc=$('{0:x8}' -f $t.crc)）…"
+        $t.deadline = (Get-Date).AddSeconds(120)
+        $t.verdictResend = (Get-Date).AddSeconds(5)
+        Write-Host "  [xfer] $($t.name) 全部 $($t.nparts) 片已发出，等待对端校验（crc=$('{0:x8}' -f $t.crc)，最长 120s）…"
     }
 }
 
@@ -2525,7 +3054,7 @@ function Handle-FileVerdict([byte[]]$pl) {
     }
     if ($flags -band 4) { Abort-FileTx "对端放弃"; return }
     if ($flags -band 2) {                       # RESUME
-        if ($t.rounds -ge 3) { Abort-FileTx "重传 3 轮仍未通过校验"; return }
+        if ($t.rounds -ge 8) { Abort-FileTx "重传 8 轮仍未通过校验"; return }
         $t.rounds++
         $t.todo = $null; $t.todoI = 0
         $mapOff = 48 + $nl
@@ -2540,8 +3069,9 @@ function Handle-FileVerdict([byte[]]$pl) {
                 Write-Host "  [xfer] 对端位图为空（可能要求整份重发），从头发"
                 $t.sent = 0
             } else {
-                $t.todo = $todo
-                Write-Host "  [xfer] 对端缺 $($todo.Count) 片，按位图补发（第 $($t.rounds) 轮）"
+                # 补发也丢帧（W→K 小帧丢失率实测很高）→ 每个缺片补 3 份
+                $t.todo = @($todo | ForEach-Object { $_, $_, $_ })
+                Write-Host "  [xfer] 对端缺 $($todo.Count) 片，按位图补发 ×3（第 $($t.rounds) 轮）"
             }
         } else {
             if ($resume -ge $t.nparts) { $resume = $t.nparts - 1 }
@@ -2612,8 +3142,10 @@ function Handle-FileDone([byte[]]$pl) {
     if ($nl -le 1024 -and $pl.Length -ge (48 + $nl)) { $name = [Text.Encoding]::UTF8.GetString($pl, 48, $nl) }
     $r = $script:fileRx
     if (-not $r.active -or $r.fid -ne $fid) {
-        Write-Host "  [warn] 收到未知传输的 DONE（fid=$fid），回 ABORT"
-        [void](Send-FileCtrl $fid 2 4 0 0 0 0 $name)
+        # 已完成的 DONE 重发（发送端每 5s 重发、完成前也可能有在途副本）不该回 ABORT：
+        # 多文件批次共用同一 fid，一个"迟到 DONE"的 ABORT 会把整批（含后续文件）一起干掉。
+        # 实测：jpg 完成后迟到 DONE → 回 ABORT → 麒麟中止整批，jar 只发了 16 片。
+        Write-Host "  [xfer] 收到已完成/未知传输的 DONE（fid=$fid，name=$name），忽略"
         return
     }
     try { $r.fs.Flush(); $r.fs.Close() } catch { }
@@ -2660,7 +3192,8 @@ function Handle-FileDone([byte[]]$pl) {
     # 防回环：记下"我刚写进剪贴板的这份文件"的身份，下一轮轮询就不会再发回去
     $script:lastFileIdent = Get-FileIdent @($final)
     $script:haveFileIdent = $true
-    [void](Send-FileCtrl $fid 2 1 $r.total 0 $r.nparts $r.nparts $r.name)
+    # 裁决单帧会丢（帧通道静默丢帧）：冗余 3 份，发端幂等
+    for ($vi = 0; $vi -lt 3; $vi++) { [void](Send-FileCtrl $fid 2 1 $r.total 0 $r.nparts $r.nparts $r.name) }
     $script:fileRx = New-RxState
 }
 
@@ -2676,7 +3209,11 @@ function Send-ClipAck([uint32]$crc, [uint16]$fmt) {
     $pl = New-Object byte[] 8
     [Oti]::Put32($pl, 0, $crc); [Oti]::Put16($pl, 4, $fmt); [Oti]::Put16($pl, 6, 0)
     $msg = [Oti]::Encode(6, 0, $pl, 8)
-    return (TxBody $msg)
+    # 线缆帧通道会静默丢帧：ACK 单帧丢一次，对端就重发整笔并覆盖剪贴板（文件尤其明显）。
+    # 冗余 3 份（对端按 crc 匹配，幂等）。
+    $rc = TxBody $msg
+    for ($i = 0; $i -lt 2; $i++) { [void](TxBody $msg) }
+    return $rc
 }
 
 # 发送一份剪贴板载荷（首发/重发共用）；成功后登记"待对端确认"
@@ -2706,6 +3243,12 @@ function Send-ClipPayload([byte[]]$bytes, [int]$clipFmt, [uint32]$crc, [string]$
             } catch { $wrc = -1; Write-Host ("  [warn] TCP 写失败: " + $_.Exception.Message) }
         } else {
             $wrc = TxBody $msg
+            # 首次发送冗余 ×3：帧通道静默丢帧（实测 W→K 单帧偶发全丢 → 文字迟迟不过去）。
+            # 同一 fid 的重复包接收端幂等（已完整则忽略/重复应用同内容），重发路径不再加冗余。
+            if ($wrc -eq 0 -and -not $NoRegister) {
+                [void](TxBody $msg)
+                [void](TxBody $msg)
+            }
         }
         if ($wrc -ne 0) { Write-Host "  写帧失败 rc=$wrc" }
         $off += $n
@@ -2718,7 +3261,7 @@ function Send-ClipPayload([byte[]]$bytes, [int]$clipFmt, [uint32]$crc, [string]$
     # 登记待确认：对端应用后会回 ACK（type=6）。重发时**不重新登记**（否则重试计数被清零 → 无限重发）
     if (-not $NoRegister) {
         $script:clipAck = @{ active = $true; crc = $crc; fmt = $clipFmt; bytes = $bytes;
-                             deadline = (Get-Date).AddMilliseconds(1500); tries = 0 }
+                             deadline = (Get-Date).AddMilliseconds(2500); tries = 0 }
     }
     return 0
 }
@@ -2728,7 +3271,7 @@ function Step-ClipAck {
     $k = $script:clipAck
     if (-not $k.active) { return }
     if ((Get-Date) -lt $k.deadline) { return }
-    if ($k.tries -ge 3) {
+    if ($k.tries -ge 6) {
         Write-Host "  [warn] 剪贴板 $($k.bytes.Length) 字节重发 3 次仍无确认，放弃"
         $script:nAckFail++
         $k.active = $false; $k.bytes = $null
@@ -2740,19 +3283,23 @@ function Step-ClipAck {
     $t = $k.tries
     [void](Send-ClipPayload $k.bytes $k.fmt $k.crc '重发' -NoRegister)
     $k.tries = $t                       # Send-ClipPayload 不动它，这里显式保留
-    $k.deadline = (Get-Date).AddMilliseconds(1500)
+    $k.deadline = (Get-Date).AddMilliseconds(2500)
 }
 
 Write-Host "开始循环（Ctrl+C 退出）…"
+
+Write-Host ("线缆 I/O: 原生 C# 泵线程（build {0}）：读授权→读帧/写帧全在后台；PS 主循环只跟内存队列打交道，不再有 SPTI 阻塞" -f [CablePump]::BuildTag)
 Init-Tray
 $lastTray = [DateTime]::MinValue
 $lastPump = [DateTime]::MinValue
 # ---- 慢轮诊断（长期保留）：帧大量丢失的直接原因是"主循环整段卡住"，
-#      把"整轮间隔"与"取帧之前那段耗时"分开，一眼看出卡在哪一段。----
+#      把"整轮间隔"与"取帧之前那段耗时"分开，一眼看出卡在哪一段。
+#      cable 模式取帧已改成微秒级出队（C≈0），慢轮只可能是 PS 自己的剪贴板/文件处理。
 $script:lastIter0 = $null
 $script:slowLogAt = Get-Date
 $script:profPre = 0
 while ($true) {
+
     $iter0 = Get-Date
     if ($script:lastIter0) {
         $gapMs = ($iter0 - $script:lastIter0).TotalMilliseconds
@@ -2788,6 +3335,14 @@ while ($true) {
         Send-Hello
     }
 
+    # 0.1) 回传本机光标真实位置（OTI_MSG_CURSOR=11）：
+    #      cable 模式由泵线程每 40ms 自己采样发送（Send-Cursor 是 no-op），这里只维持
+    #      TCP/旧 SPTI 模式的 500ms 节奏。
+    if (((Get-Date) - $lastCursorTx).TotalMilliseconds -ge 500) {
+        $lastCursorTx = Get-Date
+        Send-Cursor
+    }
+
     # 0.6) 角色协商：本机输入探测（每 3s）/ 决策与起停 otiagent2（每 1s，I1/I4/L4）
     if (((Get-Date) - $script:roleLastProbe).TotalSeconds -ge 10) {
         # 间隔为什么是 20 秒：Get-PnpDevice 是 WMI 枚举，实测单次把主循环卡住 5.2 秒
@@ -2818,17 +3373,49 @@ while ($true) {
         }
     }
 
-    # 1) 取一条消息体（TCP = 4 字节长度前缀；SPTI = 从 64KB 帧里取，跳过空闲/非法帧）
+    # 0.8) 线缆泵健康 + 证据：每 5s 一行 PUMP（grep 用）；每 2s 检查线程/链路，死了就自动重启。
+    #      这是"拔插线缆自愈"的实现点：泵线程连续读写失败会自己退出并留下 Alive=false/LastErr，
+    #      这里用原来的 Find-CableDevice 重新发现（盘符可能变）→ Start-CablePump。
+    if ($useCable) {
+        if (((Get-Date) - $script:lastPumpLog).TotalSeconds -ge 5) {
+            $script:lastPumpLog = Get-Date
+            Write-Host ("PUMP " + [CablePump]::GetStats() + " pend=" + [CablePump]::PendingTx + "/" + [CablePump]::PendingRx + " idleRx=" + [CablePump]::IdleRxMs + "ms")
+        }
+        if (((Get-Date) - $script:lastPumpCheck).TotalSeconds -ge 2) {
+            $script:lastPumpCheck = Get-Date
+            $pumpDead = -not [CablePump]::Alive
+            # 卡死判据（满足其一）：
+            #   ① 20s 无入帧 且 发送队列 10s 排不空（原 PS 泵的自愈判据，保留）；
+            #   ② 30s 一次写帧都没成功 —— 单向坏链路时 Kylin 的 ROLE 每秒不断，入帧永远新鲜，
+            #      只看 ① 永远不会触发重启（这是旧逻辑的漏洞，真机 §57 类故障）。
+            $pumpStuck = (-not $pumpDead) -and
+                         ((([CablePump]::IdleRxMs -gt 20000) -and ([CablePump]::TxStuckMs -gt 10000)) -or
+                          ([CablePump]::TxStuckMs -gt 30000))
+            if (($pumpDead -or $pumpStuck) -and ((Get-Date) - $script:lastPumpRestart).TotalSeconds -ge 10) {
+                $script:lastPumpRestart = Get-Date
+                $why = if ($pumpDead) { "泵线程已退出（err=$([CablePump]::LastErr)）" }
+                       else { ("发送队列 {0}ms 未排空（idleRx={1}ms）" -f [CablePump]::TxStuckMs, [CablePump]::IdleRxMs) }
+                [void](Restart-CablePump $why)
+            }
+        }
+    }
+
+    # 大文件传输期间暂停 CURSOR 遥测（减少双向帧写争抢；文件传完自动恢复）
+    if ($useCable) {
+        $xferBusy = $script:fileRx.active -or $script:fileTx.active
+        [CablePump]::SuppressCursor = $xferBusy
+    }
+
+    # 1) 取一条消息体（TCP = 4 字节长度前缀；cable = C# 泵线程内存队列；SPTI = 直接读）
     $body = $null; $len = 0; $didWork = $false
     if ($useTcp) {
         $body = RxTcp
         if ($null -ne $body) { $len = $body.Length }
     } elseif ($useCable) {
-        $didWork = Pump-Cable
-        if ($script:rxq.Count -gt 0) {
-            $body = $script:rxq.Dequeue()
-            $len = $body.Length
-            $didWork = $true
+        # 设备 I/O 全在泵线程；这里只做微秒级出队（取到就交给下面的 switch 处理）。
+        $b = $null
+        if ([CablePump]::TryDequeueRx([ref]$b)) {
+            $body = $b; $len = $b.Length; $didWork = $true
         }
     } else {
         $rc = [Oti]::ReadFrame($h, $frame, 1)
@@ -2842,7 +3429,7 @@ while ($true) {
         } elseif ($Verbose -and $rc -ne 0) { Write-Host "  读失败 rc=$rc" }
     }
     if ($useCable -and -not $didWork -and $null -eq $body) {
-        Start-Sleep -Milliseconds 2      # 空闲小睡：既省 CPU 又不影响延迟
+        Start-Sleep -Milliseconds 2      # 空闲小睡：设备由泵线程排空，主循环只等内存队列
     }
     $script:profPre = ((Get-Date) - $iter0).TotalMilliseconds   # 取帧之后的那一段（见慢轮诊断）
     if ($null -ne $body -and $len -gt 0) {
@@ -2953,13 +3540,24 @@ while ($true) {
                                         $script:haveFileIdent = $true
                                     } else {
                                         $text = [Text.Encoding]::UTF8.GetString($clipRx.buf, 0, $clipRx.got)
-                                        Set-Clipboard -Value $text
-                                        $lastClipHash = [Oti]::Crc32([Text.Encoding]::UTF8.GetBytes($text), 0, [Text.Encoding]::UTF8.GetByteCount($text))
-                                        $haveClipHash = $true
+                                        # ⚠️ 剪贴板 API 在**锁屏/被别的进程独占**时会抛 ExternalException（真机实测：
+                                        # 锁屏时 Get/Set-Clipboard 都是 ~1.1s 后抛"打开剪贴板失败"）。这里**必须** catch：
+                                        # 不接的话整个代理会退出（2026-11-06 首次真机部署就因此在锁屏时挂过一次，
+                                        # clip.err 里是 Set-Clipboard ExternalException）——暂时应用不了剪贴板不该杀掉代理。
+                                        $applyOk = $true
+                                        try { Set-Clipboard -Value $text }
+                                        catch {
+                                            $applyOk = $false
+                                            Write-Host ("  [warn] 应用远端剪贴板失败（锁屏/剪贴板被占用？已忽略，代理继续）：" + $_.Exception.Message)
+                                        }
+                                        if ($applyOk) {
+                                            $lastClipHash = [Oti]::Crc32([Text.Encoding]::UTF8.GetBytes($text), 0, [Text.Encoding]::UTF8.GetByteCount($text))
+                                            $haveClipHash = $true
+                                            Write-Host "  CLIP 已应用远端剪贴板 $($clipRx.got) 字节（并抑制回发）"
+                                            if ($Verbose) { Write-Host ("  → 回执 ACK crc={0:x8}" -f $lastClipHash) }
+                                            [void](Send-ClipAck $lastClipHash ([uint16]1))
+                                        }
                                         $clipRx.active = $false
-                                        Write-Host "  CLIP 已应用远端剪贴板 $($clipRx.got) 字节（并抑制回发）"
-                                        if ($Verbose) { Write-Host ("  → 回执 ACK crc={0:x8}" -f $lastClipHash) }
-                                        [void](Send-ClipAck $lastClipHash ([uint16]1))
                                     }
                                 }
                             }
@@ -3139,4 +3737,5 @@ while ($true) {
 Write-Host "结束: 收到 $rx 条消息，注入 $injected 次，剪贴板发块 $txClip"
 try { if ($script:btnState -ne 0) { Apply-Buttons 0 } } catch {}   # 退出前松开所有按键
 if ($script:tray) { try { $script:tray.Visible = $false; $script:tray.Dispose() } catch {} }
+if ($useCable) { [void][CablePump]::Stop() }   # 先停泵线程（设备句柄由它关闭），再清 PS 侧句柄
 if (-not $useTcp) { [Oti]::CloseDevice($h) } else { $client.Close() }

@@ -4706,3 +4706,572 @@ xclip 写完 stdin 即退出，没有这个风险。
 
 
 
+
+---
+
+## 73 第 58 轮：现场「鼠标在 Windows 时右移没到边就回 Kylin」= 指针加速让计数≠像素；改为回传真实光标 + 锁屏不抢（2026-11-03）
+
+**报障原话**（用户）：「鼠标在windows时，有时候右移没到边就到了kylin」。
+**决策**（用户）：走 A（Windows 剪贴板代理回传真实光标位置）；锁屏看护「不抢」。
+
+### 73.1 复现（真机线缆 + 合成手势；先证明 park 没问题）
+
+用 `--sim-input --no-grab` 合成手势，Windows 侧用 DPI-aware `GetCursorPos` 读物理光标：
+- 交接 + `hid_park_remote_pointer` 后 Windows 光标确实到 **2559**（虚拟桌面右边缘，vright=2559）——
+  park 本身是好的（从 -1500 / 1316 各跑 3 次都到边）。
+- 然后**快左移 500 计数**（5×-100，10ms 间隔）、**慢右移 608 计数**（+2/30ms）。
+- 净计数 +100 时回程判据触发，此时 Windows 光标只有 **1491**，离右边缘还差 **1068px**。
+  麒麟日志：`回程判据：已把推出去的位移推回 68/16` → `HID 模式：指针拉回本机`
+  （`16` 是诊断里的旧阈值；真实阈值是 `max(100, edge_px*12)=100`，诊断值不一致也一并修了）。
+- 证据：`/tmp/acctest.out`（W_end=1491, vright=2559）、`/tmp/acc-gesture.txt`、麒麟 `/tmp/acc.log`。
+
+### 73.2 根因：回程判据用**未缩放 HID 计数**，而 Windows 对 HID 鼠标做指针加速
+
+本机注册表 `HKCU\Control Panel\Mouse`：`MouseSensitivity=10`、`MouseSpeed=1`、
+`MouseThreshold1/2=6/10`（“提高指针精确度”开）。快左移 + 慢右移后：
+计数净 +100，但像素位置由加速曲线决定，可能还差上千像素。park 只把**交接瞬间**的起点钉在边上，
+治不了路径相关的漂移。加大 park 或阈值都不能保证（实测净 +100 差 1068px；要保证到边得用接近
+整屏宽度的阈值，手感不可接受）——**必须有对端真实光标位置反馈**。
+
+### 73.3 修法
+
+1. **新协议消息 `OTI_MSG_CURSOR = 11`**（`PROTOCOL.md §6.2`）：Windows 代理（被驱动侧）
+   每个主循环回传 `GetCursorPos`，坐标减去 `SM_X/YVIRTUALSCREEN` 归一化到虚拟桌面
+   （0..VirtW-1），载荷 `i16 x, i16 y, u16 w, u16 h`（带虚拟桌面尺寸，不依赖 HELLO 的
+   10s 节奏，otikm 刚重启后的第一次交接也能立刻判边）。
+2. **Windows 代理**（`windows/otiagent.ps1`）：新增 `VirtX()/VirtY()`、`Send-Cursor`，
+   主循环里每 ≥500ms 发一条（cable 模式实测约 0.3~0.5s/条）。
+3. **主控端核心**（`otikm_core.c`）：回传 2.5s 内新鲜且远端几何已知 → **精确判据**：
+   只有回传确认光标在入口边（容差 edge_px），并且之后再往外推
+   `OTI_REM_CURSOR_PUSH=8` 个计数才回程；回传“不在入口边”时**不按计数回程**（计数清零重锚）。
+   回传缺失/过期 → 退回旧的 `max(100, edge_px*12)` 计数判据（兼容零软件端/旧 agent）。
+4. **锁屏看护改为“不抢”**（用户指令）：锁屏瞬间不再 `force_local + 释放独占 + 通知对端放手`；
+   只置 `screen_locked` 标志并打日志。捕获线程看到 `SWITCH_TO_REMOTE` 仍会拒绝
+   （锁屏期间不把键盘独占走，密码框收得到键）；要回麒麟解锁照常走鼠标回程，回程本身会释放独占。
+5. **诊断修正**：回程判据日志不再打 `edge_px*4=16` 的旧阈值；有回传时打
+   `对端光标 (x,y) 已在/未到入口边（Nms 前回传）`。
+
+### 73.4 真机验证（新代码 + 新 agent，真实线缆）
+
+**负向（修掉的现象）**：park 到 2559 后快左移 500 计数、慢右移 608 计数：
+```
+[67709.369] 回程判据：对端光标 (3358,750) 未到入口边（304ms 前回传）
+```
+Windows 光标停在 **1499**（离边 1060px），**没有回程**（旧代码在这里就切回 Kylin 了）。
+
+**正向（到边才回）**：同样的 park + 快左移，慢右移 1100 次（足够走回边缘）：
+```
+[67821.030] 回程判据：对端光标 (4439,750) 未到入口边（523ms 前回传）
+[67821.642] RECV CURSOR 对端光标 4479,750（虚拟桌面坐标）
+[67821.742] HID 模式：指针拉回本机（落点 96,540；…）
+```
+Windows 光标在回程时 = **2559**（右边缘；归一化 4479），再推 8 计数后 100ms 回程。
+**锁屏不抢**：
+```
+[67618.287] 锁屏看护: 已启用（每 500ms 看焦点窗口 WM_CLASS；锁屏期间不独占键盘）
+[67618.287] 屏幕已锁定/屏保 → 不抢控制权（保持当前所在侧；仅拒绝再交出去）
+```
+（旧日志是 `控制权拉回本机并释放独占`。）
+
+### 73.5 门禁 / 自测
+
+* `coretest` **51/51**（新增 1e：回传不在边不回程、到边再推 8 计数回程、回传过期退回计数）。
+* `selftest_proto` 全过（新增 CURSOR 组包/解包 3 项）。
+* `tools/psparse.ps1` 解析 `otiagent.ps1`：`ERRS=0`；`deploy.sh --restart` 已部署并重启剪贴板代理。
+* `--static`：77 PASS；唯一失败是 `doccheck` 的 **AGENTS.md `re/` 路径检查**在该工作树（根目录不叫
+  `re/`）下必然失败 —— 与本次改动无关（在原始 `re/` 布局下应通过；待 CI/仓库布局确认）。
+* 真机锁屏：Kylin 的 `ukui-screensaver-dialog` 自 11:32 起一直开着；新 otikm 启动日志确认“不抢”。
+* 真机 `--hw-kmb`：合成实例改为 `env -u DISPLAY`（无 X → 锁屏看护不可用，避免“锁屏拒绝交出去”
+  挡住纯回程逻辑回归）；Windows agent 在跑时 sim 也会收到 CURSOR，精确路径同样被覆盖。
+
+### 73.6 仓库与现网源码不一致（本轮顺带同步）
+
+公开仓库 HEAD（448fd60，10-14）落后于麒麟现网 `~/otilink`（10-27）：
+现网有未入库的**锁屏看护**（`otix11_lock_screen_active` + 500ms 探测）、`--sim-input` 不校准真实光标、
+`return_inset 60→96`。本轮把这批差异**一并入库**（否则 `gate.sh --deploy-kylin` 会用旧源码覆盖现网，
+把锁屏看护/sim 修正回退掉），再加 CURSOR/不抢。
+* 现网部署没有用 `--deploy-kylin`（它会 scp 全部脚本，覆盖现网更新的 `kmbret.sh`/`coretest.c`），
+  而是只 scp 7 个源文件 + `make otikm` + `label-kysec.sh` + 重启；仓库里的 kmbret 已改为 sim 不接 X。
+* 若以后从本仓库 `--deploy-kylin`，先确认现网的 `earlyoom-kylin.sh`/`kwin-guard.sh`/`watchdogreg.sh`
+  等未入库脚本是否需要保留（它们不在本次 PR 范围）。
+
+### 73.7 副作用 / 回滚
+
+* 麒麟：同步 7 个源文件、重编译 otikm、重打 KySec 标签、重启 otikm（键鼠/剪贴板短暂中断）；
+  生产实例已恢复为 `./otikm --auto --transport cable --keepalive 5000 --config …`，1 个进程。
+* Windows：`deploy.sh --restart` 重写 `C:\Users\yezi4\otilink\*.ps1` 并重启剪贴板代理（PID 变化，
+  剪贴板短暂中断）；`km.log`/`clip.log` 保留。
+* 回滚：还原 `otilink/{otikm.c,otikm_core.c,otikm_core.h,otiproto.c/h,otix11.c/h}` 与
+  `windows/otiagent.ps1` 后按同一路径重编译/重部署；协议新增 type=11 旧端会忽略，不致命。
+* 未验证：Windows 代理**停掉**时的回退路径（理论上退回旧计数判据；本次用 sim 的无回传路径
+  `kmbret` 覆盖）；多显示器不同 DPI 下的归一化（本机 4480x1440 已验证坐标=3236/4479）。
+
+### 73.8 回归修复（2026-11-03 16:15 现场）：「Windows 解锁后鼠标回 Kylin 无法输入」= 锁屏拒绝交接后核心仍 remote，看门狗重新 grab 键盘
+
+**报障原话**（用户）：「windows刚解锁，鼠标移到kylin无法输入」。
+
+**现场**：`/tmp/otikm.log` 每秒交替出现
+```
+[warn] 屏幕已锁定/屏保 → 不接管（键盘必须留给锁屏）
+已独占 SIGMACHIP USB Keyboard（驱动侧，避免本地与远端双重输入）
+```
+Kylin 锁屏对话框（`ukui-screensaver-dialog --lock`）在位，键盘一直被 otikm grab → 密码框收不到键。
+
+**真因**：`otikm_core_local_mouse()` 的撞边检测**先**把 `have_control` 置 0，`handle_local()` 的
+`screen_locked` 守卫**后**才拒绝并只 `break` → 核心留在 remote；`run_capture()` 的
+“驱动期维持独占”（`drv = !have_control`）每 500ms 重新 `apply_grab(1)`。上一版按“不抢”删掉锁屏时的
+`force_local + apply_grab(0)` 后，没有别处回滚这次**本机→对端**的失败交接。
+
+**修法**：两个 `screen_locked` 守卫（HID 路径 + 协议路径）拒绝时：
+`otikm_core_force_local()` + `apply_grab(0)` + `mx/my` 回屏幕中心。
+这是本机发起的交接尝试被拒绝，不是抢回对端正用的一侧，符合“锁屏不抢”。锁屏瞬间对**真正 remote**
+的会话仍不 `force_local`（保留用户“不抢”语义）。
+
+**现场处置 / 验证**：先 `pkill -x otikm` 释放键盘让用户输入密码；部署修复版后日志只有
+`屏幕已锁定/屏保 → 不抢控制权（保持当前所在侧；仅拒绝再交出去）`，`已独占` 计数 = 0；
+`coretest` 51/51。后续用户解锁后确认键盘可输入。
+
+---
+
+## 74 第 59 轮：2026-11-05「Windows 解锁后回 Kylin 键盘输入不了」= 麒麟内置 SOS 救援被 Win+H 误触发（`kysos_key`）
+
+**报障**：用户「windows解锁后，移动到kylin，键盘输入不了」（10:06，与 11-03「kylin蓝屏了」同一现象再现）。
+
+### 现场（SSH 仍通，桌面已死）
+* `cat /sys/class/tty/tty0/active` = **`tty5`**（X 在 `tty7`）→ 活动 VT 被切到空控制台。
+* `xinput list`：master 上只剩 XTEST，**所有**真实设备（SIGMACHIP 键盘 9/10/11、G304 8、AT Raw 14、线缆 HID 12/13）都是 `floating slave` → 桌面收不到任何输入。
+* `/var/log/Xorg.0.log`：`[149638] event* … device removed` ×11 → `AIGLX: Suspending AIGLX clients for VT switch`，之后再没回来。
+* `dmesg`：`[149638.542] PANIC: SOS rescue timeout! No feedback from userspace.` / `SOS count: 1, Feedback count: 0, Timeout count: 1` / `fb: framebuffer at …`；`getty@tty5` 同一秒启动。
+* `kworker/9:0`（`console_callback`）与 `(agetty)` 在 `console_lock` 上 D 态 >480s；`fgconsole` 也卡在 `tty_open` → `console_lock` 死锁（与 §71「蓝屏」同一层，但这次不是 panic 升级）。
+
+### 真因（从内核镜像里挖出来的）
+`/usr/src/linux-headers-*/scripts/extract-vmlinux` 解出 vmlinux 后 `strings`，kysos_key 的日志串：
+```
+KYSOS-KEY: SOS combination triggered: LEFTMETA+H
+KYSOS-KEY: SOS event reported to userspace
+PANIC: SOS rescue timeout! No feedback from userspace.
+```
+* 麒麟内核内置 `kysos_key`（`CONFIG_INPUT_KYSOS_KEY=y`，builtin，`/sys/kos_rescue/` 是它的接口），注册 `sos-handler` 挂在**所有**输入设备上（`/proc/bus/input/devices` 每个设备的 Handlers 都有 `sos-handler`）。
+* 它把**左 Meta + H** 当 SOS 组合键：触发后等 20s（`/sys/kos_rescue/rescue_delay`，范围 1000–60000），等用户态写 `/sys/kos_rescue/rescue_feedback=1` 确认；**没人确认就"救援"**：切 VT 到 tty5 + `getty@tty5` → `console_lock` 死锁 → X 摘掉全部输入设备。
+* 这台机器**没有**麒麟的用户态 SOS 处理器（`dpkg -l | grep -i sos` 只有 libfyba 的 SOSI；systemd 无对应 unit），所以每次触发必超时。
+* **为什么是"Windows 解锁后"**：键盘物理接在麒麟，otikm 用 EVIOCGRAB 抓它转发给 Windows —— 但 EVIOCGRAB 只挡其它 evdev 客户端，**挡不住内核 input handler**，所以用户在 Windows 上按 **Win+H（Windows 的"语音输入"快捷键）** 时，麒麟内核照样看到 `LEFTMETA+H` → 触发 SOS。11-03 16:20 那次「蓝屏」的 dmesg 也是同一串（`SOS rescue timeout`），两次是同一真因。
+
+### 修法（现场已部署 + 已回归）
+* 新增 `otilink/sosguard.sh` + `otilink/otilink-sosguard.service`：轮询 `/sys/kos_rescue/stats`，状态一离开 `IDLE`（`WAITING`）就写 `rescue_feedback=1`，救援被取消、不切 VT。代价：SOS 救援在本机不再生效 —— 它在本机只会死锁（§71/本条），保留没有收益。
+* `install-kylin.sh` 第 6 步安装/启用；`otilink/sosinject.c`（`make sosinject`）注入一次左 Meta+H 用于回归；新增门禁档 `gate.sh --hw-sos`（`otilink/sosreg.sh`）。
+* **现场验证**（10:28）：
+  ```
+  $ ./sosinject --wait 1        # 注入左 Meta+H
+  $ cat /sys/kos_rescue/stats
+  SOS triggered: 1
+  Feedback received: 1
+  Timeout count: 0
+  Current state: IDLE
+  $ cat /sys/class/tty/tty0/active
+  tty7
+  # /var/log/otilink-sosguard.log
+  2026-11-05 10:28:48 SOS 组合键（左 Meta+H）已被取消，state=WAITING
+  ```
+  → 内核收到了组合键，但守卫在超时前取消；VT 仍是 tty7，X 设备未动。
+* 现场处置：console_lock 死锁无法在线恢复（`chvt`/`fgconsole` 都卡），`sync; reboot -f` 重启；重启后 `tty7`、11 个输入设备全部挂回 master、otikm 正常。
+
+### 副作用 / 回滚
+新增 root systemd unit `otilink-sosguard`（只读 `/sys/kos_rescue`、写 `rescue_feedback`）。
+卸载：`systemctl disable --now otilink-sosguard && rm /etc/systemd/system/otilink-sosguard.service /usr/local/bin/sosguard.sh`。
+
+### 未完成 / 待观察
+* 用户实际按键路径未复现（无法确认他按的就是 Win+H；但内核日志明确是 LEFTMETA+H，且这是 kysos_key 唯一认的组合）。
+* 是否还有其它 SOS 触发源（内核串里只有 LEFTMETA+H 一个）。
+* `gate.sh --hw-sos` 首跑：envcheck PASS=23 FAIL=0 WARN=2、sosreg PASS=9 FAIL=0（2026-11-05 10:36，现网）。
+
+## 75 第 60 轮：现场「鼠标在 Windows 移动一卡一卡，Kylin 正常」= HID 直发逐事件写单队列设备（2026-11-05）
+
+**报障**（2026-11-05 17:38）：用户在 Windows 桌面上移动鼠标"一卡一卡"，同一只鼠标在 Kylin 上正常。
+拓扑是 **B**（物理键鼠插在 Kylin）：`otikm --auto` 日志里有 `已独占 Logitech G304（驱动侧…）`、
+`HID 模式：指针交给对端`，Windows 侧只跑剪贴板代理、键鼠零软件，所以 Windows 上的移动完全由
+麒麟侧的 **HID 直发**（每事件一条 16 字节 CDB）驱动。
+
+### 75.1 取证：需求 2000 次设备写/秒，而线缆单队列上限约 1078 次/秒
+
+* G304 是 **1000Hz** 鼠标；evdev 把一次物理报告拆成 `REL_X`、`REL_Y` 两个事件，`handle_local()`
+  对**每个事件**各调一次 `otilink_send_hid()` → 斜向移动约 **2000 次 SCSI 写/秒**（直线也 1000/秒）。
+* 真机实测（`/tmp/hidrate`，与在跑的 otikm **并发**，1500~2000 包，2026-11-05 17:47/18:04）：
+  ```
+  N=1500 elapsed=1392ms rate=1078/s maxsend=1ms fails=0   ← 空载、无大帧时
+  N=2000 elapsed=1842ms rate=1086/s maxsend=209ms fails=0
+  ```
+  即这条单队列设备在"otikm 的 RX 泵同时在轮询"时只有 **~1.0–1.1k 次写/秒** 的吞吐。
+  需求 2k/秒 > 上限 ⇒ 捕获线程永远追不上，内核 evdev 环形缓冲（64 事件）几十毫秒就溢出丢事件，
+  用户看到的正是"一卡一卡"；麒麟本地是原生指针，不经过这条设备，所以正常。
+* 同一时间窗还量到：只要链路上有大帧（剪贴板 653KB 图片重发/回传）或 Windows 侧帧操作，
+  `maxsend` 会到 **300–500ms**（`gate.sh --hw-lat` 在剪贴板大图同步期间 MAXGAP=319~502ms）——
+  这是 NOTES §61.1 记的"大块设备写堵 HID"，与本节是叠加关系，不是同一个修法。
+
+### 75.2 修法：HID 直发也按 4ms 合并位移
+
+`otilink/otikm.c` 的 HID 分支（`peer_hid` 且 `driving_now`）原来是逐事件直接写：
+
+```
+otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otilink_send_hid()
+```
+
+改成与协议路径 `pend_*` 相同的策略：
+
+* 累积 `hid_pend_dx/dy/wheel/buttons`，**每 4ms 或按键变化**时用 `hid_flush_mouse()` 发**一条**包；
+  一条包同时带 X/Y（也避免 Windows 对两个单轴包分别做指针加速）；
+* `poll(pf, 4ms)` 超时也 flush 尾包（`run_capture` 的 `pr == 0` 分支），保证最后一段位移不滞留；
+* 交接（SWITCH_TO_REMOTE / SWITCH_TO_LOCAL）时清空合并缓冲，避免把上一段的位移当"幽灵位移"
+  发给对端；`hid_flush_mouse()` 在锁外发送前用 `a->lock` 读一次 `have_control`，已收回本机就丢弃。
+
+效果：正常 1000Hz 鼠标的设备写从 **~2000 次/秒降到 ≤250 次/秒**（4ms 一包），
+为剪贴板/看门狗等大帧留出单队列余量。
+
+### 75.3 验证与未完成
+
+* 本地：`make otikm` 无错；`coretest` **51/51**；`gate.sh --static` **81 PASS / 0 FAIL**；
+  `gate.sh --deploy-kylin` PASS（麒麟侧编译 + KySec 标签重打）；部署后 otikm 恰好 1 个实例。
+* HID 方向独立探针（不经过 otikm）：`hidmove 40 10` → 返回 `fails=0`，Windows 光标从 -266 移到 566
+  （+832px，含 Windows 指针加速）—— 证明线缆 HID 鼠标通道本身是通的。
+* **`gate.sh --hw-lat` 未通过（MAXGAP 319ms）**，但两次失败都发生在**剪贴板大图正在同步/回传**
+  （otikm 日志同一时段有 `CLIP 发送 653143 字节` / `CLIP 应用远端剪贴板 653143 字节`）或
+  **用户正在真实移动鼠标**时；空载 hidrate 的 `maxsend=1ms`。这属于 §61.1 的大帧堵 HID，
+  不能算本次合并的回归，但也不能当作"卡顿已根治"的证据。
+* **未完成（关键）**：`--sim-input` 的合成手势是**串行**的（`run_sleep(1ms)` → 处理 → 下一条），
+  模拟不出"内核独立 1000Hz 到达、处理线程追不上"的积压；旧/新二进制在同一手势下都只送出 143 个包
+  （被剪贴板大帧堵住），A/B 不可判定。**真人复测**（鼠标在 Windows 上连续移动是否还卡）仍是最终判据。
+* 独立问题（不在本次改动内）：Windows 侧剪贴板代理主循环约 90% 单核 CPU、日志里有
+  `LOOP 慢轮…C[取帧] 1.3–3.9s`；`usb-storage` 仍有一个 D 态线程自开机挂住。若真人复测仍卡，
+  下一刀先查这两处与 §61.1 的大帧互斥。
+
+### 75.4 副作用 / 回滚
+
+* 只改 `otilink/otikm.c`；部署方式 `gate.sh --deploy-kylin` + 重启 otikm（已做，当前 1 个实例）。
+* 回滚：`git revert` 本提交 → `gate.sh --deploy-kylin` → 重启 otikm。
+* 现场临时文件：Kylin `/tmp/otikm-old`、`/tmp/merge-gesture.txt`、`/tmp/merge-*.log`、`/tmp/hidrate`、
+  `/tmp/hidmove`（调试用，可删）；Windows 剪贴板代理重启过一次（`restart-clip.vbs`，单实例守卫正常）。
+
+### 75.5 追加（2026-11-06）：4ms 合并后仍卡 → 主因线索转向 Windows 侧线缆读
+
+用户复测原话："还是会卡，hid鼠标转发会打断我鼠标移动吗？"
+
+* **1ms 采样 Windows 指针**（`CursorTrace.exe`，按位置变化记录）：连续移动中出现大量
+  **100–1400ms 的冻结**，最长一次 **2.49s**；同一时段 Windows 剪贴板代理日志的
+  `LOOP 慢轮 … C[取帧]` 为 **1.3–9s**，`OTI_MSG_CURSOR` 回传间隔经常 >1s。
+* 线缆是**单队列**设备：Windows 侧 SPTI 读未完成时，麒麟侧发来的 HID 鼠标包会被堵住
+  —— 这解释了"为什么合并设备写没根治"（卡在设备读，不在设备写速率）。
+* 追加改动（第二个提交）：`windows/otiagent.ps1` 主循环线缆**空闲轮询每轮 → 30ms**
+  （`txq/rxq` 非空时仍立即泵，剪贴板/大文件不降速），空闲小睡 2ms→10ms。
+  部署后日志有 `线缆轮询: 空闲 30ms … build pump-throttle-1`；安静窗口内
+  `LOOP 慢轮` 为 0、ROLE 回传 age ~0.3–1s。
+* **复现过程中遇到一次帧会话卡死**（不是本次改动回归）：Kylin `ERR send ROLE rc=526080`、
+  Windows 侧 160s 收不到帧；`usb 1-4.2` unbind/bind + 两端重启后恢复。
+  以后遇到"剪贴板全废 + 光标回传停"先按这个顺序复位，别只重启单侧。
+* **仍未确认**：真人复测手感；代理进程 CPU 仍约 **99% 单核**（空闲小睡收益没达到预期，
+  下一步可把线缆 I/O 移出主循环或用更短 SPTI 超时）。
+
+### 75.6 有界超时实验失败 + 改为 HID 优先（2026-11-06）
+
+用户同意"可以动设备会话"后，试了两端的有界超时：
+
+* 麒麟：消息读（16 字节）SG_IO 超时 5000ms → **200ms**；
+* Windows：`ReadMsgP` 的 SPTI `TimeOutValue` 5s → **1s**（SPTI 最小单位是秒）。
+
+**结果：帧通道直接卡死**（不可用，已回滚）：
+
+* 麒麟侧 653KB 剪贴板重发 3 次全无 ACK；`/tmp/otikm.log` 没有 `ERR recv`（超时走 `-2`，是静默路径）。
+* Windows 代理日志 `ROLE: peer 未收到`、`设备连续读取失败，尝试重连`、`会话自愈：20s 无入帧…` 反复出现。
+* 结论：这块线缆固件/驱动的消息读在正常竞争下就可能要 >200ms；SPTI 更不能低于 1s，1s 已经会 abort。
+  **不要再用"缩短读超时"来救 HID 卡顿**。
+
+**保留的改动：HID 优先（弱版）**：
+
+* `otilink.c/h` 增加 `otilink_cdb_len_to()` / `otilink_msg_read_to()`（超时参数，默认仍是 5000）；
+* `otitrans.c/h` 增加 `oti_tr_set_msg_timeout()`、`oti_tr_set_hid_busy()`；`cable_pump_once()` 在
+  HID 包正在写设备时**不开始**新的消息读；
+* `otikm.c` 的 `hid_flush_mouse()` 在发 HID 包期间置 busy、发完清除。
+
+这是"不要在 HID 写的时候插读"，不是"把读超时调短"；但**已经开始的 5s 读仍会把设备占住**，
+所以只能减少碰撞概率。若用户复测仍卡，剩余根因是 Windows SPTI 读无法取消（最小 1s 超时），
+真正的修法只能是 Windows 侧 overlapped SCSI + `CancelIoEx`（50ms 级取消）或改传输/角色架构。
+
+## 76 第 61 轮：现场「鼠标来回不顺畅 + 在 Windows 移动一段时间卡几秒」= Windows 侧读帧节奏太慢堵住单队列设备（2026-11-06）
+
+**报障**（2026-11-06 10:59）："现在鼠标在 windows 和 kylin 之间来回不顺畅，而且在 windows 移动一段时间会卡几秒。"
+
+拓扑 B（物理键鼠插在 Kylin，Kylin 是主控、HID 直发；Windows 侧只跑剪贴板 PowerShell 代理）。
+上一轮（§75）把 HID 直发改成 4ms 合并、把 Windows 代理轮询降到 30ms、加了 HID 优先窗口，**仍不够**。
+
+### 76.1 决定性取证：HID 写被"帧写"堵在单队列设备上
+
+* 线缆设备 `/sys/block/sdb/device/queue_depth = **1**`（USB BOT 单队列）——HID 注入写与帧管道
+  共用同一条 SCSI 设备，**任何一条命令阻塞，后面的 HID 写全部排队**。
+* 现状基线（Windows 剪贴板代理在跑，麒麟 `hidlat` 与 otikm 并发 20s）：
+  ```
+  GAP  353ms (send 343ms) / GAP  253ms (send 243ms) / ... MAXGAP=482 GAPS_OVER_200=11
+  ```
+* 临时 trace 版 otikm（逐条 SCSI 命令计时，见 `/tmp/iotest.c` 方法）在 650KB 剪贴板同步期间：
+  ```
+  d9 2a ff 00 dir=1 len=65536 rc=0  耗时 250~700ms（单帧写！）
+  ```
+* **对照实验**：把 Windows 侧换成一个原生紧凑读帧循环（`C:\Users\Public\fastpump.cs`，
+  只读不处理，~2000 次 msg read/s），同样触发 650KB 剪贴板传输：
+  ```
+  hidlat: MAXGAP=14 GAPS_OVER_100=0 SEND_FAIL=0
+  trace:  d9 2a 每帧 2~4ms；fastpump 侧帧读 max 3ms、msg read max 9ms
+  ```
+  → **结论：帧写单次耗时完全取决于对端（Windows）读帧的及时性；Windows PowerShell 主循环
+  1.3~9s/轮、取帧可阻塞数秒，导致麒麟侧每帧写阻塞数百 ms，把 HID 写堵住数百 ms~数秒。**
+  这也解释了为什么 §75 的"合并设备写"没根治：堵在**读**，不在写速率。
+* 补充实测（`/tmp/iotest`，无竞争）：`0xD8` 消息读 0~1ms 返回（m0=0x01，不阻塞）、
+  `0xD9/0x28` 帧读无数据时立即 -90；短超时（20ms）本身不会弄坏设备。
+  → 上一轮"缩短读超时"失败（§75.6）的真正原因是对端消费问题，不是超时本身。
+* 现场另一个 bug：当前 `otikm` 的"HID 优先窗口"（鼠标移动期间 `g_hid_busy` 跳过整个消息泵）
+  在用户持续移动时会饿死 CURSOR/ROLE：`ERR send ROLE rc=-2（连续 1 次）` 每秒刷、
+  CURSOR 遥测过期 → 回程判据永远拿不到"远端光标已到入口边" → **用户现场卡在 Windows 回不来**
+  （日志 `回程判据：对端光标 (x,y) 未到入口边` 反复出现）。这属于**我们上一轮引入的回归**。
+
+### 76.2 重新设计（本轮施工）
+
+1. **Windows 侧线缆 I/O 移出 PowerShell 主循环**：在 `otiagent.ps1` 的内嵌 C# 里新增
+   `CablePump` 后台线程，独占 `\\.\H:` 做紧凑 loop（`ReadMsgP(0xD8,pending)` → 0x05 读帧 /
+   0x06/0x07 写帧），帧体经内存队列与 PS 交换；CURSOR 遥测（20~50ms）与 ROLE/HELLO 心跳
+   由该线程原生发送。PS 只做剪贴板/文件/角色逻辑，主循环不再碰设备。
+2. **麒麟侧**：删除"HID 优先窗口"（不再暂停消息泵）；新增**慢操作守卫**——帧写单次 >30ms
+   判定"对端消费慢"，暂停帧写 300ms（指数退避到 2s），期间 HID 与消息泵照常；背景心跳帧
+   在慢窗口内可合并/丢弃，剪贴板数据不丢。`otilink_send_hid` 的 trylock 补丁收敛为短等待。
+3. **交接/回程**：以 20~50ms 的**真实光标回传**为主判据（远端光标贴入口边 + 继续外推 ≥16 计数）；
+   遥测过期且有历史遥测时等待新遥测（≤300ms），不再退回"计数 100 就揪回"；零软件/旧对端保留
+   兼容计数判据。交接时用已知远端光标计算 park 位移（首轮无遥测才用饱和位移，最多 8 包）。
+4. 新增客观回归：`otilink/hidduringclip.sh`（650KB 剪贴板突发期间 hidlat MAXGAP 阈值）、
+   `otilink/winfreeze.sh`+`cursortrace.cs`（Windows 光标 1~2ms 采样，量化冻结）、交接延迟测量。
+
+### 76.3 本轮实现（2026-11-06 已部署两端的代码）
+
+1. **Windows 剪贴板代理（`windows/otiagent.ps1`，BuildTag `nativepump-2`）**：
+   * 在原有内嵌 C# 里新增 `CablePump` 后台线程：独占 `\\.\H:`，紧凑循环
+     `ReadMsgP(0xD8,pending)` → `0x05` 读帧（每次最多 4 帧）→ `0x06/0x07` 写帧
+     （**每次授权最多 2 帧**，让 HID 有插空机会）；`CURSOR(11)` 由泵线程每 40ms
+     用 `GetCursorPos` 原生发送，`ROLE/HELLO/注入模式` 由 PS 更新载荷、泵线程按 1s/10s 重发。
+   * PowerShell 主循环**不再做任何设备 I/O**，只 `EnqueueTx/TryDequeueRx` 内存队列；
+     剪贴板/大文件/角色/托盘逻辑保持原实现。会话自愈：泵线程连续失败退出 → PS 重新
+     发现设备重启泵（含拔插后盘符变化）。
+   * 修掉一个**旧崩溃**（新泵让帧更快到达后暴露）：锁屏时 `Set-Clipboard` 抛
+     `ExternalException` 而旧代码未捕获 → 整个代理退出。现在 catch + `[warn] 应用远端剪贴板失败…`
+     + **不 ACK**（不伪装成功）。
+   * 实测：CPU 从 ~90-99% 单核降到 **~9%**；`clip.log` 每 5s 一行
+     `PUMP rx=.. tx=.. maxread=..ms maxwrite=..ms resets=.. drop=..`。
+2. **麒麟传输层（`otilink/otitrans.c|h`、`otilink.c|h`、`otikm.c`）**：
+   * 逐命令计时 API（`otilink_io_*`）；**慢操作守卫**：帧写单次 >30ms → 退避 300ms 起、
+     连续慢指数退避到 2s，窗口内只暂停帧写（消息泵/帧读/HID 照常）；帧读慢独立退避。
+   * 删除上一轮引入的"HID 优先窗口"（鼠标移动期间暂停整个消息泵）——它是现场
+     "CURSOR 遥测饿死 → 回不来"的直接原因；消息泵保持 10ms 级持续轮询。
+   * **写入侧 HID 优先（按需启用）**：初始关闭；帧写 >10ms 才启用。启用后 HID 写成功后
+     50ms 内不发起帧写；队首帧饥饿 >1000ms 放行 1 帧。新原生泵场景完全不触发。
+   * `oti_tr_send()` 线缆后端**只入队、零设备 I/O**（捕获线程绝不被慢帧写阻塞）。
+   * 背压：PING/HELLO/ROLE/CURSOR 同类新覆盖旧；CLIP/键鼠/ACK/大文件片不主动丢。
+3. **交接/回程判据（`otilink/otikm_core.c|h`）**：真实光标回传（TTL 300ms）+ 远端入口边
+   ±16px + 继续外推 ≥16 未缩放计数才回程；连续"在边"遥测不重锚（慢推能累计）；
+   遥测过期冻结、不退回"计数 100 就揪回"；从未有遥测的零软件/旧端保留计数兼容；
+   交接 park 按已知远端光标估算（32~64 包，单次 HID 写 >20ms 提前中止），日志记
+   `交接耗时 Nms`。
+4. **新增门禁**：`gate.sh --hw-clipstall`（`otilink/hidduringclip.sh`）与
+   `--hw-freeze`（`otilink/winfreeze.sh` + `cursortrace.cs`），登记见 `AGENTS.md §5/§6`。
+
+### 76.4 验收数据（真机，2026-11-06 12:0x-12:3x）
+
+| 指标 | 修复前（旧 Windows PS 代理） | 修复后（nativepump-2 + 新麒麟传输层） |
+|---|---|---|
+| 空闲/剪贴板突发期间 HID 写最大间隔（`hidlat`） | **MAXGAP=372~482ms**（`GAPS_OVER_200`>0） | **MAXGAP=15ms，GAPS_OVER_40=0，SEND_FAIL=0**（650KB 文本反复下发期间实测） |
+| 麒麟侧 `SLOWOP`（慢帧写）计数 | —（旧代码无此守卫） | **0**（Windows 原生泵帧写 2~4ms，不触发） |
+| 拓扑 B 回程手势（`kmbret`） | 旧判据依赖 1.3s 级遥测，慢推/过期时不可靠 | **PASS=21 FAIL=0 WARN=4**：小步 2px/次外推能回程、park 37 包、`交接耗时 15ms`、Windows 光标位移 -960px |
+| Windows 代理 CPU | ~90-99% 单核 | ~9~10% 单核 |
+| Windows 光标冻结（`winfreeze`/`hidduringclip`） | 历史 100~1400ms，最高 2.49s | **待测**（需 otikm 处于 HID 驱动态/用户解锁，见 §76.5） |
+
+证据行（可复核）：
+* `C:\\Users\\Public\\clip.log`：`OTiLink 剪贴板代理 build nativepump-2`、
+  `线缆泵: build nativepump-2 dev=\\.\\H:`、每 5s `PUMP rx=.. tx=.. maxread=..ms maxwrite=..ms`
+* 麒麟 `hidlat`：`MAXGAP=15 GAPS_OVER_40=0 SEND_FAIL=0`
+* 麒麟 `/tmp/otikm.log`：`写入侧 HID 优先: 疑似慢对端时…`、`交接耗时 15ms（→远端…）`
+
+### 76.5 未验证 / 待用户确认（必须如实标注）
+
+1. **剪贴板端到端**：验收时 **Windows 处于锁屏**（logonui），`Set-Clipboard/Get-Clipboard`
+   在锁屏下必然 `ExternalException`（实测 ~1.1-1.2s 后抛）→ 只能验证"麒麟侧已下发 + Windows
+   泵已收到帧"，**未能验证应用/ACK**。用户解锁后需补：文本/图片各一次双向复制粘贴
+   （`clipreg.sh` 17 项作为正式判定）。
+2. **Windows 光标冻结客观值**（`winfreeze`）：需 otikm 真正处于"HID 模式：指针交给对端"
+   时用合成 HID 驱动才有效（本机控制态直写 HID 包对 Windows 光标几乎无效，实测 130×dx=40 只动 2px）；
+   本轮锁屏+时间窗未跑出有效数字。**用户手感复测是最终判据**。
+3. `clipreg.sh`/`xferreg.sh` 本轮未跑（锁屏下剪贴板全链路不可用）；解锁后补跑。
+4. Kylin 部署的二进制 `src=` 指纹与本地预期不同（`f3d4a82e706a` vs `c500f6867430`）：
+   Kylin `~/otilink` 里存在仓库外的历史 `.c` 文件，`SRC_SHA` 把全部 `*.c|*.h` 计入，属**指纹口径**
+   差异，不影响运行；后续可让 `gate.sh --deploy-kylin` 先清理多余源码或用显式文件清单。
+5. 锁屏期间 Windows PS 主循环 ~1.2s/轮（剪贴板 API 阻塞），泵 rx 队列偶满、丢最旧
+   ROLE/背景帧（tx 不丢）；解锁后应自愈。若长期锁屏可加"每轮最多处理 N 帧"硬化（未做）。
+8. **解锁后正式回归（2026-11-06 13:1x）**：`gate.sh --hw-clip` 最佳 **PASS=15 FAIL=2**（多次跑跳动 12~15 PASS），
+   失败项全是"内容乱序/陈旧覆盖"（收到上一笔的 14 字节旧内容）而非帧解码失败；`clipshort` 7/7 过。
+   为定位做了逐帧 trace（临时 build，已恢复）：
+   * ACK **确实到达**，但**迟到**：`RECV ACK crc=…（待确认=… active=0）` —— 到达时发送端已 3 次重发后放弃；
+   * Windows 原生泵 `ENQ type=6 → TXF type=6` 间隔实测 **~1.1s**；`cable.log` 同期持续 `SLOWOP frame-write 250~330ms`；
+   * 机制：`0x06/0x07` 授权窗口每次只写 2 帧 + CURSOR 25/s 入队 > 授权写速 ~20/s → txq 长期积压 ~1s，
+     后入队的 ACK/CLIP 排在陈旧 CURSOR 后面 → 超过发送端 1.5s ACK 期限 → 重发风暴 → 旧帧在新帧之后被应用（乱序）。
+   * 尝试：Windows `nativepump-4`（CURSOR 40→100ms + 每次授权写 4 帧）在噪声较大的一轮未变好（PASS=12），
+     **已回退到验证过手感/hidlat 的 nativepump-2**；Kylin 读侧退避阈值 30→150ms 保留（避免读退避自伤 ACK 时延）。
+   * 下一轮修法建议（未做）：① 按实际授权速率自适应 CURSOR 周期（或"txq 有积压时降 CURSOR 频率/丢旧 CURSOR"）；
+     ② ACK 期限 1.5s→2.5s + 重发次数 3→4（容忍慢 ACK）；③ 剪贴板按 fid 单调性丢弃迟到的旧内容（根治乱序覆盖）；
+     ④ 量化设备"每秒授权次数"，据此给 pump 设定 per-auth 帧数上限与 CURSOR 节奏。
+
+7. **仓库/真机一致性修正（2026-11-06 12:35）**：首版提交 `108887e` 里的
+   `windows/otiagent.ps1` 被误带入了**未部署、未验证**的 `nativepump-3` 硬化（批量出队≤16 帧、
+   rx 满优先丢背景帧、光标静止 200ms 心跳+慢写 300ms 退避）。**真机验收跑的是 `nativepump-2`**；
+   已把仓库文件恢复为**与部署件逐字节一致**的 nativepump-2（sha256 已核对），nativepump-3 的
+   差异另存 `/tmp/nativepump-3.patch`（未经真机验证，下一轮评估；不要直接部署）。
+   教训：**提交前必须核对部署件 sha256 == 仓库文件 sha256**（本次差点把未验证代码当成交付物）。
+
+6. **新发现（待查，不影响功能）**：Windows 解锁后双向剪贴板均能落地（Windows 侧日志
+   `CLIP 已应用远端剪贴板 29 字节（并抑制回发）`、麒麟侧 `CLIP 应用远端剪贴板 29 字节…`），
+   但**麒麟→Windows 方向发端收不到 ACK**（麒麟日志 `剪贴板未确认 → 重发 3 次 → 放弃`，而
+   Windows 每次都应用成功并显示 ACK 已发）。后果：同一笔最多多发 3 遍（新泵下每帧 2~4ms，
+   650KB≈30 帧≈100ms 设备时间，用户无感）。疑点：ACK 帧（type=6）在某一侧 rx/tx 队列/合并
+   路径被吞，或 ack crc 口径不一致；下一轮用 `-Verbose` 或临时 trace 定位。
+
+### 76.5.1 环境干扰：火绒（Huorong）安全软件拦截 VBS/隐藏 PowerShell（2026-11-06 现场）
+
+* 用户现场报告：**`vendor-off.vbs` 被火绒拦截**（已手动加信任区）。
+* 影响面（本轮实测到的"假失败"）：
+  * `deploy.sh --restart` / `restart-clip.vbs` 拉起代理**间歇失败**，日志只剩 `已有一个剪贴板代理在跑` 或
+    "代理没起来"——排查中反复遇到，不是代码 bug；VBS 脚本起不来时单实例守卫会看到正在退出的旧进程而自杀。
+  * 被拦截/挂起的隐藏 PowerShell 进程会让**剪贴板代理主循环**停在早期启动阶段（pump 线程仍在跑：
+    CURSOR 帧照发，但 PS 不轮询剪贴板、不处理收到的 CLIP），表现就是"鼠标正常、剪贴板时好时坏"。
+* 处置（给用户）：把 `C:\Users\<用户名>\otilink\`（`otiagent.ps1`、`restart-clip.vbs`、`restart-km.vbs`、
+  `clip-watchdog.vbs`、`otilink-agent.vbs`）与 `C:\Users\Public\vendor-off.vbs`、`otiagent2.exe` 加入火绒信任区；
+  之后重启剪贴板代理（双击 `restart-clip.vbs` 或 `cd re/windows && ./deploy.sh --restart`）。
+* 结论：**安全软件对本项目是"第二主人"级别的干扰源**（相当于 L1 的另一种形态），排障时先确认它没拦。
+
+### 76.7 文件剪贴板/大文件排查（2026-11-06 15:00–15:40，用户报"文字能复制、文件不行"）
+
+**实测矩阵（当前部署：Windows nativepump-12 + 麒麟本轮传输改动）**
+* 文本：麒麟→Windows **可应用**（`Get-Clipboard` 校验）；Windows→麒麟 **时通时不通**。
+* 文件（用户给的 `test.jpg` 1.6MB / `test.jar` 302MB，麒麟桌面）：
+  * `test.jpg` 麒麟→Windows **通过**：Windows 剪贴板出现 1 个文件（解到 `Temp\otilink_files_*`）。
+  * `test.jar` 麒麟→Windows **到 93% 卡住**：见下。
+  * Windows→麒麟 文件：**不通**（Windows 侧日志有 `CLIP 发送 52 字节 fmt=3 源=文件`，麒麟侧无任何 `RECV CLIP`）。
+
+**本轮查到的两个真问题**
+1. **Windows 泵"限量 2 帧/授权"造成 ACK/CLIP 排不上队**（已修）：改成每次授权把 txq 写完；同时 CURSOR 40ms→150ms、
+   队列 64→256、PS 跟不上时**背压**（不读进队列丢，让设备缓冲把对端写堵慢）。
+   实测 302MB 大文件从上一版 22%（丢 78%）→ **93%**，接收端 3.2MB/s 稳定，`[xfer] 接收 … 93.1%`。
+2. **Windows→麒麟方向 type=4（CLIP）帧仍然丢**（未修完）：大文件到 93% 后，Windows 反复
+   `[warn] … 缺 252 片，回缺片位图（从第 0 片起）`，麒麟日志里**没有任何**收到裁决/缺片的记录 →
+   RESUME 控制帧没到。同一条链路上小帧（CURSOR/ROLE/ACK）能到、PS 入队的 CLIP 帧不到，
+   与之前"ENQ 有、TXF 无、RXF 无"的观测一致，怀疑在 Windows 泵写 PS 帧的路径（待下一轮定点测）。
+   帧通道本身有 40% 量级静默丢帧（NOTES 旧结论），控制帧（DONE/RESUME/VERDICT）必须冗余+可重发。
+
+**已部署的配套修复（本轮）**
+* ACK 双端冗余 3 份；重发策略 1.5s×3 → 2.5s×6（容忍慢 ACK，避免重发风暴覆盖剪贴板）。
+* 大文件：DONE 每 5s 重发、等裁决 30s→120s、接收端"无新片"超时 60s→180s、完成裁决 ×3。
+* 麒麟：读侧退避阈值 30→150ms（读退避会自伤 ACK 时延）；写入侧 HID 守卫默认关闭（动鼠标时会把 CLIP/ACK 饿死）。
+* 回归：`gate.sh --hw-lat` PASS=5 FAIL=0（改动后 HID 最大间隔仍达标）。
+
+**未完成（下一轮）**
+* Windows→麒麟 CLIP 帧丢失的定点定位（建议给 Windows 泵加每帧 ENQ/TXF/RXF 日志 + 记录写 rc）；
+* `test.jar` 302MB 端到端 md5（当前停在 93%，RESUME 丢失后失败）；
+* `clipreg` 正式回归（当前仍受 ACK 延迟/乱序影响，最佳 15/17）。
+
+### 76.8 用户指定文件实测：test.jpg / test.jar 双向（2026-11-06 15:50–16:15）
+
+**结果（md5 级证据）**
+* 麒麟→Windows `test.jpg`（1,608,614B）：**PASS**，Windows 侧多份副本 md5 全部 `d500bb783e970bbca44cbba3c42765bc`（与麒麟原文件一致）。
+* 麒麟→Windows `test.jar`（302,812,732B）：**未完成**。最好一轮 4705/4732 片（99.4%，~301MB），`.part` 文件已是全长但**缺 27 片**（md5 `1d80597e…` ≠ 原 `053dd5bc…`）；错片补发后仍收不到 → 发送端 120s 超时中止。
+* Windows→麒麟 `test.jpg`：**PASS**，`/tmp/otilink-files-2297957/test.jpg` md5 `d500bb78…` 与原件一致。
+* Windows→麒麟 `test.jar`：**未能测**（jar 只能靠 K→W 传输放到 Windows，而该方向未完成；302MB 走 SSH relay 拷贝中途连接被关）。
+
+**本轮修掉的 bug（已部署）**
+1. **重复裁决把多文件批次误判完成**：Windows 侧裁决 ×3 冗余，麒麟 `oti_xfer_tx_poll` 每收到一份都走 OK 分支 → `done_files++/cur++`，2 个文件的批次只传完第 1 个就报"本批全部完成"。修：只在 `phase==1` 处理裁决，OK 分支先 `phase=0`；实测 `忽略重复裁决 flags=0x1（phase=0）`、`开始发送 test.jar` 正常。
+2. **末片补发只等 RESUME**：RESUME 也是单帧会丢（实测 Windows 连发 10+ 份，麒麟只收到 1 份）→ 补发一次后永久卡住。修：等裁决期间每 10s 主动重发 `todo` 缺片（"未收到裁决，主动补发 N 片"），DONE 每 5s 重发。
+
+**当前会话状态（重要）**：连续 2 小时大文件测试 + 多次 abort 后，线缆会话明显劣化（两侧帧写反复 ~1.28s、单帧丢包高；最后一次 1.6MB 传了 44.7s 且对端回 ABORT）。
+**处置：物理拔插对拷线两端**（文档里的通用复位），再重启两端代理；先测小文件，大文件留到下次。
+
+### 76.9 拔插复位后重测（2026-11-06 16:23–16:55）
+
+用户物理拔插对拷线两端后重测（两端进程重启、设备重新枚举）。
+
+**结果**
+* 文本：麒麟→Windows **PASS**（`RECV ACK crc=… active=1`，无重发）；Windows→麒麟 **PASS**（约 10s 内应用，`CLIP 应用远端剪贴板 14 字节`）。
+* 文件 `test.jpg`：麒麟→Windows **PASS**（md5 一致）；Windows→麒麟 **PASS**（此前已验 md5）。
+* 文件 `test.jar` 302MB：麒麟→Windows 最好 **99.1%（4691/4732 片）**，之后永远差 **23 片**；
+  发送端每 10s「主动补发 23 片 ×3」，接收端每份 DONE 都回「缺 23 片」——**补发帧一封都没到**，
+  120s 后中止。接收端 `.part` 为全长但缺片（md5 不符）。
+* 大文件期间速率正常段 **3.2 MB/s**；`test.jpg` 因同时按"图片 + 文件"两种格式发（fmt=2 1.6MB + fmt=3/xfer），
+  前段被图片剪贴板应用拖慢（30s+），jar 阶段恢复。
+
+**本轮修的 bug（已部署）**
+1. **迟到 DONE 触发 ABORT 把整批杀掉**：多文件批次共用一个 fid，jpg 完成后发送端仍在重发 DONE，
+   Windows 收到"未知传输的 DONE"直接回 ABORT → 麒麟中止整批，jar 只发 16 片。两端都改成
+   "已完成/未知 DONE 一律忽略、不回 ABORT"。
+2. **缺片补发要按帧确认**：补发改为每片 ×3；但实测仍然一封都不到（见下）。
+3. **大文件期间暂停 CURSOR 遥测**（`nativepump-13`：`CablePump.SuppressCursor`，传输中 1s/帧）——
+   减少双向帧写争抢；实测传输前段仍慢（图片应用导致），恢复后 3.2MB/s。
+
+**未解决（下一轮重点）**
+* 末片补发帧**系统性不到达**接收端：接收端 PS 主循环仍在回 RESUME（说明 rx 泵活着），但补发帧
+  既不计数也不报错。怀疑：① 麒麟 `send_wait` 在慢写窗口内返回 -2 而补发循环忽略了 rc（帧根本没入队）；
+  ② Windows 泵背压（rxq 接近 256）与 PS 主循环消费速度在末段形成饥饿。下一步：
+  给`tx_send_part` 补发加 rc 检查+退避重试（确认真正入队），并给 Windows 泵加"每帧 ENQ/TXF/RXF+写返回码"日志定位。
+* Windows→麒麟 302MB 未测（jar 未成功落到 Windows）。
+
+### 76.10 末片补发修复与最终重测（2026-11-06 16:44–17:00）
+
+**修复：末片补发改为"逐片确认入队 + 退避重试"**
+原实现一次连发 23 片×3=69 帧，而传输层 txq 只有 32 槽且慢写退避会让 `oti_tr_send_wait`
+返回 -2（根本没入队）；旧代码忽略 rc → 接收端永远差那 23 片。
+现在逐片 `tx_send_part` 检查 rc，非 0 退避 5ms 重试（最多 40 次），片间 2ms 间隔。
+
+**验证（md5 级）**
+* **20MB 文件麒麟→Windows：PASS**。`t20.bin` 328 片 8.2 秒（2.4MB/s），接收端 md5
+  `5c98fa5aee02ed66774907ebb0607ed3` 与源一致（本批大文件全部完成）。
+* **302MB test.jar 仍卡在 99.0%（4687/4732）**：这次连"RESUME 缺片位图"都没到麒麟
+  （Windows 每份 DONE 都回「缺 28 片」，麒麟日志无任何 RECV 裁决）→ 无缺片清单可补，
+  120s 后中止。即**根因在 Windows→麒麟方向控制帧（RESUME）的投递**，不是补发逻辑本身。
+* test.jpg 双向仍 PASS；文本双向 PASS。
+
+**下一轮唯一重点**：把"接收端缺片状态"可靠送到发送端。候选：
+① 接收端 RESUME 冗余 ×5 并在每次收到 DONE 时重发（已重发，但单帧丢失率太高）；
+② 发送端在收不到 RESUME 时**盲补最近 N 片**（例如最后 64 片）作为兜底；
+③ 分片窗口内逐片 ACK（改动大，但根治）；
+④ 给 Windows 泵加逐帧 ENQ/TXF/RX + 写 rc 日志，先确认 RESUME 到底写没写出去。
+
+### 76.11 两个根因落定：agent 内 WMI 挂死 + 大文件无节流把鼠标堵死（2026-11-06 17:00–18:00）
+
+**根因 A：Windows 剪贴板代理的 PS 主循环卡在 WMI/PnP 调用上（"W→K 文字文件都不行"）**
+* 用启动探针（`C:\Users\Public\psmark.log`）定位：主循环卡在
+  `Update-LocalInput → Test-HotplugInput → Get-PnpDeviceProperty`（PnP 属性查询在 agent 进程内
+  **永不返回**；新开 PowerShell 里同样的查询 0.3s 返回 → 是该 host 的 WMI 客户端状态问题，换会话即好）。
+  卡住期间泵线程照跑（CURSOR 还在发），但 PS 不轮询剪贴板/不发 CLIP → 用户看到"W→K 完全不通"。
+* 修：`Get-CimTimed`（独立 runspace + 1.5s 超时）与 `Test-HotplugInput` 的 1.2s 超时兜底；
+  超时后本会话停用该探测、按"可热插拔"处理。修后探针显示 `loop#201` 正常、W→K 文字 4 秒内到达。
+
+**根因 B：大文件传输无节流 → 设备帧写阻塞 ~1.28s → HID 注入写排队 → 鼠标冻结**
+* `hidlat` 在 302MB 传输进行中实测：**MAXGAP=1284ms**（19 次 >40ms）—— 用户"复制时鼠标不能动"属实。
+* 机理：接收端约 50 片/秒（2.5~3.2MB/s），设备缓冲很小；发送端猛发把设备写堵住，
+  单次帧写退化成 ~1.28s，期间 HID 写只能排队。
+* 修：**两端 xfer 发送按每片 20ms 限速**（≈3.2MB/s，与接收端匹配）。
+* 修后同条件实测：**MAXGAP=28ms / GAPS_OVER_40=0 / SEND_FAIL=0**（远低于 40ms 验收线）。
+
+**本轮其它可靠性修复（nativepump-20~23）**
+* CLIP 首发包冗余 ×3（同 fid，接收端幂等）—— W→K 文字从"重发 6 次不到"变成 4 秒内到。
+* xfer 缺片补发 ×3、重传轮次 3→8；发送端背压（`PendingTx>192` 等待）。
+* 同修：迟到/未知 DONE 不再回 ABORT（否则多文件批次被在途 DONE 杀掉）。
+
+**最终实测（md5 级）**
+* Windows→麒麟 `test.apk` 192,768,115B：**PASS**，md5 `147488f92368e3a9eefc117bbc27e94a` 两端一致（73.9s，2.5MB/s）。
+* 麒麟→Windows `test.jar` 302,812,732B：**PASS**，md5 `053dd5bccb9446eb9a8380e439673a31` 两端一致（116.8s，2.5MB/s）。
+* 文字双向 PASS；传输期间 HID MAXGAP=28ms（鼠标不卡）。
+
+### 76.6 现场应急（本轮已做）
+
+* 11:37 对 Kylin `~/otilink/otitrans.c` 做了**临时热修**（`if (0 && g_hid_busy)`）并重启 otikm，
+  先解掉"移动期间消息泵饿死 → 回不来"；该文件随后被团队最终代码覆盖。
+* 回滚：`git checkout --` 对应文件 + `gate.sh --deploy-kylin` + 重启；Windows 侧
+  `cd re/windows && ./deploy.sh --restart` 回到备份的 otiagent.ps1。

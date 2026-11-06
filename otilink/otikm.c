@@ -132,6 +132,15 @@ struct app {
     int   pend_dx, pend_dy, pend_wheel, pend_buttons;
     int   pend_abs_x, pend_abs_y, pend_dirty, sent_buttons;
     long  last_mouse_tx_ms;
+    /* HID 直发（拓扑 B）的鼠标位移合并。每个 evdev 事件都发一次 SCSI 写：
+       G304 是 1000Hz，且 REL_X / REL_Y 是两个独立事件 → 2000 次设备写/秒，
+       而实测线缆 HID 写上限约 1000 次/秒（hidrate：956~1086/s，偶发 200~340ms
+       的大停顿）→ 捕获线程积压、evdev 环形缓冲溢出 → 用户看到"在 Windows 上
+       移动一卡一卡"（麒麟本地是原生指针，所以正常）。
+       按 4ms 合并（与协议路径 pend_* 的间隔一致）；按键变化立即发。 */
+    int   hid_pend_dx, hid_pend_dy, hid_pend_wheel, hid_pend_buttons;
+    int   hid_pend_dirty, hid_sent_buttons;
+    long  hid_flush_ms;               /* 上次真正发 HID 鼠标包的时刻 */
     int abs_last_x, abs_last_y, abs_have;  /* 收到绝对坐标时换算相对位移用 */
     long hello_last_ms;               /* 上次发 HELLO 的时间 */
     struct oti_clip clip;
@@ -162,6 +171,10 @@ struct app {
     int         send_reset_tries;     /* W5：连续"写侧故障窗口"次数（2 次就升级到 USB 复位） */
     long        send_hint_ms;         /* W5：无权限提示的节流时刻 */
     long        last_return_ms;      /* 被驱动侧撞边交还的节流时刻 */
+    /* 锁屏/屏保看护（2026-10-27）：屏幕锁定时**绝不独占键盘**，否则密码框收不到键。
+       由 RX（消息泵）线程每 500ms 探测一次并写；捕获线程只读这个标志（不碰 X）。 */
+    volatile int screen_locked;
+    long        lock_probe_ms;
     volatile int want_vendor_return; /* 撞边后请求主线程去通知厂商端（避免与消息泵抢授权） */
     volatile int want_token;         /* 请求消息泵线程发 F24 回程令牌（捕获线程自己发会被吞） */
     volatile int want_release_all;   /* 请求消息泵线程发"全零释放包"（切回本地前，先于令牌） */
@@ -373,7 +386,11 @@ static void role_apply_pending(struct app *a)
             int px, py;
             pthread_mutex_lock(&a->lock);
             a->core.have_control = 1;          /* 指针归我：本地原生用，推到边缘才交出去 */
-            if (otix11_pos(&px, &py) == 0) { a->core.mx = (int16_t)px; a->core.my = (int16_t)py; }
+            /* 同上：sim 模式不拿真实光标校准，core 起点固定=屏幕中心（手势文件按它设计） */
+            if (!a->cfg.sim_input && otix11_pos(&px, &py) == 0) {
+                a->core.mx = (int16_t)px;
+                a->core.my = (int16_t)py;
+            }
             pthread_mutex_unlock(&a->lock);
             say(a, "ROLE 生效：master（键鼠在本机，抓取已切到本机设备）");
         } else {
@@ -589,6 +606,7 @@ static void hid_send_state(struct app *a, struct otilink_dev *cd)
             a->n_hid++;
             a->hid_fail_streak = 0;
             a->hid_last_ok_ms = now_ms();
+            oti_tr_note_hid_activity(a->tx);   /* 写入侧 HID 优先：50ms 内推迟帧写 */
         } else if (++a->hid_fail_streak >= 20) {
             break;
         }
@@ -619,44 +637,88 @@ static void return_landing_xy(const otikm_core *c, int *ox, int *oy)
 }
 
 /* 交接时把对端光标"停"在入口边。HID 鼠标只有相对位移、不能直接定位，但可以用一段
-   **饱和位移**把它顶到那条边上。
+   位移把它顶到那条边上（过冲由系统夹在边上，无害）。
    为什么必须做（2026-09-21 真机）：状态机里的"入口边"是从**零位移**起算的，而对端光标的
    真实位置是上次用完留在那里的；更糟的是用户可能在对端把光标顶在屏幕边上继续推
    （位移被系统夹住、画面不动），这些"看不见的位移"全记进 drv_*：之后用户原路推回来
    也到不了阈值 —— 表现就是"怎么推都回不来"。顶到入口边后，"推出去多少推回来多少"
    的镜像判据就与用户眼睛看到的一致了（协议/绝对坐标路径本来就是这个语义）。
-   数量：覆盖远端虚拟桌面（未知按 4480 兜底），上限 64 包（8128 计数）。 */
-static void hid_park_remote_pointer(struct app *a, struct otilink_dev *cd,
+
+   2026-11-06（第 61 轮）两个改动：
+     * 有真实光标遥测（cursor_ever）时，按**最近一次已知远端光标位置**估算到入口边的
+       距离（Kylin 持控期间对端光标不动，旧遥测的位置仍然有效）：计数 ≈ 距离×2 + 128
+       余量（Windows 指针加速下 1 计数 ≈ 0.5~1px，取保守值；过冲会被夹边吸收）。
+       包数上限 64、估算路径下限保护 = 至少 32 包（4064 计数）。没有遥测（零软件/旧端）
+       时退回按远端虚拟桌面尺寸的**饱和位移**（未知按 4480x1440 兜底）。
+     * **耗时保护**：park 期间若单次 HID 写 >20ms（设备被慢对端/大帧拖住），立即中止
+       剩余 park —— 交接绝不能卡在这里（用户会感觉"顿一下"）。日志 `park 提前中止 n/N`。
+   返回实际发出的包数（调用方用于"交接耗时"日志）。 */
+static int hid_park_remote_pointer(struct app *a, struct otilink_dev *cd,
                                    int entry_x, int entry_y)
 {
-    int rw = a->core.rem_w > 0 ? a->core.rem_w : 4480;
-    int rh = a->core.rem_h > 0 ? a->core.rem_h : 1440;
+    /* 几何优先用 CURSOR 载荷自带的虚拟桌面（Windows 现场 3584x1152），
+       HELLO 的 10s 心跳只当兜底。 */
+    int rw = a->core.rem_cur_w > 0 ? a->core.rem_cur_w
+             : (a->core.rem_w > 0 ? a->core.rem_w : 4480);
+    int rh = a->core.rem_cur_h > 0 ? a->core.rem_cur_h
+             : (a->core.rem_h > 0 ? a->core.rem_h : 1440);
     int dx = 0, dy = 0;
-    if (entry_x == 0) dx = -(rw + 128);
-    else if (entry_x == 1) dx = rw + 128;
-    if (entry_y == 0) dy = -(rh + 128);
-    else if (entry_y == 1) dy = rh + 128;
+    int max_pk = 64;
+    if (a->core.cursor_ever && a->core.rem_cur_w > 0 && a->core.rem_cur_h > 0) {
+        /* 估算路径：只算要找的那一轴（交接通常是左右方向）。 */
+        int need_px = 0;
+        if (entry_x == 0)      need_px = a->core.rem_cur_x + 1;
+        else if (entry_x == 1) need_px = rw - a->core.rem_cur_x;
+        else if (entry_y == 0) need_px = a->core.rem_cur_y + 1;
+        else if (entry_y == 1) need_px = rh - a->core.rem_cur_y;
+        if (need_px < 0) need_px = 0;
+        int need_cnt = need_px * 2 + 128;      /* ×2 安全系数 + 128 计数余量 */
+        int need_pk = (need_cnt + 126) / 127;
+        if (need_pk < 32) need_pk = 32;        /* 下限保护：宁多勿少（过冲无害） */
+        if (need_pk > 64) need_pk = 64;
+        max_pk = need_pk;
+        if (entry_x == 0)      dx = -need_cnt;
+        else if (entry_x == 1) dx =  need_cnt;
+        else if (entry_y == 0) dy = -need_cnt;
+        else if (entry_y == 1) dy =  need_cnt;
+    } else {
+        /* 无遥测：按远端虚拟桌面尺寸做饱和位移，64 包封顶。 */
+        if (entry_x == 0) dx = -(rw + 128);
+        else if (entry_x == 1) dx = rw + 128;
+        if (entry_y == 0) dy = -(rh + 128);
+        else if (entry_y == 1) dy = rh + 128;
+    }
     if (!dx && !dy)
-        return;
+        return 0;
     uint8_t pkt[OTI_HID_PKT_LEN];
     int sent = 0;
-    while ((dx || dy) && sent < 64) {
+    while ((dx || dy) && sent < max_pk) {
         int cx = dx > 127 ? 127 : (dx < -127 ? -127 : dx);
         int cy = dy > 127 ? 127 : (dy < -127 ? -127 : dy);
         otihid_mouse_report(a->mouse_buttons, (int16_t)cx, (int16_t)cy, 0, 0, pkt);
+        long t0 = now_ms();
         int rc = otilink_send_hid(cd, OTI_HID_TYPE_MOUSE, pkt);
+        long dt = now_ms() - t0;
         note_send_result(a, rc);
         if (rc == 0) {
             a->n_hid++;
             a->hid_fail_streak = 0;
             a->hid_last_ok_ms = now_ms();
+            oti_tr_note_hid_activity(a->tx);   /* 写入侧 HID 优先：50ms 内推迟帧写 */
         } else if (++a->hid_fail_streak >= 20) {
             break;                            /* 链路故障：交给看门狗交还本机 */
         }
         dx -= cx;
         dy -= cy;
         sent++;
+        if (dt > 20) {
+            /* 设备被慢对端/大帧拖住：交接不能卡在 park 上（目标 <100ms）。 */
+            say(a, "park 提前中止 %d/%d（单次 HID 写 %ldms > 20ms，避免交接卡住）",
+                sent, max_pk, dt);
+            break;
+        }
     }
+    return sent;
 }
 
 /* 键盘事件走**帧管道**（OTI_MSG_KEY）而不是 HID —— 线缆的 HID 键盘接口有固件缺陷
@@ -706,13 +768,21 @@ static void return_landing_store(struct app *a, int *ox, int *oy)
 static void return_landing_warp(struct app *a, int tx, int ty)
 {
     int px = -1, py = -1;
+    /* sim 模式（无硬件回归）不碰真实光标：虚拟指针与桌面光标无关，
+       拿真实光标校准会把合成手势的坐标抹掉（见 handle_local 里的同款说明）。 */
+    if (a->cfg.sim_input)
+        return;
     if (otix11_pos(&px, &py) != 0)
         return;
     /* 只在真实光标**贴在出口边**（grab 期间它不会动，回程时通常就在那儿）时，
        才把它挪到落点；如果它在别处（多屏/用户刚动过），挪动就会变成
        "光标跳一大截"（用户报障：从 Windows 回来时光标跳动、移位）。
-       这时改为**用真实光标校准状态机**，谁都不动。 */
-    int m = a->core.edge_px + 8;
+       这时改为**用真实光标校准状态机**，谁都不动。
+       2026-10-27（#3）：安全区从 edge+8(=12px) 提高到 return_inset(=96px)。
+       原来 12px 太小：真实光标在 20~90px 时既不挪动、core 又停在落点，
+       用户回程后手指的惯性尾巴（十几像素）就能再次撞边被交出去
+       （日志实证：拉回本机后 2~3 秒又"交给对端"）。 */
+    int m = otikm_core_return_inset(&a->core);
     int near = 0;
     switch (a->core.edge) {
     case OTI_EDGE_LEFT:   near = px <= m; break;
@@ -721,13 +791,15 @@ static void return_landing_warp(struct app *a, int tx, int ty)
     default:              near = py >= a->core.screen_h - 1 - m; break;
     }
     if (near && (px != tx || py != ty) && otix11_warp(tx, ty) == 0) {
-        say(a, "回程落点 %d,%d：真实光标 %d,%d → 已同步", tx, ty, px, py);
+        say(a, "回程落点 %d,%d：真实光标 %d,%d 贴出口边 → 已挪到安全区（离边 %dpx）",
+            tx, ty, px, py, m);
     } else if (!near) {
         pthread_mutex_lock(&a->lock);
         a->core.mx = (int16_t)px;
         a->core.my = (int16_t)py;
         pthread_mutex_unlock(&a->lock);
-        say(a, "回程：真实光标在 %d,%d（不贴出口边）→ 不挪动，按它校准", px, py);
+        say(a, "回程：真实光标在 %d,%d（离出口边 >%dpx）→ 不挪动，核心坐标已按它校准",
+            px, py, m);
     }
 }
 
@@ -759,6 +831,52 @@ static void flush_mouse(struct app *a)
     a->pend_dx = a->pend_dy = a->pend_wheel = 0;
     a->sent_buttons = a->pend_buttons;
     a->last_mouse_tx_ms = now_ms();
+}
+
+/* HID 直发模式的鼠标合并发送（与 flush_mouse 的区别：载体是**设备 HID 包**，
+   不是协议帧）。为什么必须合并：见 struct 里 hid_pend_* 的注释 ——
+   逐个 evdev 事件写设备会把线缆单队列打满，输入线程追不上 1000Hz 鼠标。
+   ⚠️ 只在"仍在对端驱动中"时发：交接/看门狗可能已经把控制权收回，
+   这时发出去的就是"幽灵位移"（对端光标乱跳）。 */
+static void hid_flush_mouse(struct app *a)
+{
+    if (!a->hid_pend_dirty)
+        return;
+    a->hid_pend_dirty = 0;
+    int dx = a->hid_pend_dx, dy = a->hid_pend_dy, wheel = a->hid_pend_wheel;
+    int buttons = a->hid_pend_buttons;
+    a->hid_pend_dx = a->hid_pend_dy = a->hid_pend_wheel = 0;
+    a->hid_sent_buttons = buttons;
+    a->hid_flush_ms = now_ms();
+    pthread_mutex_lock(&a->lock);
+    int local_now = a->core.have_control;
+    pthread_mutex_unlock(&a->lock);
+    if (local_now)
+        return;                            /* 已经回到本机：丢弃这段位移 */
+    struct otilink_dev *cd = oti_tr_cable_dev(a->tx);
+    if (!cd)
+        return;
+    /* 描述符每轴只有 1 字节有符号 → 大位移必须拆成多包 */
+    uint8_t pk[8 * OTI_HID_PKT_LEN];
+    int np = otihid_mouse_packets(buttons, dx, dy, wheel, pk, 8);
+    /* 【2026-11-06 删除"HID 优先窗口"】原逻辑在鼠标移动期间调 oti_tr_set_hid_busy(1)
+       让消息泵跳过整轮设备读，只在"鼠标停了 30ms"或"指针在入口边 400px 内"时才恢复。
+       真机证明它害处大于收益：泵一停 CURSOR/ROLE 遥测就饿死 → 交接/回程判据失灵
+       （现场"鼠标回不来"），而且它并不能根治"慢帧写堵 HID"（那由传输层慢操作守卫处理）。
+       现在消息泵持续 10ms 级轮询，HID 写与帧写只靠 otilink_cable_io_lock 的
+       "读授权→写帧"窗口互斥（HID 拿不到锁最多等 10ms，见 otilink_send_hid）。 */
+    for (int i = 0; i < np; i++) {
+        int hrc = otilink_send_hid(cd, OTI_HID_TYPE_MOUSE, pk + i * OTI_HID_PKT_LEN);
+        note_send_result(a, hrc);
+        if (hrc == 0) {
+            a->n_hid++;
+            a->hid_fail_streak = 0;
+            a->hid_last_ok_ms = now_ms();
+            oti_tr_note_hid_activity(a->tx);   /* 写入侧 HID 优先：50ms 内推迟帧写 */
+        } else {
+            a->hid_fail_streak++;
+        }
+    }
 }
 
 /*
@@ -1052,7 +1170,12 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
        为什么要对齐：本机指针走 X 的加速曲线，而状态机按 evdev 原始位移积分，
        两者会漂移；用户报障“鼠标还没推到边就切到 Windows”（漂移让状态机以为已到边）。
        ~60Hz 对齐一次（16ms）：压住漂移，又不给每个鼠标事件都加一次 X 往返。仅主控端本地态做。 */
-    if (is_mouse && !a->cfg.return_on_edge) {
+    /* 2026-10-27：`--sim-input`（无硬件回归）时**不做光标校准**。
+       合成手势没有 X 加速，真实光标也不会动（--no-grab），拿真实光标校准等于
+       每 16ms 把模拟位移抹掉一次 —— kmbret 会因此"推不到边、永远不切换"
+       （实测：状态机被钉在 860，24 次 -50 全被吃掉）。这也解释了它过去为什么
+       时好时坏：真实光标恰好贴在出口边时校准反而帮了忙，鼠标在中间时就不行。 */
+    if (is_mouse && !a->cfg.return_on_edge && !a->cfg.sim_input) {
         long nw = now_ms();
         if (nw - a->cursor_sync_ms >= 16) {
             int px = -1, py = -1;
@@ -1169,6 +1292,7 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
             return;                     /* 被驱动侧永不接管、永不转发 */
         }
         pthread_mutex_lock(&a->lock);
+        otikm_core_set_now(&a->core, now_ms());
         otikm_act act = is_mouse ? otikm_core_local_mouse(&a->core, m, &sw)
                                  : otikm_core_local_key(&a->core, k, &sw);
         int driving_now = !a->core.have_control;
@@ -1196,6 +1320,7 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                         nsup, n_sup);
             }
         }
+        long sw_t0 = now_ms();               /* 本次交接动作耗时测量的起点 */
         switch (act) {
         case OTI_ACT_LOCAL:
             break;                            /* 指针在本机：本地消费 */
@@ -1205,9 +1330,6 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                 /* 回程判据诊断（节流 1s，只在"用户正往入口边推"时打）：
                    下次再遇到"回不来"，日志里就有证据（推回多少 / 阈值 / 入口在哪边）。 */
                 if (driving_now) {
-                    int need = a->core.edge_px * 4;
-                    if (need < 8)
-                        need = 8;
                     int prog = 0;
                     if (drv_ex == 1) prog = drv_x;
                     else if (drv_ex == 0) prog = -drv_x;
@@ -1216,24 +1338,48 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                     long nw = now_ms();
                     if (prog > 0 && nw - a->drive_log_ms >= 1000) {
                         a->drive_log_ms = nw;
-                        say(a, "回程判据：已把推出去的位移推回 %d/%d（入口边 x=%d y=%d）",
-                            prog, need, drv_ex, drv_ey);
+                        int cur_fresh = a->core.rem_cur_valid && a->core.rem_cur_w > 0 &&
+                                        nw - a->core.rem_cur_ms >= 0 &&
+                                        nw - a->core.rem_cur_ms <= OTI_REM_CURSOR_TTL_MS;
+                        if (a->core.cursor_ever) {
+                            /* 2026-11-06：判据 = 真实光标在入口边（容差 edge_px*4）
+                               + 继续外推 OTI_REM_CURSOR_PUSH(16) 未缩放计数。
+                               遥测过期时**只等新帧**、绝不退回计数（现场"揪回"bug）。 */
+                            int at = a->core.rem_edge_confirmed;
+                            if (!cur_fresh) {
+                                say(a, "回程判据：遥测过期 %ldms（等待新帧再判，绝不退回计数；"
+                                       "已累计外推 %d/%d；入口边 x=%d y=%d）",
+                                    nw - a->core.rem_cur_ms, prog, OTI_REM_CURSOR_PUSH,
+                                    drv_ex, drv_ey);
+                            } else {
+                                say(a, "回程判据：对端光标 (%d,%d)%s（%ldms 前回传；"
+                                       "已外推 %d/%d；远端桌面 %dx%d；入口边 x=%d y=%d）",
+                                    a->core.rem_cur_x, a->core.rem_cur_y,
+                                    at ? " 已在入口边" : " 未到入口边",
+                                    nw - a->core.rem_cur_ms, prog, OTI_REM_CURSOR_PUSH,
+                                    a->core.rem_cur_w, a->core.rem_cur_h, drv_ex, drv_ey);
+                            }
+                        } else {
+                            /* 兼容路径：对端从未回过 CURSOR（零软件/旧 agent）。 */
+                            int need = a->core.edge_px * 12;
+                            if (need < 100)
+                                need = 100;
+                            say(a, "回程判据（无光标回传，退回计数）：已把推出去的位移推回 %d/%d（入口边 x=%d y=%d）",
+                                prog, need, drv_ex, drv_ey);
+                        }
                     }
                 }
-                /* 描述符每轴只有 1 字节有符号 → 大位移必须拆成多包 */
-                uint8_t pk[8 * OTI_HID_PKT_LEN];
-                int np = otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8);
-                for (int i = 0; i < np; i++) {
-                    int hrc = otilink_send_hid(cd, OTI_HID_TYPE_MOUSE, pk + i * OTI_HID_PKT_LEN);
-                    note_send_result(a, hrc);
-                    if (hrc == 0) {
-                        a->n_hid++;
-                        a->hid_fail_streak = 0;
-                        a->hid_last_ok_ms = now_ms();
-                    } else {
-                        a->hid_fail_streak++;
-                    }
-                }
+                /* 合并位移后再写设备：HID 鼠标只有相对位移，4ms 内把 REL_X/REL_Y
+                   （以及按钮/滚轮）合成**一条**包；否则 1000Hz 鼠标每轴一个事件，
+                   每秒 2000 次设备写会把单队列打满（见 struct 里 hid_pend_*）。 */
+                a->hid_pend_dx += m->dx;
+                a->hid_pend_dy += m->dy;
+                a->hid_pend_wheel += m->wheel;
+                a->hid_pend_buttons = m->buttons;
+                a->hid_pend_dirty = 1;
+                if (m->buttons != a->hid_sent_buttons ||
+                    now_ms() - a->hid_flush_ms >= 4)
+                    hid_flush_mouse(a);
             } else {
                 send_key_frame(a, cd, k->code, k->value);
             }
@@ -1273,7 +1419,18 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                 say(a, "[warn] 角色未确认为 master（对端尚未让位）→ 暂不接管（I1）");
                 break;
             }
+            /* 2026-11-03 用户现场：Kylin 锁屏后鼠标要能主动推到 Windows。
+               锁屏期间**不再拒绝本机→对端的交接**（旧守卫会把用户困在锁屏上）。
+               “不抢”仍然成立：锁屏**瞬间**不会 force_local 把对端正在用的一侧拉回来；
+               用户主动推边交出去后，键盘会随交接独占（这是用户明确要的动作），
+               要回麒麟照常走回程手势，回程会释放独占。 */
             otihid_kbd_reset(&a->kbd);        /* 新的一段转发，从干净状态开始 */
+            /* 上一段驱动里没来得及发的合并位移不能算到这一段（否则一切过去就跳一下） */
+            a->hid_pend_dirty = 0;
+            a->hid_pend_dx = a->hid_pend_dy = a->hid_pend_wheel = 0;
+            a->hid_sent_buttons = a->mouse_buttons;
+            a->hid_flush_ms = now_ms();
+            /* （2026-11-06 删除 HID 优先窗口：不再调 oti_tr_set_hid_busy） */
             /* 告诉对端"我接管了，你回到被动"：只有对端是**厂商/零软件端**时才需要 F24 令牌。
                对端跑我们的 agent 时它不驱动 KM，令牌纯属浪费 —— 而且真机实测线缆的键盘接口
                每个会话只送得动**几条**报表，这 6 条 F24 会把额度吃掉，导致随后用户按键全丢
@@ -1285,13 +1442,34 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
                 /* 把对端光标顶到入口边：让"入口边=0 位移"的模型与用户看到的一致 */
                 pthread_mutex_lock(&a->lock);
                 int ex = a->core.rem_entry_x, ey = a->core.rem_entry_y;
+                int cur_known = a->core.cursor_ever && a->core.rem_cur_w > 0 &&
+                                a->core.rem_cur_h > 0;
+                int cur_x = a->core.rem_cur_x, cur_y = a->core.rem_cur_y;
+                int cur_w = a->core.rem_cur_w, cur_h = a->core.rem_cur_h;
                 pthread_mutex_unlock(&a->lock);
-                hid_park_remote_pointer(a, cd, ex, ey);
-                say(a, "HID 模式：指针交给对端（开始把键鼠发成 HID 包；对端光标已停在入口边 x=%d y=%d）",
-                    ex, ey);
+                long t_park0 = now_ms();
+                int npk = hid_park_remote_pointer(a, cd, ex, ey);
+                long park_ms = now_ms() - t_park0;
+                say(a, "HID 模式：指针交给对端（开始把键鼠发成 HID 包；对端光标已停在入口边"
+                       " x=%d y=%d；park %d 包 %ldms；%s）",
+                    ex, ey, npk, park_ms,
+                    cur_known ? "按已知遥控光标估算" : "无遥测→饱和位移");
+                if (cur_known)
+                    say(a, "交接诊断：远端光标 (%d,%d) / 虚拟桌面 %dx%d；入口边 x=%d y=%d；"
+                           "park 后按已知位置估算",
+                        cur_x, cur_y, cur_w, cur_h, ex, ey);
+                /* 交接耗时：从 SWITCH 动作开始到 park/独占完成（目标 <100ms，验收指标）。 */
+                say(a, "交接耗时 %ldms（→远端：独占 + park %d 包）",
+                    now_ms() - sw_t0, npk);
             }
             break;
         case OTI_ACT_SWITCH_TO_LOCAL: {
+            /* 合并缓冲里若还有位移/按键，属于"对端那段"；切回本机后由释放包统一松开，
+               不再补发（补发 = 本机光标被幽灵位移带跑）。 */
+            a->hid_pend_dirty = 0;
+            a->hid_pend_dx = a->hid_pend_dy = a->hid_pend_wheel = 0;
+            a->hid_sent_buttons = 0;
+            /* （2026-11-06 删除 HID 优先窗口：不再调 oti_tr_set_hid_busy） */
             request_release_all(a);           /* 关键：避免对端卡键（泵线程先发这个） */
             /* 告诉对端"我放手了"：对端据此恢复自己的键鼠（否则它会一直吞着） */
             request_token(a);
@@ -1309,6 +1487,8 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
             return_landing_warp(a, tx, ty);
             say(a, "HID 模式：指针拉回本机（落点 %d,%d；已请求释放包 + 令牌，由消息泵发出）",
                 tx, ty);
+            /* 交接耗时：回程方向（释放/落点同步都是非阻塞入队，主要耗时在真实光标 warp）。 */
+            say(a, "交接耗时 %ldms（→本机：释放包 + 令牌 + 落点同步）", now_ms() - sw_t0);
             break;
         }
         }
@@ -1317,6 +1497,7 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
 
     pthread_mutex_lock(&a->lock);
     int locked_before = a->core.locked;
+    otikm_core_set_now(&a->core, now_ms());
     otikm_act act = is_mouse ? otikm_core_local_mouse(&a->core, m, &sw)
                              : otikm_core_local_key(&a->core, k, &sw);
     int land = 0, land_tx = 0, land_ty = 0;             /* 回程落点（锁外再同步真实光标） */
@@ -1369,6 +1550,8 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
         }
         break;
     case OTI_ACT_SWITCH_TO_REMOTE:
+        /* 锁屏期间允许主动推到对端（同 HID 路径，2026-11-03 用户现场）；
+           “不抢”只表示锁屏瞬间不 force_local 拉回对端正用的一侧。 */
         /* W4：对端静默时不交出去（同 HID 路径） */
         if (peer_is_silent(a)) {
             say(a, "[warn] 对端已 %ldms 没有任何消息 → 不交出去（W4）", now_ms() - a->per_ms);
@@ -1528,7 +1711,7 @@ static void clip_ack_register(struct app *a, const void *data, size_t len, uint3
     a->ack_fmt = fmt;
     a->ack_active = 1;
     a->ack_tries = 0;
-    a->ack_deadline_ms = now_ms() + 1500;
+    a->ack_deadline_ms = now_ms() + 2500;
 }
 
 /* 超时未确认 → 重发（复用登记时的字节） */
@@ -1538,8 +1721,8 @@ static void clip_ack_check(struct app *a)
         return;
     if (now_ms() < a->ack_deadline_ms)
         return;
-    if (a->ack_tries >= 3) {
-        say(a, "[warn] 剪贴板 %zu 字节重发 3 次仍无确认（对端在吗？），放弃", a->ack_len);
+    if (a->ack_tries >= 6) {
+        say(a, "[warn] 剪贴板 %zu 字节重发 %d 次仍无确认（对端在吗？），放弃", a->ack_len, a->ack_tries);
         a->n_ack_fail++;
         a->ack_active = 0;
         free(a->ack_buf);
@@ -1550,7 +1733,7 @@ static void clip_ack_check(struct app *a)
     a->n_ack_retry++;
     say(a, "剪贴板未确认 → 第 %d 次重发 %zu 字节（crc=%08x）", a->ack_tries, a->ack_len, a->ack_crc);
     send_clipboard(a, a->ack_buf, a->ack_len);     /* 只发，不重新登记 */
-    a->ack_deadline_ms = now_ms() + 1500;
+    a->ack_deadline_ms = now_ms() + 2500;
 }
 
 /* 保活：所有传输发 PING（可探测对端存活）；线缆模式额外发全零 dummy 帧冲刷设备
@@ -1932,6 +2115,38 @@ static void *rx_thread(void *arg)
             }
         }
         maybe_send_role(a, 0);
+        /* ---- 锁屏/屏保看护（2026-10-27 真机事故）----
+           屏幕 18:02 自动锁定，而 otikm 正把键鼠交给 Windows（键盘 EVIOCGRAB），
+           用户在锁屏密码框里怎么打都没反应（键被转成 HID 发去对端了），最后只能 SSH 解锁。
+           规矩：**锁屏期间键盘必须留在本机**（L8 "交出去的能力必须收得回来" 的最硬一种）：
+             · 已锁定且正在驱动对端 → force_local + 释放独占 + 通知对端放手；
+             · 锁屏期间捕获线程看到 SWITCH_TO_REMOTE 会拒绝（见 handle_local）。
+           探测失败（-1，无 X）保持原行为。 */
+        if (now_ms() - a->lock_probe_ms >= 500) {
+            a->lock_probe_ms = now_ms();
+            int lk = otix11_lock_screen_active();
+            static int lock_probe_logged;
+            if (!lock_probe_logged) {
+                lock_probe_logged = 1;
+                say(a, "锁屏看护: %s（每 500ms 看焦点窗口 WM_CLASS；锁屏期间不独占键盘）",
+                    lk < 0 ? "**不可用**（无 X / 读不到焦点）——锁屏时仍可能抢键盘"
+                           : "已启用");
+            }
+            if (lk >= 0 && lk != a->screen_locked) {
+                a->screen_locked = lk;
+                if (lk) {
+                    /* 2026-11-03（用户指令）：锁屏**不抢控制权**。
+                       旧行为在锁屏瞬间 force_local + 释放独占 + 通知对端放手，
+                       用户正在 Windows 上操作时会突然被拉回麒麟（现场报障）。
+                       现在只置标志：不抢；捕获线程看到 SWITCH_TO_REMOTE 仍会拒绝
+                       （锁屏期间不把键盘独占走，密码框收得到键）。
+                       用户要回麒麟解锁，照常走鼠标回程手势 —— 回程本身会释放独占。 */
+                    say(a, "屏幕已锁定/屏保 → 不抢控制权（保持当前所在侧；仅拒绝再交出去）");
+                } else {
+                    say(a, "屏幕已解锁（撞边切换恢复正常）");
+                }
+            }
+        }
         /* 回程令牌 / 释放包：必须由**本线程（消息泵所在线程）**发。
            捕获线程自己发会跟这里抢同一条帧管道上的授权消息与应答，实测令牌被吞
            → 对端收不到"交还控制权"，指针永远回不来。顺序：先松手，再发令牌。 */
@@ -1942,12 +2157,16 @@ static void *rx_thread(void *arg)
                 int rrc = tcd ? otilink_hid_release_all(tcd) : -1;
                 if (rrc)
                     say(a, "ERR 释放包 rc=%d", rrc);
+                else
+                    oti_tr_note_hid_activity(a->tx);  /* 写入侧 HID 优先 */
             }
             if (a->want_token) {
                 a->want_token = 0;
                 int trc = tcd ? otilink_hid_send_token(tcd, OTI_HID_TOKEN_PASSIVE) : -1;
                 say(a, "→ 回程令牌 F24 已发（消息泵线程，rc=%d%s）", trc,
                     trc ? " <-- 写设备失败，对端收不到！" : "");
+                if (trc == 0)
+                    oti_tr_note_hid_activity(a->tx);  /* 写入侧 HID 优先 */
             }
         }
         /* 撞边交还：厂商帧必须由**本线程（消息泵所在线程）**发。
@@ -1972,6 +2191,37 @@ static void *rx_thread(void *arg)
         }
         watchdog_check(a);
         send_fail_watchdog(a);
+        /* ---- 慢操作守卫 / 写入侧 HID 优先 的证据行（2026-11-06 传输层重设计）----
+           对端消费慢（旧 Windows 代理）时，传输层会把单次 >30ms 的帧写判定为慢操作并
+           暂停帧写；另外最近 50ms 内有成功 HID 写时也推迟帧写（写入侧 HID 优先）。
+           两种情况都只推迟"写"，消息泵/帧读照常。这里每 5s 汇总一次计数变化，写进
+           otikm 自己的日志（/tmp/otikm.log），方便真机验证时 grep `SLOWOP`。
+           传输层同时在 stderr 打 `[warn] SLOWOP frame write Nms…`（run-kylin 重定向）。 */
+        {
+            static long slow_log_ms;
+            static unsigned long slow_logged, read_logged, defer_logged;
+            long now5 = now_ms();
+            if (now5 - slow_log_ms >= 5000) {
+                slow_log_ms = now5;
+                unsigned long sc = oti_tr_cable_slow_count(a->tx);
+                unsigned long rc = oti_tr_cable_read_slow_count(a->tx);
+                unsigned long dw = oti_tr_cable_deferred_writes(a->tx);
+                if (sc != slow_logged || rc != read_logged || dw != defer_logged) {
+                    slow_logged = sc;
+                    read_logged = rc;
+                    defer_logged = dw;
+                    say(a, "SLOWOP 汇总：帧写慢 %lu 次（单次最大 %ldms，最近退避 %ldms），"
+                           "推迟帧写 %lu 次（HID 优先 %lu、饥饿放行 %lu），帧读慢 %lu 次（最大 %ldms）"
+                           "（HID 守卫%s启用）→ 帧写已自动让路 HID，消息泵/帧读照常",
+                        sc, oti_tr_cable_frame_write_max_ms(a->tx),
+                        oti_tr_cable_backoff_ms(a->tx),
+                        dw, oti_tr_cable_deferred_hid(a->tx),
+                        oti_tr_cable_starved(a->tx),
+                        rc, oti_tr_cable_frame_read_max_ms(a->tx),
+                        oti_tr_cable_peer_slow_seen(a->tx) ? "已" : "未");
+                }
+            }
+        }
         int rc = oti_tr_recv(a->tx, body, &len, 200);
         if (rc == -2) {
             err_streak = 0;                /* 超时 = 链路正常（只是暂时没数据） */
@@ -2085,6 +2335,17 @@ static void *rx_thread(void *arg)
             }
             break;
         }
+        case OTI_MSG_CURSOR: {
+            oti_cursor_evt ce;
+            if (oti_decode_cursor(pl, h.len, &ce) == 0) {
+                pthread_mutex_lock(&a->lock);
+                otikm_core_set_remote_cursor(&a->core, ce.x, ce.y, ce.w, ce.h, now_ms());
+                pthread_mutex_unlock(&a->lock);
+                if (a->cfg.verbose)
+                    say(a, "RECV CURSOR 对端光标 %d,%d（虚拟桌面坐标）", ce.x, ce.y);
+            }
+            break;
+        }
         case OTI_MSG_MOUSE_MODE: {
             uint8_t md = 0;
             if (oti_decode_mouse_mode(pl, h.len, &md) == 0) {
@@ -2116,6 +2377,10 @@ static void *rx_thread(void *arg)
             const uint8_t *data;
             uint32_t dlen;
             if (oti_decode_clip(pl, h.len, &ch, &data, &dlen) == 0) {
+                if (a->cfg.verbose)
+                    say(a, "RECV CLIP fmt=%u fid=%u off=%u total=%u dlen=%u",
+                        (unsigned)ch.format, (unsigned)ch.fid, (unsigned)ch.offset,
+                        (unsigned)ch.total_len, (unsigned)dlen);
                 /* 大文件分片 / 传输控制：先于普通剪贴板重组分派（见 otixfer.h） */
                 if (ch.format == OTI_CLIP_FMT_PART) {
                     /* u32 idx, u32 nparts, u64 total, u32 namelen, name, u32 dlen2, data */
@@ -2193,15 +2458,20 @@ static void *rx_thread(void *arg)
                             /* 走**可靠**发送：ACK 很小，可它一丢，对端就会把整笔内容重发 3 轮
                                （实测主控模式下 6KB 图片被重发 8 次；8MB 包更亏）。
                                超时给短一点，别把接收线程拖住。 */
+                            /* 线缆帧通道会静默丢帧（实测 40% 量级）——ACK 只有一帧，丢一次发送端就
+                               重发整笔并可能覆盖剪贴板（2026-11-06 现场：文字/文件复制互相打架）。
+                               冗余 3 份（首份走可靠发送，其余入队），接收端幂等。 */
                             int arc = oti_tr_send_wait(a->tx, ab, an, 300);
                             note_send_result(a, arc);
-                            if (arc)
-                                say(a, "ERR send ACK rc=%d", arc);
-                            else {
+                            if (arc == 0) {
+                                for (int ai = 0; ai < 2; ai++)
+                                    (void)oti_tr_send(a->tx, ab, an);
                                 a->n_sent++;
                                 if (a->cfg.verbose)
-                                    say(a, "→ 回执 ACK crc=%08x（fmt=%u）", rh,
+                                    say(a, "→ 回执 ACK×3 crc=%08x（fmt=%u）", rh,
                                         (unsigned)(ch.format ? ch.format : 1));
+                            } else {
+                                say(a, "ERR send ACK rc=%d", arc);
                             }
                         }
                     }
@@ -2560,6 +2830,9 @@ static void run_capture(struct app *a)
             continue;
         if (pr == 0) {
             flush_mouse(a);
+            hid_flush_mouse(a);             /* 尾包：4ms 内没有新事件也要把合并的位移发出去 */
+            /* （2026-11-06 删除"鼠标停 30ms 才恢复消息泵"的 HID 优先窗口：泵始终在跑，
+               CURSOR/ROLE 遥测不再过期；慢对端由传输层慢操作守卫退避帧写处理。） */
             continue;
         }
         for (int i = 0; i < a->ncap; i++) {
@@ -3483,6 +3756,18 @@ int main(int argc, char **argv)
         return 1;
     }
     say(&a, "传输就绪: %s", oti_tr_name(a.tx));
+    /* 写入侧 HID 优先（2026-11-06 Lead 追加的保险）：最近 50ms 内有成功 HID 写时推迟
+       **帧写**（只推迟写！消息泵/帧读照常）→ 即使对端是旧慢代理，用户动键鼠期间也
+       不会有 250~700ms 的长帧写堵住 HID；停手 50ms 后剪贴板/心跳自动补发。
+       ⚠️ 按需启用：仅当见过 >10ms 帧写（疑似慢对端）才生效；新原生泵下完全不生效。
+       队首帧饥饿 >1000ms 时放行 1 帧，防止 ROLE/ACK 被无限饿死。 */
+    say(&a, "写入侧 HID 优先: 疑似慢对端时，HID 写成功后 %dms 内推迟帧写；"
+            "队首帧饥饿 >%dms 放行 1 帧（只推迟写，消息泵/帧读照常）",
+        OTI_HID_GUARD_MS, OTI_HID_STARVE_MS);
+    /* 消息读超时保持默认 5s：实测压到 200ms 会让设备消息读频繁超时、帧通道
+       直接卡死（ROLE/剪贴板全断）。实测 0xD8 本身 0~1ms 就返回，慢对端的唯一风险是
+       0xD9/0x2A 帧写（250~700ms）—— 由传输层慢操作守卫自动退避（见 otitrans.h），
+       不再靠"HID 写期间停泵"那套补丁（2026-11-06 已删除）。 */
     maybe_send_hello(&a);          /* 先把自己的屏幕几何告诉对端 */
     g_app_for_signal = &a;
     signal(SIGINT, on_signal);
@@ -3582,6 +3867,22 @@ int main(int argc, char **argv)
         pthread_join(kth, NULL);
     say(&a, "结束: 发出 %lu 条, 注入 %lu 条, 切换 %lu 次, 保活 %lu 次, 收到 PING %lu 次, HID 包 %lu 个",
         a.n_sent, a.n_injected, a.n_switches, a.n_keepalive, a.n_ping_recv, a.n_hid);
+    /* 本轮新证据：慢操作守卫的最终统计（真机验证时 grep `SLOWOP` 即可） */
+    say(&a, "SLOWOP 统计: 帧写慢 %lu 次（单次最大 %ldms）/帧读慢 %lu 次（最大 %ldms），"
+            "推迟帧写 %lu 次（HID 优先 %lu 次，饥饿放行 %lu 次），帧最大单次延迟 %ldms",
+        oti_tr_cable_slow_count(a.tx), oti_tr_cable_frame_write_max_ms(a.tx),
+        oti_tr_cable_read_slow_count(a.tx), oti_tr_cable_frame_read_max_ms(a.tx),
+        oti_tr_cable_deferred_writes(a.tx), oti_tr_cable_deferred_hid(a.tx),
+        oti_tr_cable_starved(a.tx),
+        oti_tr_cable_max_latency_ms(a.tx));
+    /* 逐类 CDB 的全局计时（otilink.c 的统计 API）：真机验收期望
+       帧写 max ≈2~4ms（旧慢代理场景下会看到数百 ms 的历史最大值，正常）。 */
+    say(&a, "设备计时: 消息读 max=%ums avg=%ums | 帧读 max=%ums avg=%ums | "
+            "帧写 max=%ums avg=%ums | HID 写 max=%ums avg=%ums",
+        otilink_io_max_ms(OTI_IO_MSG_READ), otilink_io_avg_ms(OTI_IO_MSG_READ),
+        otilink_io_max_ms(OTI_IO_FRAME_READ), otilink_io_avg_ms(OTI_IO_FRAME_READ),
+        otilink_io_max_ms(OTI_IO_FRAME_WRITE), otilink_io_avg_ms(OTI_IO_FRAME_WRITE),
+        otilink_io_max_ms(OTI_IO_HID_WRITE), otilink_io_avg_ms(OTI_IO_HID_WRITE));
 
     if (a.cfg.peer_hid) {                      /* 退出前释放对端可能按住的键 */
         if (oti_tr_cable_dev(a.tx))

@@ -12,6 +12,12 @@
 > AIC 驱动用 `install /bin/false` + udev `.disabled` **挡死**（重启后 `lsmod | grep aic` 为空）；
 > `panic_on_oops=0` 用 **late unit** `otilink-panic-on-oops.service`（`After=kdump-tools.service`）落地 ——
 > **只改 `KDUMP_SYSCTL` 无效**（`kdump-config` 末尾强制设回 1）。**与对拷线无关**。
+> **⚠️ 2026-11-05 更新（NOTES §74）：「蓝屏 / 键盘输入不了」还有第二个真因** —— 麒麟内核内置
+> `kysos_key` 把**左 Meta+H** 当 SOS 组合键，20s 无用户态确认就切 VT 到 `tty5` → `console_lock` 死锁 →
+> X 摘掉全部输入设备。**Windows 上 Win+H 是"语音输入"**，共享键盘（otikm EVIOCGRAB 挡不住内核 input
+> handler）时误触即中招。已装 `otilink-sosguard.service`（`otilink/sosguard.sh`）在超时前写
+> `/sys/kos_rescue/rescue_feedback=1` 取消救援；回归 `gate.sh --hw-sos`（`otilink/sosreg.sh`）。
+> 已死锁只能硬重启（`chvt`/`systemctl reboot` 都会卡在 console_lock）。
 > **⚠️ 换无线网卡会打断 Windows 热点 relay**：`127.0.0.1:2222`（`ssh kylin` 别名）按写死的 MAC
 > 找麒麟 IP，换卡后报 `Connection reset by peer`。已改成多 MAC 列表（新卡在前）+ IP fallback；换卡后
 > 记得更新 `C:\Users\<你的用户名>\dsh-kylin-relay.ps1` 并重启 relay（`RUNBOOK §21`）。实测：**`ssh kylin`（relay）是 LAN 直连 1.7–2.1s；`ssh kylin-ts`（tailscale）在本机走 DERP 中转 5.3–8.1s** —— 交互用前者、容错用后者。
@@ -47,12 +53,35 @@
 > **欠账**：① 真人复测（推到 Windows 打字，看是否还重复）；② `re/portable/build.sh` 重建
 > `dist/`（`--portable` 现在 2 FAIL：包内指纹过期，与本次修复无关）；③ §61.3 键盘改走帧管道（根治丢包）。
 >
+> **第 60 轮（现场，2026-11-05，PR 待并）**：用户报「鼠标在 Windows 一卡一卡，Kylin 正常」。
+> 拓扑 B：G304 1000Hz × REL_X/REL_Y 两事件 ≈ **2000 次 HID 设备写/秒**，而线缆单队列实测上限
+> ~**1078 次/秒**（hidrate，与 otikm 并发；空载 maxsend=1ms）→ 捕获线程积压/evdev 丢事件。
+> 修法：`otikm.c` HID 直发也按 **4ms 合并**（按键变化立即发、poll 超时补尾包、交接清空），
+> 设备写降到 ≤250/秒。已部署（static 81 PASS、coretest 51/51、deploy-kylin PASS）。
+> **待办**：真人复测手感（sim 手势串行，复现不出积压）；若仍卡，下一刀查剪贴板大帧堵 HID
+> （`--hw-lat` 在 653KB 图片同步期间 MAXGAP=319~502ms）与 Windows 代理主循环 90% CPU/秒级慢轮。
+> 详见 `NOTES §75`。
+>
 > **第 57 轮（现场，2026-10-14）**：用户报「kylin→Windows 复制失败」。真因 = `oticlip.c` 的
 > `popen("xclip … -o")` **无超时**，遇到不响应的选区所有者时 `clip_thread` 被**永久卡死**
 > （现场一个 `xclip -t text/uri-list -o` 子进程活了 41 小时）→ 本地剪贴板再也不被读取 →
 > **L→W 一条都发不出**，而 W→L（RX 线程）正常、拔插无效。已修：新增 `xclip_read_popen()`，
 > 读路径统一 `timeout 3 xclip …`；重启 otikm 后双向恢复，`--static` 80 PASS、`coretest` 45/45。
 > 详见 `NOTES §72`。
+>
+> **第 58 轮（现场，2026-11-03）**：用户报「鼠标在 Windows 时右移没到边就回 Kylin」。
+> 真因 = 回程判据只看**未缩放 HID 计数**，而 Windows 指针加速让净计数与像素漂移
+> （实测：park 到 2559 后快左移 500 计数、慢右移 608 计数，净 +100 触发回程时 Windows 光标
+> 只有 **1491**，离右边缘 **1068px**）。修法 = Windows 剪贴板代理回传真实光标
+> （新增 `OTI_MSG_CURSOR=11`，PROTOCOL §6.2），主控端要求“回传确认在入口边 + 再外推 8 计数”
+> 才回程；无回传/过期退回旧计数判据。同轮按用户指令把锁屏看护改成**不抢控制权**
+> （只拒绝再交出去）。真机正向验证回程时 Windows 光标 = 2559、负向停在 1499 不回。
+> coretest 51/51、selftest_proto 新增 CURSOR 全过；`--static` 仅剩工作树布局导致的
+> `re/` 路径检查失败（与本次无关）。**仓库已顺带同步现网 10-27 的锁屏看护/sim 修正/return_inset 96**
+> （公开 HEAD 10-14 落后于现网），详见 `NOTES §73`。
+> **回归修复（16:15 现场）**：锁屏拒绝交接后核心仍 remote → 看门狗重 grab 键盘 → 锁屏无法输入；
+> 两个 `screen_locked` 守卫已改为 `force_local + apply_grab(0)`（真 remote 会话锁屏仍不抢），
+> 现场日志 `已独占` 计数 0，详见 `NOTES §73.8`。
 >
 > **第 53 轮（现场，2026-10-09）**：一次收敛四条独立真因 —— ①设置窗口闪烁=`ukui-control-center` 重绘循环（与对拷线无关）；
 > ②Kylin 键盘输入不了 + 「回本机→3s 又抓走」乒乓=`hotkey_to_local/remote` 撞 IDEA 的 Ctrl+Alt+←/→（已关成 `none`）；
@@ -125,6 +154,53 @@
 > （`envcheck.sh` 的 `/dev/sg3`、`probe.c` 自动选到了 MS LUN、`hwtest/xferreg` 里被忽略的位置参数）。
 > ⚠️ 仍欠一件事：`--hw-km` 第 1 步用的是**假失败**判据（光标贴右边缘时 +100 推不动 → Δ=0），
 > HID 通路实测是好的（+247px）。见 `NOTES §55`。
+
+> **⚠️ 2026-11-06 第 61 轮（已部署两端，最重要）**：现场「鼠标在 Windows 与 Kylin 之间来回不顺畅 +
+> 在 Windows 移动一段时间卡几秒」= **Windows 剪贴板 PowerShell 代理读帧太慢，麒麟向它写 64KB 帧时
+> 在单队列设备上阻塞 250~700ms，把 HID 注入写堵住**（实测 `hidlat MAXGAP=372~482ms`）。
+> 修法（已上线）：
+> * Windows：`windows/otiagent.ps1` **BuildTag `nativepump-2`** —— 内嵌 C# `CablePump` 后台线程独占
+>   线缆设备，紧凑读帧；CURSOR 遥测 40ms、ROLE/HELLO 由泵线程重发；PS 主循环不再做设备 I/O
+>   （CPU 99%→~9%）。另修「锁屏时 `Set-Clipboard` 抛异常把代理整个带走」。
+> * 麒麟：传输层逐命令计时 + **慢操作守卫**（帧写 >30ms 退避 300ms→2s，只停帧写）；删掉上一轮
+>   有害的「HID 优先窗口（暂停消息泵）」；写入侧 HID 优先**按需启用**（新泵下不触发）。
+> * 交接判据重写：真实光标（TTL 300ms）+ 贴入口边 + 继续外推 ≥16 计数；`交接耗时 15ms`。
+> * 新门禁：`--hw-clipstall`（hidduringclip.sh）、`--hw-freeze`（winfreeze.sh）。
+> 真机数据：`hidlat MAXGAP=15ms`（旧 372~482ms，650KB 剪贴板突发期间）、`kmbret PASS=21 FAIL=0 WARN=4`
+> （小步回程成功、park 37 包、**交接耗时 15ms**；现场真人日志还有一次 `交接耗时 35ms`）、麒麟 `SLOWOP=0`；
+> 剪贴板双向已由 win-pump 在解锁后手测互通。
+> **✅ 2026-11-06 18:00 两个根因已修，用户指定的文件双向全通（md5 级）**：
+> ① Windows agent 的 PS 主循环会卡在 `Get-PnpDeviceProperty`（agent 进程内 WMI 永不返回）→ 剪贴板全哑；
+> 用 runspace+超时兜底修掉。② 大文件发送无节流把设备写堵 ~1.28s → **鼠标冻结**（实测 MAXGAP=1284ms）；
+> 两端 xfer 按 20ms/片限速后 **MAXGAP=28ms**（<40ms 验收线），复制 302MB 时鼠标不卡。
+> 实测：W→K `test.apk`(184MB) md5 一致 PASS；K→W `test.jar`(302MB) md5 一致 PASS；文字双向 PASS。
+> 详见 NOTES §76.11。
+> **⚠️ 2026-11-06 16:55 拔插复位后重测**：文本双向 PASS；`test.jpg` 双向 PASS（md5 一致）；
+> `test.jar` 302MB 麒麟→Windows **99.1%（4691/4732 片）**，末 23 片补发帧系统性不到达（每 10s ×3 补发、接收端每份 DONE 都回缺片位图），120s 中止。
+> 已修「迟到 DONE 回 ABORT 杀整批」「缺片补发 ×3」「传输中暂停 CURSOR」；下一轮：补发按 rc 重试 + 给 Windows 泵加逐帧投递日志。详见 NOTES §76.9。
+> **⚠️ 2026-11-06 16:15 用户指定文件实测（test.jpg/test.jar 双向）**：`test.jpg` **双向都通过且 md5 一致**
+> （K→W Windows 侧多份副本 `d500bb78…`；W→K `/tmp/otilink-files-2297957/test.jpg` 同 md5）。
+> `test.jar`(302MB) K→W 最好 **99.4%（缺 27/4732 片）** 后超时中止；W→K 因 jar 未落到 Windows 未能测。
+> 修了"重复裁决误判多文件批次完成"和"缺片补发只等 RESUME"两个 bug；连续测试后线缆会话劣化
+> （帧写反复 ~1.28s、丢包高）→ **需要物理拔插对拷线两端复位**。详见 NOTES §76.8。
+> **⚠️ 2026-11-06 15:40 文件剪贴板进展（用户报"文件不行"）**：`test.jpg`(1.6MB) 麒麟→Windows **已通**；
+> `test.jar`(302MB) 从 22% → **93%**（修了泵限流 2 帧/授权、加接收背压、CURSOR 降频、队列 64→256），
+> 但最后 ~250 片卡住：Windows 反复回"缺片位图"，麒麟收不到 → **Windows→麒麟方向的 CLIP 帧仍在丢**
+> （小帧能到、PS 入队 CLIP 帧不到，同早前 ENQ/TXF/RXF 观测）。已加 ACK×3、DONE 5s 重发、裁决 120s、
+> 接收超时 180s 兜底；`--hw-lat` PASS=5。详见 NOTES §76.7。
+> **⚠️ 2026-11-06 13:1x 解锁后正式回归（残活）**：
+> 鼠标/交接指标保持达标；但 `clipreg` 最佳 **PASS=15 FAIL=2**（多次跑 12~15 跳动），失败全是
+> **内容乱序/陈旧覆盖**（收到上一笔旧内容），帧解码无失败；`clipshort` 7/7 过。
+> 逐帧 trace 定位：ACK **迟到**（`RECV ACK … active=0`；`ENQ type=6→TXF` 间隔 ~1.1s；同期 `SLOWOP` 250~330ms）——
+> Windows 泵"每次授权写 2 帧"遇上 CURSOR 25/s 入队 > 授权写速 → txq 积压 ~1s → ACK/CLIP 排在陈旧 CURSOR 后
+> → 超过发送端 1.5s 期限 → 重发风暴 → 旧帧覆盖新帧。**修法未完成**（候选：自适应 CURSOR 节奏、放宽 ACK 期限、
+> 剪贴板按 fid 单调丢弃旧帧）；nativepump-4 实验（CURSOR 100ms + 4 帧/授权）未变好已回退；
+> 麒麟读侧退避阈值 30→150ms 保留。详见 `NOTES §76.5` 第 8 条。
+> **未验证**：Windows 光标冻结客观值（winfreeze 需 HID 驱动态）、`xferreg` 正式回归。
+> ⚠️ 仓库 `windows/otiagent.ps1` = 真机部署件 **nativepump-2**（逐字节核对）；
+> 未验证的 nativepump-3 patch 在 `/tmp/nativepump-3.patch`，不要直接部署。
+> 回滚：Windows `deploy.sh --restart` 前把 `C:\Users\Public\otiagent.baseline.ps1` 拷回
+> （或 `git checkout -- windows/otiagent.ps1`）；麒麟 `gate.sh --deploy-kylin` + 重启 otikm。
 
 ---
 

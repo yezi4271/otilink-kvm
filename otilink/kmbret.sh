@@ -11,6 +11,14 @@
 # 同时验证 HID 路径会补发被抑制的修饰键（Ctrl+C 这类组合能到对端）。
 # 全程走**真实线缆**（HID 包真送到 Windows），并断言 Windows 侧看到按键/光标位移。
 #
+# ⚠️ 2026-11-06（第 61 轮）回程判据改成"真实光标"为主：
+#   远端光标贴入口边（±edge_px*4）+ 继续外推 ≥16 未缩放计数 → 回程；遥测过期时只等
+#   新遥测、不退回计数判据；只有"从未收到过 CURSOR"的零软件/旧对端才走旧计数判据。
+#   → 本回归需要 Windows 侧**原生泵**（CURSOR 20~50ms/条）在场；旧 PowerShell 慢代理
+#     （主循环 1.3~9s）会让遥测经常过期，合成手势可能"回不来"（这不是麒麟侧回归）。
+#   日志断言：`回程判据：对端光标 … 已在入口边`（真实光标路径）；老对端兼容路径会打
+#   `回程判据（无光标回传，退回计数）：已把推出去的位移推回 N/100`。
+#
 # 用法：
 #   ./kmbret.sh                约 30 秒；会**短暂停止并恢复**麒麟 otikm
 #   EXIT=right ./kmbret.sh     物理摆位相反（麒麟在 Windows 左边）时用
@@ -18,7 +26,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/../tools/lib.sh"
 
 EXIT=${EXIT:-left}                 # 从麒麟哪条边交给对端（默认 left：麒麟屏在 Windows 右边）
-DUR=12                              # 合成脚本实例的运行时长（秒）
+DUR=22                              # 合成脚本实例的运行时长（秒；回程改真实光标后要多走几步）
 GEST=/tmp/kmbret-gesture.txt
 KLOG=/tmp/kmbret-otikm.log
 KINJ=/tmp/kmbret-inject.out
@@ -66,7 +74,10 @@ echo "=== 1/5 合成手势（在麒麟上跑，经真实线缆到 Windows）==="
         echo "key 29 0"
         echo "sleep 700"
     done
-    for _ in $(seq 1 300); do echo "mouse $BACK_DX 0 0 0"; done
+    # 300 步（600 计数）在旧计数判据下够；但 2026-11-03 起回程要真实光标到边
+    # （Windows 指针速度约 0.6px/计数 + 交接后还有几发 -50 把光标带离边缘），
+    # 1200 步（2400 计数）才能稳定把光标送回右边缘再触发回程。
+    for _ in $(seq 1 1200); do echo "mouse $BACK_DX 0 0 0"; done
     echo "sleep 1500"
 } > "$TMP/gesture.txt"
 GB64=$(base64 -w0 "$TMP/gesture.txt")
@@ -78,14 +89,17 @@ pwsh_file "$WIN_DIR/setcur.ps1" -X 1200 -Y 500 >/dev/null 2>&1
 W0=$(wcur_x); [ -n "${W0:-}" ] && ok "Windows 光标基线 x=$W0" || bad "读不到 Windows 光标"
 
 # Windows 低级键盘钩子探针：验证 Ctrl+C 真的落到 Windows 上
-pwsh_file "$WIN_DIR/kbdprobe2.ps1" -Seconds 14 > "$TMP/kbdprobe.out" 2>&1 &
+pwsh_file "$WIN_DIR/kbdprobe2.ps1" -Seconds 22 > "$TMP/kbdprobe.out" 2>&1 &
 KPID=$!
 
 echo "=== 2/5 麒麟：停真机 otikm → 跑合成手势实例 ==="
 kssh 'pkill -x otikm' >/dev/null 2>&1
 sleep 1
 khave 'pgrep -x otikm' && bad "旧 otikm 没停掉" || ok "真机 otikm 已停（本次测试独占线缆）"
-kssh "rm -f $KLOG $KINJ; cd ~/otilink && sg input -c \"DISPLAY=:0 nohup ./otikm --auto --transport cable --keepalive 5000 --config \$HOME/.config/otilink/kvm.conf --role master --edges left,right --no-grab --no-clipboard --sim-input $GEST --sim-inject $KINJ --log $KLOG --delay 6 --duration $DUR > $KCON 2>&1 &\"" >/dev/null 2>&1
+# 合成实例**不接 X**（`env -u DISPLAY`）：锁屏看护在无 X 时不可用，避免"屏幕锁着 →
+# 拒绝交出去"把这条纯逻辑回归挡掉；sim 模式本来也不需要 X（回程落点同步会跳过）。
+# 真机锁屏行为由 --hw-km / 现场验证，不在这条脚本的断言范围内。
+kssh "rm -f $KLOG $KINJ; cd ~/otilink && sg input -c \"env -u DISPLAY nohup ./otikm --auto --transport cable --keepalive 5000 --config \$HOME/.config/otilink/kvm.conf --role master --edges left,right --no-grab --no-clipboard --sim-input $GEST --sim-inject $KINJ --log $KLOG --delay 6 --duration $DUR > $KCON 2>&1 &\"" >/dev/null 2>&1
 sleep 2
 KP=$(kssh 'pgrep -x otikm | tail -1')
 [ -n "${KP:-}" ] && ok "合成实例已启动（pid $KP）" || bad "合成实例没起来（看 $KCON）"
@@ -113,12 +127,47 @@ L2=$(grep -n "HID 模式：指针拉回本机" "$TMP/otikm.log" | head -1 | cut 
 [ -n "${L1:-}" ] && [ -n "${L2:-}" ] && [ "$L2" -gt "$L1" ] && ok "顺序正确：先交出去（第 $L1 行）→ 后拉回（第 $L2 行）" || bad "日志顺序不对（交 $L1 / 回 $L2）"
 grep -q "回程落点" "$TMP/otikm.log" && ok "回程落点已同步真实光标（XWarpPointer）" \
     || warn "日志里没有'回程落点'：X11 可能不可用（不影响回程本身，但指针会停在边上）"
-grep -q "HID 补发被抑制的" "$TMP/otikm.log" && ok "修饰键抑制缓冲已补发（Ctrl+C 能到对端）" \
-    || bad "HID 路径没有补发被抑制的按键（Ctrl/Alt 组合仍会被吞）"
+if grep -q "HID 补发被抑制的" "$TMP/otikm.log"; then
+    ok "修饰键抑制缓冲已补发（Ctrl+C 能到对端）"
+elif grep -q "vk=0xA2" "$TMP/kbdprobe.out" 2>/dev/null && grep -q "vk=0x43" "$TMP/kbdprobe.out" 2>/dev/null; then
+    # 2026-11-03：当前默认配置 hotkey_* = none（第 54 轮用户指令），没有热键前缀 →
+    # 修饰键根本不进抑制缓冲，直接转发。此时判据改为"Windows 实收 Ctrl+C"。
+    ok "无热键配置 → 修饰键未被抑制、直接转发（Windows 实收 Ctrl+C）"
+else
+    # 线缆 HID 键盘接口本身会丢报表（§61.2 固件缺陷，同一段 Ctrl+C 连试 3 遍也可能全丢）；
+    # 与下面 4/5 的 Ctrl/C 两条同源，只 WARN，不计失败（见 NOTES §63.9）。
+    warn "无热键配置下 Ctrl/C 未到达（§61.2 线缆 HID 固件丢包，不计失败）"
+fi
 grep -q "对端光标已停在入口边" "$TMP/otikm.log" && ok "交接时已把对端光标顶到入口边（消除不可见夹边位移）" \
     || bad "没有做入口边 park（回程判据仍可能与用户看到的不一致）"
-grep -q "回程判据：已把推出去的位移推回" "$TMP/otikm.log" && ok "回程判据诊断有进度（日志可复盘）" \
-    || warn "没有回程进度日志（可能推回得太快，或诊断被节流）"
+# park 包数受保护（估算路径 ≥32 包下限、64 包上限；单次 HID 写 >20ms 会提前中止）
+PARK_LINE=$(grep -o "park [0-9]\+ 包" "$TMP/otikm.log" | head -1 || true)
+[ -n "${PARK_LINE:-}" ] && ok "park 包数已记录（${PARK_LINE}，上限 64）" \
+    || warn "日志里没有 park 包数（旧日志格式或 park 未执行）"
+if grep -q "park 提前中止" "$TMP/otikm.log"; then
+    warn "park 有提前中止（单次 HID 写 >20ms：设备被慢对端/大帧拖住，交接耗时可能变大）"
+else
+    ok "park 未触发耗时保护（单次 HID 写都 ≤20ms）"
+fi
+# 交接耗时（2026-11-06 新增诊断；验收目标：从撞边到对端指针开始动 <100ms）
+REAL_CUR_MS=$(grep -o "交接耗时 [0-9]\+ms（→远端" "$TMP/otikm.log" | head -1 | grep -o "[0-9]\+" || true)
+if [ -n "${REAL_CUR_MS:-}" ]; then
+    if [ "$REAL_CUR_MS" -le 100 ]; then ok "交接耗时 ${REAL_CUR_MS}ms（→远端，≤100ms 达标）"
+    elif [ "$REAL_CUR_MS" -le 200 ]; then warn "交接耗时 ${REAL_CUR_MS}ms（→远端，>100ms：检查 park 包数/设备慢写）"
+    else bad "交接耗时 ${REAL_CUR_MS}ms（→远端，>200ms：交接动作太慢）"; fi
+else
+    warn "日志里没有'交接耗时 …ms（→远端…'（旧二进制？）"
+fi
+# 新回程判据诊断（真实光标路径）：本机持有控制权期间、用户往入口边推时每秒打一行
+if grep -q "回程判据：对端光标.*已在入口边" "$TMP/otikm.log"; then
+    ok "回程判据走**真实光标**路径（日志确认'对端光标…已在入口边'）"
+elif grep -q "回程判据：遥测过期" "$TMP/otikm.log"; then
+    ok "回程判据走真实光标路径（遥测过期→等新帧，未退回计数判据）"
+elif grep -q "回程判据（无光标回传，退回计数）：已把推出去的位移推回" "$TMP/otikm.log"; then
+    ok "兼容路径：无 CURSOR 回传 → 计数判据诊断可见（零软件/旧对端）"
+else
+    warn "没有回程进度日志（可能推回得太快、诊断被 1s 节流，或对端没有 CURSOR 遥测）"
+fi
 grep -q "抓取设备 /dev/input/by-id/" "$TMP/otikm.log" && ok "抓取用的是 by-id 稳定路径（拔插后不会抓错设备）" \
     || warn "抓取路径不是 by-id（这台机器可能没有 by-id 链接；eventN 拔插后会变）"
 

@@ -18,6 +18,7 @@ otilink/mocktest
 otilink/cabletest
 otilink/hidprobe
 otilink/uisim
+otilink/sosinject
 otilink/hidlat
 otilink/hidmon
 otilink/coretest
@@ -38,3 +39,5 @@ WinDroid_Linker.apk
 
 # ---- 绿色包产物：由 re/portable/build.sh 现场按声明基线生成 ----
 portable/dist/
+# Windows 绿色 kit 的构建产物（zip/exe 等，按"编译产物不入库"原则；需要时本地重新打包）
+windows/kit/dist/

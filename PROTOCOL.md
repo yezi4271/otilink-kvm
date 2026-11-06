@@ -254,6 +254,7 @@ Linux↔Linux 两端都是我们的代码，因此**不复刻 XML 层**，直接
   magic u32 'OTL1' | type u16 | flags u16 | seq u32 | len u32 | crc32 u32
   crc32 覆盖 头[0..15] + 载荷
 type: KEY(1) MOUSE(2) SWITCH(3) CLIP(4) PING(5) ACK(6)
+      MOUSE_ABS(7) HELLO(8) MOUSE_MODE(9) ROLE(10) CURSOR(11)
 ```
 
 载荷上限 `OTI_PAYLOAD_MAX = 65496 - 20 = 65476`；剪贴板单块 `65000`。
@@ -302,6 +303,46 @@ u32 input_age_ms      本机最近一次真实键鼠事件距今毫秒（越小 
 
 **门禁**：`coretest`（纯逻辑 11 项）、`selftest_proto`（编解码 6 项）、`--replug`（拔插后角色/抓取仍有效）、
 `--hw-km` / `--hw-clip`。
+
+---
+
+### 6.2 对端光标回传 `OTI_MSG_CURSOR = 11`（第 58 轮：修“没到边就回程”）
+
+**为什么加**：拓扑 B（键鼠插在麒麟、Windows 是被驱动侧）的回程判据原本只看**未缩放的 HID 计数**
+（`drv_x/drv_y`）。但 Windows 会对 HID 鼠标做指针加速（“提高指针精确度”，本机注册表
+`MouseSensitivity=10 / MouseSpeed=1 / Threshold 6,10`），**快左移 + 慢右移**之后净计数回到 +100，
+像素位置却可能还离边缘上千像素。真机实测：park 后光标在 2559（右边缘），快左移 500 计数、
+慢右移 608 计数，净 +100 触发回程时 Windows 光标还在 **1491**，离边缘差 **1068px** —— 用户看到
+“右移没到边就回到麒麟”。park 只能钉住交接瞬间的起点，治不了路径相关的加速漂移。
+
+**载荷 8 字节（小端）**：
+
+```
+i16 x    光标 X，已减去 SM_XVIRTUALSCREEN（归一化到虚拟桌面左上角，0..w-1）
+i16 y    同上，0..h-1
+u16 w    虚拟桌面宽（= HELLO.width）
+u16 h    虚拟桌面高（= HELLO.height）
+```
+
+带上 `w/h` 是为了**不依赖 HELLO 的 10s 节奏**：otikm 刚重启、第一次交接时也能立刻判边
+（旧版必须等 HELLO 到达且在下一次交接生效；否则退回计数判据）。
+
+坐标系与 `OTI_MSG_HELLO` 的 `width/height` 一致：发送方在虚拟桌面内归一化，接收方直接与
+`rem_w/rem_h` 和入口边比较。
+
+**发送**：被驱动侧（Windows `otiagent.ps1`）在主循环里周期性回传本机真实光标（`GetCursorPos`，
+进程已 `SetProcessDPIAware`，物理像素）。cable 模式主循环受取帧阻塞影响约 1.3s/轮，实际约
+1.3s 一条。
+
+**接收/使用**（`otikm_core.c`）：主控端在 `!have_control` 时：
+* 回传在 2.5s 内（`OTI_REM_CURSOR_TTL_MS`）且远端几何已知 → **精确判据**：
+  只有回传确认光标在入口边（容差 `edge_px`），并且之后再往外推 `OTI_REM_CURSOR_PUSH=8` 个计数，
+  才回程；回传说不在入口边时**不按计数回程**（计数清零重锚）。
+* 回传缺失/过期 → 退回旧的 `max(100, edge_px*12)` 计数判据（兼容零软件接收端与旧版 agent）。
+
+**兼容**：新增 type=11 → 两端同版本时生效；旧对端不认 type 11 会忽略，本端退化为旧判据。
+**门禁**：`coretest` 1e（回传不在边不回程、到边再推 8 计数回程、回传过期退回计数）；
+真机：`kmbret`（无回传路径）与真机 Windows agent 联调（回传路径）。
 
 ---
 
