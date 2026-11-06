@@ -105,6 +105,7 @@ typedef struct {
     int      rem_cur_w, rem_cur_h;   /* 回传自带的虚拟桌面尺寸（不依赖 HELLO 的 10s 节奏） */
     long     rem_cur_ms;             /* 收到回传的时刻（本地单调毫秒） */
     int      rem_cur_valid;
+    int      cursor_ever;        /* 对端曾回过 CURSOR：有真实光标反馈，回程不再退化成纯计数 */
     long     rem_cur_anchor_ms;      /* 最近一次“回传确认在入口边”的时刻（用于重锚 drv_*） */
     long     now_ms;                 /* 本次事件时刻，由调用方（handle_local/coretest）写入 */
     int      edge_px;          /* 触边阈值（像素/单位位移） */

@@ -167,12 +167,20 @@ int main(void)
     otikm_core_set_remote_cursor(&c, 1920 - 1, 500, 1920, 1080, 3000); /* 回传确认真到右边缘 */
     expect(push_at(&c, 1, 0, 7, 3000, 10), OTI_ACT_TO_REMOTE, "刚到边、外推 7 计数 → 还不回程");
     expect(push_at(&c, 1, 0, 1, 3070, 10), OTI_ACT_SWITCH_TO_LOCAL, "再外推 1 计数（共 8）→ 回程");
-    /* 回传过期 → 退回旧计数判据（兼容没有回传的旧版/零软件端） */
+    /* 回传过期 + 对端**曾经**回过 CURSOR → 不再退回纯计数判据。
+       真机回归（2026-11-06）：HID 优先窗口把消息泵暂停，回传过期后纯计数把
+       用户正常移动累积到 100 计数就"揪回 Kylin"。 */
     setup(&c);
     expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "再交出去");
     otikm_core_set_remote_cursor(&c, 1000, 500, 1920, 1080, 1000);
     expect(push_at(&c, 127, 0, 1, 1000 + OTI_REM_CURSOR_TTL_MS + 1000, 10),
-           OTI_ACT_SWITCH_TO_LOCAL, "回传过期 → 旧计数判据仍能回程（兼容路径）");
+           OTI_ACT_TO_REMOTE, "回传过期 + 曾有过回传 → 计数判据不生效（防误回程）");
+
+    /* 从未收到回传（零软件端/旧 agent）→ 旧计数判据仍是唯一回程方式 */
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "零软件端：先交出去");
+    expect(push_at(&c, 127, 0, 1, 5000, 10),
+           OTI_ACT_SWITCH_TO_LOCAL, "从未有回传 → 旧计数判据仍能回程（兼容路径）");
 
     printf("=== 2) 右出 / 左回（镜像方向）===\n");
     setup(&c);

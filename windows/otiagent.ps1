@@ -251,7 +251,7 @@ public static class Oti
 
     // 执行一条 16 字节 CDB；toDev=1 表示数据阶段为写。返回 0 成功，否则非 0（含 SCSI 状态）
     const int SENSE_LEN = 32;
-    public static int Exec(IntPtr h, byte[] cdb, byte[] data, bool toDev, out byte scsiStatus, out byte[] sense, int timeoutSec = 5) {
+    public static int Exec(IntPtr h, byte[] cdb, byte[] data, bool toDev, out byte scsiStatus, out byte[] sense) {
         scsiStatus = 0; sense = new byte[SENSE_LEN];
         int dataLen = (data == null) ? 0 : data.Length;
         int sz = Marshal.SizeOf(typeof(SCSI_PASS_THROUGH_DIRECT));   // 56
@@ -267,7 +267,7 @@ public static class Oti
             s.SenseInfoLength = SENSE_LEN;
             s.DataIn = (byte)(dataLen == 0 ? 0 : (toDev ? 0 : 1));   // 0=写(TO_DEV) 1=读(FROM_DEV)
             s.DataTransferLength = (uint)dataLen;
-            s.TimeOutValue = (byte)(timeoutSec > 0 ? timeoutSec : 5);   /* SPTI 单位：秒 */
+            s.TimeOutValue = 5;
             s.DataBuffer = dataPtr;
             s.SenseInfoOffset = (uint)sz;                            // Sense 紧跟结构之后
             s.Cdb = new byte[16];
@@ -347,8 +347,6 @@ public static class Oti
         cdb[3] = (byte)(pending >> 8); cdb[4] = (byte)(pending & 0xFF);
         cdb[14] = (byte)'O'; cdb[15] = (byte)'T';
         byte st; byte[] se;
-        /* 注意：SPTI 的 TimeOutValue 最小单位是秒。实测压到 1s 会让消息读频繁超时、
-           设备被重连（ROLE 全丢），退回 5s；HID 侧的阻塞改由麒麟侧 200ms 超时 + HID 优先约束。 */
         return Exec(h, cdb, m16, false, out st, out se);
     }
 

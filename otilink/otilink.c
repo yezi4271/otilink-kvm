@@ -238,10 +238,14 @@ int otilink_send_hid(struct otilink_dev *d, int type, const uint8_t pkt[OTI_HID_
     cdb[1] = sub;
     memcpy(&cdb[2], pkt, OTI_HID_CDB_COPY);   /* 厂商只把前 12 字节放进 CDB */
     oti_cdb_tail(cdb);
-    /* 与 pump 的"读授权 → 立刻写帧"窗口互斥（否则授权会失效 → 帧写 CHECK_CONDITION） */
-    otilink_cable_io_lock();
+    /* 与 pump 的"读授权 → 立刻写帧"窗口互斥（否则授权会失效 → 帧写 CHECK_CONDITION）。
+       ⚠️ 但 HID 写**绝不等待**这把锁：实测等锁最长 250ms，而设备 I/O 本身 0~1ms
+       （NOTES §75.7）。拿不到锁就直接发——最坏是打断一次帧写（帧有 ACK/重发），
+       代价远小于鼠标冻结几百毫秒。 */
+    int locked = (pthread_mutex_trylock(&g_cable_io) == 0);
     int rc = otilink_cdb(d, cdb, NULL, 0, 1, sense, sizeof(sense));
-    otilink_cable_io_unlock();
+    if (locked)
+        otilink_cable_io_unlock();
     return rc;
 }
 

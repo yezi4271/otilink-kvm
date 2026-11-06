@@ -322,6 +322,7 @@ void otikm_core_set_remote_cursor(otikm_core *c, int x, int y, int w, int h, lon
     c->rem_cur_y = y;
     c->rem_cur_ms = now;
     c->rem_cur_valid = 1;
+    c->cursor_ever = 1;
 }
 
 void otikm_core_set_now(otikm_core *c, long now)
@@ -589,11 +590,14 @@ otikm_act otikm_core_local_mouse(otikm_core *c, const oti_mouse_evt *m, oti_swit
                     if (push >= OTI_REM_CURSOR_PUSH)
                         back = 1;
                 }
-            } else {
-                /* 旧判据（没有回传 / 回传过期）：兼容零软件端与旧 agent。
+            } else if (!c->cursor_ever) {
+                /* 旧判据（从未收到过回传）：兼容零软件端与旧 agent。
                    纯鼠标切换：回程必须是一个"明确的推回"动作，不能一碰就回。
                    原来是 edge_px*4=16 计数（约 0.3mm）→ 在 Windows 上稍微一动就被拉回来，
-                   表现成"过不去 Windows / 键盘在两机之间跳"（2026-10-10 真机）。 */
+                   表现成"过不去 Windows / 键盘在两机之间跳"（2026-10-10 真机）。
+                   ⚠️ 只对**从未有过 CURSOR 回传**的对端生效：一旦对端会回传真实光标，
+                   回传过期（例如 HID 优先窗口把消息泵暂停）时绝不能退回纯计数 ——
+                   否则用户正常移动累积 100 计数就被"揪回 Kylin"（2026-11-06 现场）。 */
                 int need = c->edge_px * 12;
                 if (need < 100)
                     need = 100;

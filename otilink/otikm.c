@@ -141,6 +141,7 @@ struct app {
     int   hid_pend_dx, hid_pend_dy, hid_pend_wheel, hid_pend_buttons;
     int   hid_pend_dirty, hid_sent_buttons;
     long  hid_flush_ms;               /* 上次真正发 HID 鼠标包的时刻 */
+    long  hid_active_ms;              /* 最近一次 HID 鼠标发送时刻（HID 优先窗口） */
     int abs_last_x, abs_last_y, abs_have;  /* 收到绝对坐标时换算相对位移用 */
     long hello_last_ms;               /* 上次发 HELLO 的时间 */
     struct oti_clip clip;
@@ -814,7 +815,32 @@ static void hid_flush_mouse(struct app *a)
     /* 描述符每轴只有 1 字节有符号 → 大位移必须拆成多包 */
     uint8_t pk[8 * OTI_HID_PKT_LEN];
     int np = otihid_mouse_packets(buttons, dx, dy, wheel, pk, 8);
-    oti_tr_set_hid_busy(1);          /* 让消息泵这一小段不要插进来读设备 */
+    /* HID 优先窗口：只要鼠标还在动，就不让消息泵开始新的设备读。
+       实测（NOTES §75.8）：关掉 otikm 泵、只留 Windows 代理读时，合成 HID 流
+       的指针更新很平滑；把 otikm 泵放回来就出现 100~350ms 冻结 —— 泵的一次
+       MSC 读会在设备侧把 HID 报表延迟数百毫秒。窗口在捕获循环空闲 30ms 后关闭。
+
+       ⚠️ 但**指针在入口边附近时不要暂停泵**：回程判据需要 Windows 回传的真实光标，
+       泵一停回传就过期，回程变成"时灵时不灵"（2026-11-06 现场）。入口边附近允许
+       读设备（最多让指针在该区域卡一下），换回可靠的"真实光标在入口边"判据。 */
+    int near_edge = 0;
+    pthread_mutex_lock(&a->lock);
+    int rw = a->core.rem_w > 0 ? a->core.rem_w : a->cfg.screen_w;
+    int rh = a->core.rem_h > 0 ? a->core.rem_h : a->cfg.screen_h;
+    int ex = a->core.rem_entry_x, ey = a->core.rem_entry_y;
+    int marg = 400;                            /* 远端像素 */
+    if (ex == 1)      near_edge = a->core.rem_x >= rw - 1 - marg;
+    else if (ex == 0) near_edge = a->core.rem_x <= marg;
+    else if (ey == 1) near_edge = a->core.rem_y >= rh - 1 - marg;
+    else if (ey == 0) near_edge = a->core.rem_y <= marg;
+    pthread_mutex_unlock(&a->lock);
+    if (near_edge) {
+        a->hid_active_ms = 0;
+        oti_tr_set_hid_busy(0);
+    } else {
+        a->hid_active_ms = now_ms();
+        oti_tr_set_hid_busy(1);
+    }
     for (int i = 0; i < np; i++) {
         int hrc = otilink_send_hid(cd, OTI_HID_TYPE_MOUSE, pk + i * OTI_HID_PKT_LEN);
         note_send_result(a, hrc);
@@ -826,7 +852,6 @@ static void hid_flush_mouse(struct app *a)
             a->hid_fail_streak++;
         }
     }
-    oti_tr_set_hid_busy(0);
 }
 
 /*
@@ -1372,6 +1397,8 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
             a->hid_pend_dx = a->hid_pend_dy = a->hid_pend_wheel = 0;
             a->hid_sent_buttons = a->mouse_buttons;
             a->hid_flush_ms = now_ms();
+            a->hid_active_ms = 0;
+            oti_tr_set_hid_busy(0);
             /* 告诉对端"我接管了，你回到被动"：只有对端是**厂商/零软件端**时才需要 F24 令牌。
                对端跑我们的 agent 时它不驱动 KM，令牌纯属浪费 —— 而且真机实测线缆的键盘接口
                每个会话只送得动**几条**报表，这 6 条 F24 会把额度吃掉，导致随后用户按键全丢
@@ -1395,6 +1422,8 @@ static void handle_local(struct app *a, int is_mouse, const oti_mouse_evt *m,
             a->hid_pend_dirty = 0;
             a->hid_pend_dx = a->hid_pend_dy = a->hid_pend_wheel = 0;
             a->hid_sent_buttons = 0;
+            a->hid_active_ms = 0;
+            oti_tr_set_hid_busy(0);
             request_release_all(a);           /* 关键：避免对端卡键（泵线程先发这个） */
             /* 告诉对端"我放手了"：对端据此恢复自己的键鼠（否则它会一直吞着） */
             request_token(a);
@@ -2710,6 +2739,11 @@ static void run_capture(struct app *a)
         if (pr == 0) {
             flush_mouse(a);
             hid_flush_mouse(a);             /* 尾包：4ms 内没有新事件也要把合并的位移发出去 */
+            /* 鼠标停了 >30ms：重新允许消息泵读设备（剪贴板/ROLE/CURSOR 恢复）。 */
+            if (a->hid_active_ms && now_ms() - a->hid_active_ms > 30) {
+                a->hid_active_ms = 0;
+                oti_tr_set_hid_busy(0);
+            }
             continue;
         }
         for (int i = 0; i < a->ncap; i++) {
