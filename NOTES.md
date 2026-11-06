@@ -4949,3 +4949,22 @@ otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otili
 * 回滚：`git revert` 本提交 → `gate.sh --deploy-kylin` → 重启 otikm。
 * 现场临时文件：Kylin `/tmp/otikm-old`、`/tmp/merge-gesture.txt`、`/tmp/merge-*.log`、`/tmp/hidrate`、
   `/tmp/hidmove`（调试用，可删）；Windows 剪贴板代理重启过一次（`restart-clip.vbs`，单实例守卫正常）。
+
+### 75.5 追加（2026-11-06）：4ms 合并后仍卡 → 主因线索转向 Windows 侧线缆读
+
+用户复测原话："还是会卡，hid鼠标转发会打断我鼠标移动吗？"
+
+* **1ms 采样 Windows 指针**（`CursorTrace.exe`，按位置变化记录）：连续移动中出现大量
+  **100–1400ms 的冻结**，最长一次 **2.49s**；同一时段 Windows 剪贴板代理日志的
+  `LOOP 慢轮 … C[取帧]` 为 **1.3–9s**，`OTI_MSG_CURSOR` 回传间隔经常 >1s。
+* 线缆是**单队列**设备：Windows 侧 SPTI 读未完成时，麒麟侧发来的 HID 鼠标包会被堵住
+  —— 这解释了"为什么合并设备写没根治"（卡在设备读，不在设备写速率）。
+* 追加改动（第二个提交）：`windows/otiagent.ps1` 主循环线缆**空闲轮询每轮 → 30ms**
+  （`txq/rxq` 非空时仍立即泵，剪贴板/大文件不降速），空闲小睡 2ms→10ms。
+  部署后日志有 `线缆轮询: 空闲 30ms … build pump-throttle-1`；安静窗口内
+  `LOOP 慢轮` 为 0、ROLE 回传 age ~0.3–1s。
+* **复现过程中遇到一次帧会话卡死**（不是本次改动回归）：Kylin `ERR send ROLE rc=526080`、
+  Windows 侧 160s 收不到帧；`usb 1-4.2` unbind/bind + 两端重启后恢复。
+  以后遇到"剪贴板全废 + 光标回传停"先按这个顺序复位，别只重启单侧。
+* **仍未确认**：真人复测手感；代理进程 CPU 仍约 **99% 单核**（空闲小睡收益没达到预期，
+  下一步可把线缆 I/O 移出主循环或用更短 SPTI 超时）。
