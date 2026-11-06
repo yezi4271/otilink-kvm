@@ -383,10 +383,26 @@ int oti_xfer_tx_poll(struct oti_xfer_tx *t)
            不能只等下一次 RESUME，否则补发的片丢了就永久卡住。每 10s 把缺片再补一遍。 */
         if (t->todo && t->todo_n > 0 && now >= t->retx_resend_ms) {
             t->retx_resend_ms = now + 10000;
-            for (uint32_t i = 0; i < t->todo_n; i++)
-                for (int rep = 0; rep < 3; rep++)       /* 补发也丢帧 → 每片补 3 份 */
-                    (void)tx_send_part(t, t->todo[i]);
-            xlog(t, "  未收到裁决，主动补发 %u 片 ×3（防 RESUME/数据帧丢失）", t->todo_n);
+            /* 逐片确认**真正入队/写出**：send_wait 队列满或写失败会返回非 0，
+               以前忽略 rc 直接连发 → 帧根本没进队列，接收端永远差那几片（实测 23 片一封不到）。
+               队列只有 32 槽，一次连发 69 帧必然大量返回 -2。这里逐片退避重试。 */
+            int sent_ok = 0;
+            for (uint32_t i = 0; i < t->todo_n; i++) {
+                int rc = 0, tries = 0;
+                do {
+                    rc = tx_send_part(t, t->todo[i]);
+                    if (rc != 0)
+                        usleep(5 * 1000);
+                } while (rc != 0 && ++tries < 40);
+                if (rc != 0) {
+                    xlog(t, "  [warn] 补发第 %u 片失败 rc=%d（本轮发送 %d/%u 片后放弃）",
+                         t->todo[i], rc, sent_ok, t->todo_n);
+                    break;
+                }
+                sent_ok++;
+                usleep(2000);           /* 逐片小间隔：别把 32 槽队列一次打满 */
+            }
+            xlog(t, "  未收到裁决，主动补发缺片（逐片确认入队 %d/%u）", sent_ok, t->todo_n);
         }
         /* DONE 帧同样是单帧，丢了收端就永远不裁决 → 每 5s 重发（幂等） */
         if (now >= t->verdict_resend_ms) {

@@ -5221,6 +5221,27 @@ otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otili
   给`tx_send_part` 补发加 rc 检查+退避重试（确认真正入队），并给 Windows 泵加"每帧 ENQ/TXF/RXF+写返回码"日志定位。
 * Windows→麒麟 302MB 未测（jar 未成功落到 Windows）。
 
+### 76.10 末片补发修复与最终重测（2026-11-06 16:44–17:00）
+
+**修复：末片补发改为"逐片确认入队 + 退避重试"**
+原实现一次连发 23 片×3=69 帧，而传输层 txq 只有 32 槽且慢写退避会让 `oti_tr_send_wait`
+返回 -2（根本没入队）；旧代码忽略 rc → 接收端永远差那 23 片。
+现在逐片 `tx_send_part` 检查 rc，非 0 退避 5ms 重试（最多 40 次），片间 2ms 间隔。
+
+**验证（md5 级）**
+* **20MB 文件麒麟→Windows：PASS**。`t20.bin` 328 片 8.2 秒（2.4MB/s），接收端 md5
+  `5c98fa5aee02ed66774907ebb0607ed3` 与源一致（本批大文件全部完成）。
+* **302MB test.jar 仍卡在 99.0%（4687/4732）**：这次连"RESUME 缺片位图"都没到麒麟
+  （Windows 每份 DONE 都回「缺 28 片」，麒麟日志无任何 RECV 裁决）→ 无缺片清单可补，
+  120s 后中止。即**根因在 Windows→麒麟方向控制帧（RESUME）的投递**，不是补发逻辑本身。
+* test.jpg 双向仍 PASS；文本双向 PASS。
+
+**下一轮唯一重点**：把"接收端缺片状态"可靠送到发送端。候选：
+① 接收端 RESUME 冗余 ×5 并在每次收到 DONE 时重发（已重发，但单帧丢失率太高）；
+② 发送端在收不到 RESUME 时**盲补最近 N 片**（例如最后 64 片）作为兜底；
+③ 分片窗口内逐片 ACK（改动大，但根治）；
+④ 给 Windows 泵加逐帧 ENQ/TXF/RX + 写 rc 日志，先确认 RESUME 到底写没写出去。
+
 ### 76.6 现场应急（本轮已做）
 
 * 11:37 对 Kylin `~/otilink/otitrans.c` 做了**临时热修**（`if (0 && g_hid_busy)`）并重启 otikm，
