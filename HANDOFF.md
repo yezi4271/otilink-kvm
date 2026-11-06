@@ -168,10 +168,17 @@
 > * 新门禁：`--hw-clipstall`（hidduringclip.sh）、`--hw-freeze`（winfreeze.sh）。
 > 真机数据：`hidlat MAXGAP=15ms`（旧 372~482ms，650KB 剪贴板突发期间）、`kmbret PASS=21 FAIL=0 WARN=4`
 > （小步回程成功、park 37 包、**交接耗时 15ms**；现场真人日志还有一次 `交接耗时 35ms`）、麒麟 `SLOWOP=0`；
-> 剪贴板双向已由 win-pump 在解锁后手测互通。**未验证**：Windows 光标冻结客观值（winfreeze 需 HID 驱动态）、
-> `clipreg/xferreg` 正式回归（解锁窗口未排上）、Kylin→Windows 发端收不到 ACK（功能正常，NOTES §76.5）——
-> 详见 `NOTES §76.5`。⚠️ 仓库 `windows/otiagent.ps1` = 真机部署件 **nativepump-2**（逐字节核对）；
-> 未验证的 nativepump-3 硬化 patch 在 `/tmp/nativepump-3.patch`，不要直接部署。
+> 剪贴板双向已由 win-pump 在解锁后手测互通。**⚠️ 2026-11-06 13:1x 解锁后正式回归（残活）**：
+> 鼠标/交接指标保持达标；但 `clipreg` 最佳 **PASS=15 FAIL=2**（多次跑 12~15 跳动），失败全是
+> **内容乱序/陈旧覆盖**（收到上一笔旧内容），帧解码无失败；`clipshort` 7/7 过。
+> 逐帧 trace 定位：ACK **迟到**（`RECV ACK … active=0`；`ENQ type=6→TXF` 间隔 ~1.1s；同期 `SLOWOP` 250~330ms）——
+> Windows 泵"每次授权写 2 帧"遇上 CURSOR 25/s 入队 > 授权写速 → txq 积压 ~1s → ACK/CLIP 排在陈旧 CURSOR 后
+> → 超过发送端 1.5s 期限 → 重发风暴 → 旧帧覆盖新帧。**修法未完成**（候选：自适应 CURSOR 节奏、放宽 ACK 期限、
+> 剪贴板按 fid 单调丢弃旧帧）；nativepump-4 实验（CURSOR 100ms + 4 帧/授权）未变好已回退；
+> 麒麟读侧退避阈值 30→150ms 保留。详见 `NOTES §76.5` 第 8 条。
+> **未验证**：Windows 光标冻结客观值（winfreeze 需 HID 驱动态）、`xferreg` 正式回归。
+> ⚠️ 仓库 `windows/otiagent.ps1` = 真机部署件 **nativepump-2**（逐字节核对）；
+> 未验证的 nativepump-3 patch 在 `/tmp/nativepump-3.patch`，不要直接部署。
 > 回滚：Windows `deploy.sh --restart` 前把 `C:\Users\Public\otiagent.baseline.ps1` 拷回
 > （或 `git checkout -- windows/otiagent.ps1`）；麒麟 `gate.sh --deploy-kylin` + 重启 otikm。
 
