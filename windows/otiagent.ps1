@@ -82,7 +82,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 # BuildTag：改本文件必须 bump（日志证据行/部署核对用；与 otiagent2.cs 的 BuildTag 分开）。
 #   pump-throttle-1 → nativepump-1：线缆 I/O 从 PowerShell 主循环搬进 Add-Type 的 C# 后台泵线程。
 #   nativepump-2：锁屏时 Set-Clipboard 抛 ExternalException 会把代理整个带走 —— CLIP 文本应用加 catch（2026-11-06 真机）。
-$script:BuildTag = 'nativepump-12'
+$script:BuildTag = 'nativepump-14'
 
 # ---- 单实例守卫（L4 的剪贴板代理版）----
 # 同一条线缆帧管道**只能有一个读者**。两个实例会互相抢走发送授权消息与帧，症状是
@@ -522,8 +522,11 @@ public static class Oti
 //     写帧期间不插别的设备操作（与 otilink/otitrans.c 的 cable_pump_once_locked 语义一致）。
 public static class CablePump
 {
-    public const string BuildTag = "nativepump-12";
-    public const int QCAP = 256;   // 大文件分片突发：64 太小，PS 处理跟不上会丢帧（实测 302MB 传输丢 78%）              // 每个方向的队列容量（满丢最旧并计数）
+    public const string BuildTag = "nativepump-14";
+    public const int QCAP = 256;   // 每个方向队列容量（大文件分片突发：64 太小，PS 跟不上会丢帧）
+    // 大文件传输期间**暂停光标遥测**：单队列设备上双向同时写帧会互相堵
+    // （实测两侧帧写都出现 ~1.28s 的对称卡顿 → 传输速率掉到 0.1~0.4MB/s）。
+    public static volatile bool SuppressCursor = false;
     const string LogPath = @"C:\Users\Public\cable.log";
     const int CURSOR_MS = 150;               // 光标遥测周期 40→150ms（6.7/s）：回程判据 TTL 300ms 内足够；
                                              // 40ms(25/s) 会超过设备授权写速、把 ACK/CLIP 挤到队后（2026-11-06 实测）
@@ -830,7 +833,8 @@ public static class CablePump
     // 每轮补背景帧：CURSOR(11, 40ms) / ROLE(10, 1s) / HELLO(8+9, 10s)
     static void FillBackground(uint now)
     {
-        if ((uint)(now - lastCursorTick) >= CURSOR_MS)
+        uint cursorPeriod = SuppressCursor ? 1000u : (uint)CURSOR_MS;
+        if ((uint)(now - lastCursorTick) >= cursorPeriod)
         {
             lastCursorTick = now;
             int pend;
@@ -3070,8 +3074,10 @@ function Handle-FileDone([byte[]]$pl) {
     if ($nl -le 1024 -and $pl.Length -ge (48 + $nl)) { $name = [Text.Encoding]::UTF8.GetString($pl, 48, $nl) }
     $r = $script:fileRx
     if (-not $r.active -or $r.fid -ne $fid) {
-        Write-Host "  [warn] 收到未知传输的 DONE（fid=$fid），回 ABORT"
-        [void](Send-FileCtrl $fid 2 4 0 0 0 0 $name)
+        # 已完成的 DONE 重发（发送端每 5s 重发、完成前也可能有在途副本）不该回 ABORT：
+        # 多文件批次共用同一 fid，一个"迟到 DONE"的 ABORT 会把整批（含后续文件）一起干掉。
+        # 实测：jpg 完成后迟到 DONE → 回 ABORT → 麒麟中止整批，jar 只发了 16 片。
+        Write-Host "  [xfer] 收到已完成/未知传输的 DONE（fid=$fid，name=$name），忽略"
         return
     }
     try { $r.fs.Flush(); $r.fs.Close() } catch { }
@@ -3316,6 +3322,12 @@ while ($true) {
                 [void](Restart-CablePump $why)
             }
         }
+    }
+
+    # 大文件传输期间暂停 CURSOR 遥测（减少双向帧写争抢；文件传完自动恢复）
+    if ($useCable) {
+        $xferBusy = $script:fileRx.active -or $script:fileTx.active
+        [CablePump]::SuppressCursor = $xferBusy
     }
 
     # 1) 取一条消息体（TCP = 4 字节长度前缀；cable = C# 泵线程内存队列；SPTI = 直接读）

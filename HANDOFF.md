@@ -169,6 +169,9 @@
 > 真机数据：`hidlat MAXGAP=15ms`（旧 372~482ms，650KB 剪贴板突发期间）、`kmbret PASS=21 FAIL=0 WARN=4`
 > （小步回程成功、park 37 包、**交接耗时 15ms**；现场真人日志还有一次 `交接耗时 35ms`）、麒麟 `SLOWOP=0`；
 > 剪贴板双向已由 win-pump 在解锁后手测互通。
+> **⚠️ 2026-11-06 16:55 拔插复位后重测**：文本双向 PASS；`test.jpg` 双向 PASS（md5 一致）；
+> `test.jar` 302MB 麒麟→Windows **99.1%（4691/4732 片）**，末 23 片补发帧系统性不到达（每 10s ×3 补发、接收端每份 DONE 都回缺片位图），120s 中止。
+> 已修「迟到 DONE 回 ABORT 杀整批」「缺片补发 ×3」「传输中暂停 CURSOR」；下一轮：补发按 rc 重试 + 给 Windows 泵加逐帧投递日志。详见 NOTES §76.9。
 > **⚠️ 2026-11-06 16:15 用户指定文件实测（test.jpg/test.jar 双向）**：`test.jpg` **双向都通过且 md5 一致**
 > （K→W Windows 侧多份副本 `d500bb78…`；W→K `/tmp/otilink-files-2297957/test.jpg` 同 md5）。
 > `test.jar`(302MB) K→W 最好 **99.4%（缺 27/4732 片）** 后超时中止；W→K 因 jar 未落到 Windows 未能测。

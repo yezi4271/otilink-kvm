@@ -384,8 +384,9 @@ int oti_xfer_tx_poll(struct oti_xfer_tx *t)
         if (t->todo && t->todo_n > 0 && now >= t->retx_resend_ms) {
             t->retx_resend_ms = now + 10000;
             for (uint32_t i = 0; i < t->todo_n; i++)
-                (void)tx_send_part(t, t->todo[i]);
-            xlog(t, "  未收到裁决，主动补发 %u 片（防 RESUME 丢帧）", t->todo_n);
+                for (int rep = 0; rep < 3; rep++)       /* 补发也丢帧 → 每片补 3 份 */
+                    (void)tx_send_part(t, t->todo[i]);
+            xlog(t, "  未收到裁决，主动补发 %u 片 ×3（防 RESUME/数据帧丢失）", t->todo_n);
         }
         /* DONE 帧同样是单帧，丢了收端就永远不裁决 → 每 5s 重发（幂等） */
         if (now >= t->verdict_resend_ms) {
@@ -656,7 +657,9 @@ int oti_xfer_rx_ctrl(struct oti_xfer_rx *r, uint32_t fid, uint16_t kind, uint16_
     if (kind != OTI_XFER_DONE)
         return -1;
     if (!r->active || r->fid != fid) {
-        rlog(r, "[warn] 收到未知传输的 DONE（fid=%u），回 ABORT", fid);
+        /* 已完成的 DONE 重发不应回 ABORT：多文件批次共用同一 fid，
+           迟到的 DONE 回 ABORT 会把整批后续文件一起终止（与 Windows 侧同修）。 */
+        rlog(r, "[warn] 收到已完成/未知传输的 DONE（fid=%u），忽略", fid);
         return -1;
     }
     if (nparts != r->nparts || total != r->total) {
