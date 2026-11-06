@@ -814,6 +814,7 @@ static void hid_flush_mouse(struct app *a)
     /* 描述符每轴只有 1 字节有符号 → 大位移必须拆成多包 */
     uint8_t pk[8 * OTI_HID_PKT_LEN];
     int np = otihid_mouse_packets(buttons, dx, dy, wheel, pk, 8);
+    oti_tr_set_hid_busy(1);          /* 让消息泵这一小段不要插进来读设备 */
     for (int i = 0; i < np; i++) {
         int hrc = otilink_send_hid(cd, OTI_HID_TYPE_MOUSE, pk + i * OTI_HID_PKT_LEN);
         note_send_result(a, hrc);
@@ -825,6 +826,7 @@ static void hid_flush_mouse(struct app *a)
             a->hid_fail_streak++;
         }
     }
+    oti_tr_set_hid_busy(0);
 }
 
 /*
@@ -3631,6 +3633,9 @@ int main(int argc, char **argv)
         return 1;
     }
     say(&a, "传输就绪: %s", oti_tr_name(a.tx));
+    /* 消息读超时保持默认 5s：实测压到 200ms 会让设备消息读频繁超时、帧通道
+       直接卡死（ROLE/剪贴板全断）。HID 侧的阻塞改由"泵在 HID 写期间不开始新读"
+       约束（见 hid_flush_mouse / oti_tr_set_hid_busy）。 */
     maybe_send_hello(&a);          /* 先把自己的屏幕几何告诉对端 */
     g_app_for_signal = &a;
     signal(SIGINT, on_signal);

@@ -4968,3 +4968,28 @@ otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otili
   以后遇到"剪贴板全废 + 光标回传停"先按这个顺序复位，别只重启单侧。
 * **仍未确认**：真人复测手感；代理进程 CPU 仍约 **99% 单核**（空闲小睡收益没达到预期，
   下一步可把线缆 I/O 移出主循环或用更短 SPTI 超时）。
+
+### 75.6 有界超时实验失败 + 改为 HID 优先（2026-11-06）
+
+用户同意"可以动设备会话"后，试了两端的有界超时：
+
+* 麒麟：消息读（16 字节）SG_IO 超时 5000ms → **200ms**；
+* Windows：`ReadMsgP` 的 SPTI `TimeOutValue` 5s → **1s**（SPTI 最小单位是秒）。
+
+**结果：帧通道直接卡死**（不可用，已回滚）：
+
+* 麒麟侧 653KB 剪贴板重发 3 次全无 ACK；`/tmp/otikm.log` 没有 `ERR recv`（超时走 `-2`，是静默路径）。
+* Windows 代理日志 `ROLE: peer 未收到`、`设备连续读取失败，尝试重连`、`会话自愈：20s 无入帧…` 反复出现。
+* 结论：这块线缆固件/驱动的消息读在正常竞争下就可能要 >200ms；SPTI 更不能低于 1s，1s 已经会 abort。
+  **不要再用"缩短读超时"来救 HID 卡顿**。
+
+**保留的改动：HID 优先（弱版）**：
+
+* `otilink.c/h` 增加 `otilink_cdb_len_to()` / `otilink_msg_read_to()`（超时参数，默认仍是 5000）；
+* `otitrans.c/h` 增加 `oti_tr_set_msg_timeout()`、`oti_tr_set_hid_busy()`；`cable_pump_once()` 在
+  HID 包正在写设备时**不开始**新的消息读；
+* `otikm.c` 的 `hid_flush_mouse()` 在发 HID 包期间置 busy、发完清除。
+
+这是"不要在 HID 写的时候插读"，不是"把读超时调短"；但**已经开始的 5s 读仍会把设备占住**，
+所以只能减少碰撞概率。若用户复测仍卡，剩余根因是 Windows SPTI 读无法取消（最小 1s 超时），
+真正的修法只能是 Windows 侧 overlapped SCSI + `CancelIoEx`（50ms 级取消）或改传输/角色架构。
