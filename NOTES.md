@@ -5135,6 +5135,19 @@ otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otili
    650KB≈30 帧≈100ms 设备时间，用户无感）。疑点：ACK 帧（type=6）在某一侧 rx/tx 队列/合并
    路径被吞，或 ack crc 口径不一致；下一轮用 `-Verbose` 或临时 trace 定位。
 
+### 76.5.1 环境干扰：火绒（Huorong）安全软件拦截 VBS/隐藏 PowerShell（2026-11-06 现场）
+
+* 用户现场报告：**`vendor-off.vbs` 被火绒拦截**（已手动加信任区）。
+* 影响面（本轮实测到的"假失败"）：
+  * `deploy.sh --restart` / `restart-clip.vbs` 拉起代理**间歇失败**，日志只剩 `已有一个剪贴板代理在跑` 或
+    "代理没起来"——排查中反复遇到，不是代码 bug；VBS 脚本起不来时单实例守卫会看到正在退出的旧进程而自杀。
+  * 被拦截/挂起的隐藏 PowerShell 进程会让**剪贴板代理主循环**停在早期启动阶段（pump 线程仍在跑：
+    CURSOR 帧照发，但 PS 不轮询剪贴板、不处理收到的 CLIP），表现就是"鼠标正常、剪贴板时好时坏"。
+* 处置（给用户）：把 `C:\Users\<用户名>\otilink\`（`otiagent.ps1`、`restart-clip.vbs`、`restart-km.vbs`、
+  `clip-watchdog.vbs`、`otilink-agent.vbs`）与 `C:\Users\Public\vendor-off.vbs`、`otiagent2.exe` 加入火绒信任区；
+  之后重启剪贴板代理（双击 `restart-clip.vbs` 或 `cd re/windows && ./deploy.sh --restart`）。
+* 结论：**安全软件对本项目是"第二主人"级别的干扰源**（相当于 L1 的另一种形态），排障时先确认它没拦。
+
 ### 76.6 现场应急（本轮已做）
 
 * 11:37 对 Kylin `~/otilink/otitrans.c` 做了**临时热修**（`if (0 && g_hid_busy)`）并重启 otikm，
