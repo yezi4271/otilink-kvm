@@ -148,8 +148,9 @@ void otilink_set_ops(struct otilink_dev *d, const struct oti_scsi_ops *ops)
         memset(&d->ops, 0, sizeof(d->ops));
 }
 
-int otilink_cdb_len(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
-                    void *data, unsigned len, int to_dev, struct oti_scsi_result *res)
+int otilink_cdb_len_to(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
+                       void *data, unsigned len, int to_dev,
+                       struct oti_scsi_result *res, int timeout_ms)
 {
     if (d->ops.exec)                      /* 注入的后端（仿真设备/测试） */
         return d->ops.exec(d->ops.ctx, cdb, data, len, to_dev, res);
@@ -169,7 +170,7 @@ int otilink_cdb_len(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
     memset(sense, 0, sizeof(sense));
     hdr.sbp = sense;
     hdr.mx_sb_len = sizeof(sense);
-    hdr.timeout = 5000;
+    hdr.timeout = timeout_ms > 0 ? (unsigned)timeout_ms : 5000;
     int io = ioctl(d->sg, SG_IO, &hdr);
     if (res) {
         memset(res, 0, sizeof(*res));
@@ -192,10 +193,16 @@ int otilink_cdb_len(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
     return 0;
 }
 
+int otilink_cdb_len(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
+                    void *data, unsigned len, int to_dev, struct oti_scsi_result *res)
+{
+    return otilink_cdb_len_to(d, cdb, cdb_len, data, len, to_dev, res, 5000);
+}
+
 int otilink_cdb_ex(struct otilink_dev *d, const uint8_t cdb[16], void *data,
                    unsigned len, int to_dev, struct oti_scsi_result *res)
 {
-    return otilink_cdb_len(d, cdb, 16, data, len, to_dev, res);
+    return otilink_cdb_len_to(d, cdb, 16, data, len, to_dev, res, 5000);
 }
 
 int otilink_cdb(struct otilink_dev *d, const uint8_t cdb[16], void *data,
@@ -450,7 +457,8 @@ int otilink_send_frame(struct otilink_dev *d, const void *body, size_t len)
     return otilink_cdb(d, cdb, frame, OTI_FRAME_SIZE, 1, sense, sizeof(sense));
 }
 
-int otilink_msg_read(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx)
+int otilink_msg_read_to(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx,
+                        int timeout_ms)
 {
     /* 消息管道：0xD8/0x00/0x03 + IN **16 字节**（厂商 ProcessIdleState @0x4e30）。
        CDB[3..4] = 本机待发送帧数（16 位大端），设备据此决定是否发放 0x07 发送授权。 */
@@ -462,7 +470,15 @@ int otilink_msg_read(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx
     cdb[4] = (uint8_t)(pending_tx & 0xff);
     oti_cdb_tail(cdb);
     memset(m16, 0, 16);
-    return otilink_cdb(d, cdb, m16, 16, 0, sense, sizeof(sense));
+    struct oti_scsi_result r;
+    int rc = otilink_cdb_len_to(d, cdb, 16, m16, 16, 0, &r, timeout_ms);
+    (void)sense;
+    return rc;
+}
+
+int otilink_msg_read(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx)
+{
+    return otilink_msg_read_to(d, m16, pending_tx, 5000);
 }
 
 int otilink_recv_frame(struct otilink_dev *d, uint8_t frame[OTI_FRAME_SIZE])

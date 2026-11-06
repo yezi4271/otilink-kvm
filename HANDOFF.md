@@ -12,6 +12,12 @@
 > AIC 驱动用 `install /bin/false` + udev `.disabled` **挡死**（重启后 `lsmod | grep aic` 为空）；
 > `panic_on_oops=0` 用 **late unit** `otilink-panic-on-oops.service`（`After=kdump-tools.service`）落地 ——
 > **只改 `KDUMP_SYSCTL` 无效**（`kdump-config` 末尾强制设回 1）。**与对拷线无关**。
+> **⚠️ 2026-11-05 更新（NOTES §74）：「蓝屏 / 键盘输入不了」还有第二个真因** —— 麒麟内核内置
+> `kysos_key` 把**左 Meta+H** 当 SOS 组合键，20s 无用户态确认就切 VT 到 `tty5` → `console_lock` 死锁 →
+> X 摘掉全部输入设备。**Windows 上 Win+H 是"语音输入"**，共享键盘（otikm EVIOCGRAB 挡不住内核 input
+> handler）时误触即中招。已装 `otilink-sosguard.service`（`otilink/sosguard.sh`）在超时前写
+> `/sys/kos_rescue/rescue_feedback=1` 取消救援；回归 `gate.sh --hw-sos`（`otilink/sosreg.sh`）。
+> 已死锁只能硬重启（`chvt`/`systemctl reboot` 都会卡在 console_lock）。
 > **⚠️ 换无线网卡会打断 Windows 热点 relay**：`127.0.0.1:2222`（`ssh kylin` 别名）按写死的 MAC
 > 找麒麟 IP，换卡后报 `Connection reset by peer`。已改成多 MAC 列表（新卡在前）+ IP fallback；换卡后
 > 记得更新 `C:\Users\<你的用户名>\dsh-kylin-relay.ps1` 并重启 relay（`RUNBOOK §21`）。实测：**`ssh kylin`（relay）是 LAN 直连 1.7–2.1s；`ssh kylin-ts`（tailscale）在本机走 DERP 中转 5.3–8.1s** —— 交互用前者、容错用后者。
@@ -47,12 +53,35 @@
 > **欠账**：① 真人复测（推到 Windows 打字，看是否还重复）；② `re/portable/build.sh` 重建
 > `dist/`（`--portable` 现在 2 FAIL：包内指纹过期，与本次修复无关）；③ §61.3 键盘改走帧管道（根治丢包）。
 >
+> **第 60 轮（现场，2026-11-05，PR 待并）**：用户报「鼠标在 Windows 一卡一卡，Kylin 正常」。
+> 拓扑 B：G304 1000Hz × REL_X/REL_Y 两事件 ≈ **2000 次 HID 设备写/秒**，而线缆单队列实测上限
+> ~**1078 次/秒**（hidrate，与 otikm 并发；空载 maxsend=1ms）→ 捕获线程积压/evdev 丢事件。
+> 修法：`otikm.c` HID 直发也按 **4ms 合并**（按键变化立即发、poll 超时补尾包、交接清空），
+> 设备写降到 ≤250/秒。已部署（static 81 PASS、coretest 51/51、deploy-kylin PASS）。
+> **待办**：真人复测手感（sim 手势串行，复现不出积压）；若仍卡，下一刀查剪贴板大帧堵 HID
+> （`--hw-lat` 在 653KB 图片同步期间 MAXGAP=319~502ms）与 Windows 代理主循环 90% CPU/秒级慢轮。
+> 详见 `NOTES §75`。
+>
 > **第 57 轮（现场，2026-10-14）**：用户报「kylin→Windows 复制失败」。真因 = `oticlip.c` 的
 > `popen("xclip … -o")` **无超时**，遇到不响应的选区所有者时 `clip_thread` 被**永久卡死**
 > （现场一个 `xclip -t text/uri-list -o` 子进程活了 41 小时）→ 本地剪贴板再也不被读取 →
 > **L→W 一条都发不出**，而 W→L（RX 线程）正常、拔插无效。已修：新增 `xclip_read_popen()`，
 > 读路径统一 `timeout 3 xclip …`；重启 otikm 后双向恢复，`--static` 80 PASS、`coretest` 45/45。
 > 详见 `NOTES §72`。
+>
+> **第 58 轮（现场，2026-11-03）**：用户报「鼠标在 Windows 时右移没到边就回 Kylin」。
+> 真因 = 回程判据只看**未缩放 HID 计数**，而 Windows 指针加速让净计数与像素漂移
+> （实测：park 到 2559 后快左移 500 计数、慢右移 608 计数，净 +100 触发回程时 Windows 光标
+> 只有 **1491**，离右边缘 **1068px**）。修法 = Windows 剪贴板代理回传真实光标
+> （新增 `OTI_MSG_CURSOR=11`，PROTOCOL §6.2），主控端要求“回传确认在入口边 + 再外推 8 计数”
+> 才回程；无回传/过期退回旧计数判据。同轮按用户指令把锁屏看护改成**不抢控制权**
+> （只拒绝再交出去）。真机正向验证回程时 Windows 光标 = 2559、负向停在 1499 不回。
+> coretest 51/51、selftest_proto 新增 CURSOR 全过；`--static` 仅剩工作树布局导致的
+> `re/` 路径检查失败（与本次无关）。**仓库已顺带同步现网 10-27 的锁屏看护/sim 修正/return_inset 96**
+> （公开 HEAD 10-14 落后于现网），详见 `NOTES §73`。
+> **回归修复（16:15 现场）**：锁屏拒绝交接后核心仍 remote → 看门狗重 grab 键盘 → 锁屏无法输入；
+> 两个 `screen_locked` 守卫已改为 `force_local + apply_grab(0)`（真 remote 会话锁屏仍不抢），
+> 现场日志 `已独占` 计数 0，详见 `NOTES §73.8`。
 >
 > **第 53 轮（现场，2026-10-09）**：一次收敛四条独立真因 —— ①设置窗口闪烁=`ukui-control-center` 重绘循环（与对拷线无关）；
 > ②Kylin 键盘输入不了 + 「回本机→3s 又抓走」乒乓=`hotkey_to_local/remote` 撞 IDEA 的 Ctrl+Alt+←/→（已关成 `none`）；

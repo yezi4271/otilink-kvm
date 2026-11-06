@@ -59,6 +59,24 @@ static otikm_act push(otikm_core *c, int dx, int dy, int times)
     return act;
 }
 
+/* 带时间戳的推位移：用于"对端光标回传"测试（回传新鲜度按 now_ms 判定）。 */
+static otikm_act push_at(otikm_core *c, int dx, int dy, int times, long t0, long step)
+{
+    oti_mouse_evt m;
+    oti_switch_evt sw;
+    otikm_act act = OTI_ACT_LOCAL;
+    for (int i = 0; i < times; i++) {
+        memset(&m, 0, sizeof(m));
+        m.dx = (int16_t)dx;
+        m.dy = (int16_t)dy;
+        otikm_core_set_now(c, t0 + (long)i * step);
+        act = otikm_core_local_mouse(c, &m, &sw);
+        if (act == OTI_ACT_SWITCH_TO_REMOTE || act == OTI_ACT_SWITCH_TO_LOCAL)
+            return act;
+    }
+    return act;
+}
+
 static void setup(otikm_core *c)
 {
     otikm_core_init(c, 1920, 1080, 4);
@@ -135,6 +153,26 @@ int main(void)
     } else {
         printf("  [PASS] pending 几何在下次交出去时生效（rem_w=%d，rem_x=%d）\n", c.rem_w, c.rem_x);
     }
+
+    /* ---- 1e) 对端光标回传：必须"真到边缘"才回程（2026-11-03 Windows 指针加速回归）----
+       真机 bug：回程只看未缩放计数；Windows 的“提高指针精确度”让快左移 + 慢右移后
+       净计数 +100 时像素还差 1068px → 提前回程。现在要求对端回传的位置在入口边，
+       再往外推 OTI_REM_CURSOR_PUSH 个计数才回程；回传不在边缘时计数判据不生效。 */
+    printf("=== 1e) 对端光标回传：不在边缘不许回程（Windows 加速漂移回归）===\n");
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "先交出去");
+    otikm_core_set_remote_cursor(&c, 1000, 500, 1920, 1080, 1000);       /* 对端光标在屏幕中间 */
+    expect(push_at(&c, 127, 0, 4, 1000, 20), OTI_ACT_TO_REMOTE,
+           "净计数 508、但对端光标不在入口边 → 不回程（旧实现会提前切）");
+    otikm_core_set_remote_cursor(&c, 1920 - 1, 500, 1920, 1080, 3000); /* 回传确认真到右边缘 */
+    expect(push_at(&c, 1, 0, 7, 3000, 10), OTI_ACT_TO_REMOTE, "刚到边、外推 7 计数 → 还不回程");
+    expect(push_at(&c, 1, 0, 1, 3070, 10), OTI_ACT_SWITCH_TO_LOCAL, "再外推 1 计数（共 8）→ 回程");
+    /* 回传过期 → 退回旧计数判据（兼容没有回传的旧版/零软件端） */
+    setup(&c);
+    expect(push(&c, -40, 0, 10), OTI_ACT_SWITCH_TO_REMOTE, "再交出去");
+    otikm_core_set_remote_cursor(&c, 1000, 500, 1920, 1080, 1000);
+    expect(push_at(&c, 127, 0, 1, 1000 + OTI_REM_CURSOR_TTL_MS + 1000, 10),
+           OTI_ACT_SWITCH_TO_LOCAL, "回传过期 → 旧计数判据仍能回程（兼容路径）");
 
     printf("=== 2) 右出 / 左回（镜像方向）===\n");
     setup(&c);

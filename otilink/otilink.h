@@ -115,6 +115,11 @@ int  otilink_cdb_ex(struct otilink_dev *d, const uint8_t cdb[16], void *data,
 /* 允许自定义 CDB 长度（标准命令 6/10 字节；厂商命令用 16） */
 int  otilink_cdb_len(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
                      void *data, unsigned len, int to_dev, struct oti_scsi_result *res);
+/* 同 otilink_cdb_len，但显式指定 SG_IO 超时（毫秒）。消息管道读用它把"阻塞读占住
+   单队列设备"的时间压到有界，见 NOTES §75.5。 */
+int  otilink_cdb_len_to(struct otilink_dev *d, const uint8_t *cdb, unsigned cdb_len,
+                        void *data, unsigned len, int to_dev,
+                        struct oti_scsi_result *res, int timeout_ms);
 
 /* 便捷封装 */
 int  otilink_send_hid(struct otilink_dev *d, int type, const uint8_t pkt[OTI_HID_PKT_LEN]);
@@ -162,6 +167,8 @@ int  otilink_frame_check(const uint8_t frame[OTI_FRAME_SIZE]);  /* 1=有效数�
  *               → 必须**立刻** otilink_send_frame()，中间不要插别的操作
  *   0x01/0x00/0x08/0x10 = 复位（清收发队列），通常是链路未就绪/对端未消费 */
 int  otilink_msg_read(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx);
+int  otilink_msg_read_to(struct otilink_dev *d, uint8_t m16[16], uint16_t pending_tx,
+                         int timeout_ms);
 
 /* 帧写：0xD9/0x2A/0xFF + 64KB OUT。**必须在收到 0x06/0x07 授权后立刻调用**，
  * 否则设备返回 key=0x9 ASC=0x81/0x85/0x86（厂商语义：Tx_No_image / Image_Conflict）。 */

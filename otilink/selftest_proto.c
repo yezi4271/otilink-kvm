@@ -38,6 +38,17 @@ static void test_proto(void)
     CHECK(oti_decode_key(pl, h.len, &k2) == 0 && k2.code == 30 &&
               k2.value == OTI_KEY_PRESS, "KEY 载荷还原 (code=%u)", k2.code);
 
+    /* 对端光标回传（2026-11-03）：归一化到虚拟桌面，最大值 4479/1439 */
+    oti_cursor_evt ce = {.x = 4479, .y = 1439, .w = 4480, .h = 1440};
+    n = oti_encode_cursor(9, &ce, buf, sizeof(buf));
+    CHECK(n == OTI_HDR_SIZE + 8, "CURSOR 组包长度 = %zu", n);
+    CHECK(oti_decode(buf, n, &h, &pl) == 0 && h.type == OTI_MSG_CURSOR,
+          "CURSOR 解包 type 正确");
+    oti_cursor_evt ce2;
+    CHECK(oti_decode_cursor(pl, h.len, &ce2) == 0 && ce2.x == 4479 && ce2.y == 1439 &&
+              ce2.w == 4480 && ce2.h == 1440, "CURSOR 载荷还原 (%d,%d %dx%d)",
+          ce2.x, ce2.y, ce2.w, ce2.h);
+
     /* CRC 必须覆盖载荷：改一个载荷字节应被拒 */
     uint8_t copy[64];
     memcpy(copy, buf, n);

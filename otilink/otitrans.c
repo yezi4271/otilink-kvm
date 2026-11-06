@@ -250,6 +250,15 @@ static int fd_read_all(int fd, void *buf, size_t len, int timeout_ms)
     return 0;
 }
 
+/* 消息读超时 / HID 优先级（见 NOTES §75.5）：
+   线缆是单队列设备，一次阻塞的 SCSI 读会把 HID 写堵住数百毫秒。
+   - 消息读（16 字节）单独用有界超时，默认 5000，HID 直发模式由 otikm 调小；
+   - HID 包正在写时，泵不要在"读授权 → 写帧"之间插入新的消息读。 */
+static int g_msg_timeout_ms = 5000;
+static volatile int g_hid_busy = 0;
+void oti_tr_set_msg_timeout(int ms) { g_msg_timeout_ms = ms > 0 ? ms : 5000; }
+void oti_tr_set_hid_busy(int busy) { g_hid_busy = busy; }
+
 /* ---------------- 线缆：一次"读消息 → 分派"的设备交互 ----------------
  * 严格按厂商 ProcessIdleState 的语义（NOTES §34）：
  *   1) 读 16 字节消息，同时用 CDB[3..4] 上报"本机待发送帧数"
@@ -264,6 +273,9 @@ static int cable_pump_once_locked(oti_transport *t);
    漏解锁。 */
 static int cable_pump_once(oti_transport *t)
 {
+    /* HID 包正在写设备：本次不开始新的消息读（已开始的读受 g_msg_timeout_ms 约束）。 */
+    if (g_hid_busy)
+        return -2;
     otilink_cable_io_lock();
     int rc = cable_pump_once_locked(t);
     otilink_cable_io_unlock();
@@ -279,7 +291,7 @@ static int cable_pump_once_locked(oti_transport *t)
     unsigned pending = (unsigned)t->txq.count;
     if (pending > 100)
         pending = 100;
-    int rc = otilink_msg_read(&t->dev, m, (uint16_t)pending);
+    int rc = otilink_msg_read_to(&t->dev, m, (uint16_t)pending, g_msg_timeout_ms);
     if (rc)
         return rc;
 
@@ -465,8 +477,13 @@ int oti_tr_recv(oti_transport *t, void *body, size_t *len, int timeout_ms)
             return 0;
         if (deadline >= 0 && now_ms() >= deadline)
             return -2;
-        /* 设备侧暂时没有数据：小睡一下，别把 CPU 空转打满 */
-        usleep(300);
+        /* 设备侧暂时没有数据：小睡一下，别把 CPU 空转打满。
+           ⚠️ 这里同时是 HID 鼠标的"竞争对手"：每次 cable_pump_once 都要拿
+           g_cable_io 做一次 SCSI 读，读未完成时捕获线程的 otilink_send_hid()
+           只能等锁 —— 真机表现就是"Windows 指针每 100~300ms 冻结一下"
+           （2026-11-06，1ms 采样）；原先 300us 一次把设备几乎占满。
+           10ms 一次：CURSOR/ROLE/剪贴板延迟上限 +10ms，大文件按帧仍够用。 */
+        usleep(10 * 1000);
     }
 }
 

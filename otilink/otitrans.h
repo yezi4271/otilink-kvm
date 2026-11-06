@@ -37,6 +37,11 @@ int  oti_tr_cable_pending(oti_transport *t);
 long oti_tr_cable_last_tx_ms(oti_transport *t);
 /* 清空待发队列（交还控制权时用：陈旧位移再发出去只会让对端指针乱跳） */
 void oti_tr_cable_drop_tx(oti_transport *t);
+/* 线缆消息读的 SG_IO 超时（毫秒）。默认 5000；HID 直发模式下调小，避免一次
+   阻塞读把单队列设备占住数百毫秒（Windows 光标冻结）。 */
+void oti_tr_set_msg_timeout(int ms);
+/* HID 包正在写设备：让泵**不要开始**新的消息读（已开始的读受 msg_timeout 约束）。 */
+void oti_tr_set_hid_busy(int busy);
 /* 线缆后端底层设备（用于初始化握手；仅 cable 后端有效） */
 struct otilink_dev *oti_tr_cable_dev(oti_transport *t);
 void oti_tr_close(oti_transport *t);

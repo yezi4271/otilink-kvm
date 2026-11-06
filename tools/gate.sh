@@ -10,6 +10,7 @@
 #   --hw-kmb         键鼠真机回归（kmbret，拓扑 B：键鼠在麒麟 → 回程手势 + Ctrl 组合，约 30s）
 #   --hw-kbdexcl     键盘独占真机回归（kbdexcl，拓扑 B：接管期间本地键盘必须被独占 → 防双重输入；约 40s）
 #   --hw-lat         键鼠卡顿回归（hidlat，与 otikm 并发量 HID 写间隔；>200ms 即卡顿，约 20s）
+#   --hw-sos         SOS 救援回归（sosreg：左 Meta+H 必须被 sosguard 取消，不许切 VT/死锁；约 15s）
 #   --hw-xfer [N]    大文件真机回归（xferreg，缺省 64MB）
 #   --replug         线缆拔插自愈回归（replugreg，USB unbind/bind 模拟拔插 N 轮，约 40s）
 #   --hw-all         上面三档全跑
@@ -96,6 +97,7 @@ while [ $# -gt 0 ]; do
         --hw-kmb)       DO+=(hwkmb) ;;
         --hw-kbdexcl)   DO+=(hwkbdexcl) ;;
         --hw-lat)       DO+=(hwlat) ;;
+        --hw-sos)       DO+=(hwsos) ;;
         --hw-xfer)      DO+=(hwxfer); XFER_BYTES=${2:-67108864}; case "${2:-}" in ''|--*) ;; *) shift ;; esac ;;
         --replug)       DO+=(replug) ;;
         --hw-all)       DO+=(hwclip hwkm hwxfer) ;;
@@ -115,7 +117,7 @@ done
 # 误导性的 FAIL，比如"没人转发"）。仓库不内置这两个值（可公开），见 re/AGENTS.md §0。
 NEEDS_SSH=0
 for step in "${DO[@]}"; do
-    case "$step" in pre|hwclip|hwkm|hwkmb|hwkbdexcl|hwlat|replug|hwxfer|deploy) NEEDS_SSH=1 ;; esac
+    case "$step" in pre|hwclip|hwkm|hwkmb|hwkbdexcl|hwlat|hwsos|replug|hwxfer|deploy) NEEDS_SSH=1 ;; esac
 done
 if [ "$NEEDS_SSH" -eq 1 ] && { [ -z "${KY:-}" ] || [ -z "${KY_PASS:-}" ]; }; then
     { printf '%s[FATAL]%s 该档位需要连麒麟，但环境变量没设置：\n' "$R" "$N"
@@ -173,6 +175,11 @@ case "$step" in
     hwlat)
         need_hw_notice
         run_regression "键鼠卡顿回归" "$OTI_DIR/hidlat.sh" ;;
+
+    hwsos)
+        need_hw_notice
+        run_regression "环境体检" "$RE_DIR/tools/envcheck.sh"
+        run_regression "SOS 救援回归" "$OTI_DIR/sosreg.sh" ;;
 
     replug)
         need_hw_notice
