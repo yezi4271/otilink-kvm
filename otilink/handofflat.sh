@@ -72,7 +72,6 @@ for i in 1 2 3 4 5 6 7; do
     [ -n "$KW" ] && [ -n "$KM" ] || continue
     RTT=$(( T1 - T0 )); MID=$(( (T0 + T1) / 2 ))
     # C = 麒麟单调时钟(mono) 与 Windows 绝对时间 的映射：win_ms ≈ mono_ms + (wall-mono) - (wall-W) = mono + KW-KM-KW+MID
-    CI=$(( KM + (KW - KM) - (KW - MID) ))     # 等价：win = mono + MID - KM
     if [ "$RTT" -lt "$BEST_RTT" ]; then BEST_RTT=$RTT; CAL=$(( MID - KM )); fi
 done
 UNC=$(( BEST_RTT / 2 ))
@@ -88,13 +87,15 @@ echo "=== 2/6 Windows 采样器 + 麒麟光标采样器 ==="
 mkdir -p "$WINCSV_DIR"; cp "$OTI_DIR/cursortrace.cs" "$WINCSV_DIR/cursortrace.cs"
 ( "$CSC" /nologo /optimize+ /target:exe "/out:$WINCSV_W\\cursortrace.exe" "$WINCSV_W\\cursortrace.cs" ) > "$TMP/csc.out" 2>&1 \
     && ok "cursortrace.exe 编译通过" || bad "cursortrace.exe 编译失败：$(tail -2 "$TMP/csc.out" | tr '\n' ' ')"
-WCSV="$WINCSV_DIR/handoff-$ (date +%H%M%S).csv" 2>/dev/null; WCSV="$WINCSV_DIR/handoff-$(date +%H%M%S).csv"
+WCSV="$WINCSV_DIR/handoff-$(date +%H%M%S).csv"
 WCSV_W="$WINCSV_W\\$(basename "$WCSV")"
 pwsh_file "$WIN_DIR/setcur.ps1" -X 1200 -Y 500 >/dev/null 2>&1
 ( cd "$WINCSV_DIR" && ./cursortrace.exe "$TRACE_MS" "$WCSV_W" 0 0 > "$TMP/trace.out" 2>&1 ) &
 TP=$!
 # 麒麟本端光标采样：uptime ms + 坐标（25ms 一轮；用于"回推→本端恢复"的耗时）
-kssh "rm -f $KSMP; (while :; do printf '%s ' \$(awk '{printf \"%d\", \$1*1000}' /proc/uptime); DISPLAY=:0 xdotool getmouselocation 2>/dev/null | sed -n 's/^x:\([0-9-]*\) y:\([0-9-]*\).*/\1 \2/p' | head -1; sleep 0.02; done) > $KSMP 2>/dev/null" >/dev/null 2>&1 &
+# 采样器自限时（约 ${DRV_MS}+20s 后自行退出）：不读 stdin，靠"有限循环"，避免按模式杀进程（L11 禁用宽泛匹配）
+SMP_ROUNDS=$(( (DRV_MS + 20000) / 20 ))
+kssh "rm -f $KSMP; (for _i in \$(seq 1 $SMP_ROUNDS); do printf '%s ' \$(awk '{printf \"%d\", \$1*1000}' /proc/uptime); DISPLAY=:0 xdotool getmouselocation 2>/dev/null | sed -n 's/^x:\([0-9-]*\) y:\([0-9-]*\).*/\1 \2/p' | head -1; sleep 0.02; done) > $KSMP 2>/dev/null" >/dev/null 2>&1 &
 SP=$!
 sleep 1
 
@@ -131,7 +132,7 @@ else
     ok "合成实例已自行退出"
 fi
 kssh "cat $KLOG" > "$TMP/otikm.log" 2>/dev/null
-kssh 'pkill -x -f "while :; do printf"' >/dev/null 2>&1 || true   # 采样器可能还在跑，下面用文件内容判
+kill "$SP" 2>/dev/null || true; wait "$SP" 2>/dev/null || true   # 本地 ssh 包装；远端循环自限时，无需 pkill（L11）
 wait "$TP" 2>/dev/null || true
 
 echo "=== 5/6 分析（日志判决时刻 + 双端光标变化）==="
@@ -145,10 +146,10 @@ KBACK=$(grep -a -n 'HID 模式：指针拉回本机' "$TMP/otikm.log" | wc -l | 
 info "日志：$TMP/otikm.log → $ART/otikm.log"
 
 # 解析：判决时刻（mono ms）
-logts_to_mono() {   # $1 = "sec.mmm" → mono_ms（处理 %100000 回绕）
-    awk -v ts="$1" -v up="${2:-0}" 'BEGIN{
-        gsub(/,/,".",ts); s=ts+0; base=int(up/100000)*100000;
-        m=base+s; if (m > up*1000+60000) m-=100000; printf "%d", m;
+logts_to_mono() {   # $1 = "sec.mmm" → monotonic ms（otikm 打的是 tv_sec % 100000，处理回绕）
+    awk -v ts="$1" -v upms="${2:-0}" 'BEGIN{
+        gsub(/,/,".",ts); s=ts+0; base=int(upms/100000000)*100000000;
+        m=base+s*1000; if (m > upms+60000) m-=100000000; printf "%d", m;
     }'
 }
 UPMS=$(kssh "awk '{printf \"%d\", \$1*1000}' /proc/uptime" 2>/dev/null | tr -d ' ')
