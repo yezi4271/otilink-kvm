@@ -23,6 +23,11 @@
 #
 # 副作用：会覆盖麒麟 X11 剪贴板（结束后写回一行短文本）；只写 /tmp 与
 #         C:\Users\Public\otilink-verify\；不动 otikm / Windows 代理进程。
+#
+# 判定口径（诚实优先）：
+#   * **硬断言**：MAXGAP ≤ 阈值、SEND_FAIL=0，以及"麒麟确实下发了 <BYTES>"（证明确实有负载）。
+#   * Windows 侧"已应用远端剪贴板"是**附加证据**：Windows 锁屏时 Set-Clipboard/Get-Clipboard
+#     必然抛 ExternalException（实测，见 NOTES §76.5），此时应用/读取一律只 WARN，不计 FAIL。
 # 退出码 = 失败项数（0 = 通过）。日志：/tmp/hidduringclip-artifacts/
 set -u
 # 本仓库脚本依赖 powershell.exe；某些 agent/WSL shell 的 PATH 里没有 Windows 目录 → 兜底
@@ -122,7 +127,15 @@ K_SEND=$(printf '%s' "$KNEW" | grep -a -c -E "CLIP 发送 ${BYTES} 字节|重发
     || bad "麒麟 otikm 日志新增里没有下发 ${BYTES} 字节的 CLIP 行（见 $ART/otikm.log.delta）"
 printf '%s' "$KNEW" | grep -a -E 'CLIP 发送|CLIP 应用|重发' | tail -4 | sed 's/^/      /'
 
-# Windows 侧：clip.log 新增行应有 "CLIP 已应用远端剪贴板 <BYTES> 字节"
+# Windows 侧：clip.log 新增行应有 "CLIP 已应用远端剪贴板 <BYTES> 字节"。
+# ⚠️ 这一项是**附加证据，不是硬断言**：Windows 锁屏时剪贴板 API 必然不可用（NOTES §76.5），
+#    所以"应用/读取"结果只 ok/warn/info，绝不计 FAIL。
+WLOCK="UNKNOWN"
+WLOCK=$(pwsh_cmd 'if (Get-Process LogonUI -EA SilentlyContinue) { "LOCK" } else { "UNLOCK" }' 2>/dev/null | tail -1 | tr -d ' \r')
+if [ "${WLOCK:-}" = "LOCK" ]; then
+    warn "Windows 疑似锁屏（LogonUI 在跑）：剪贴板'已应用'证据不可用 → 只 WARN 不计 FAIL（NOTES §76.5；解锁后应重跑并辅以 clipreg.sh）"
+    warn "本次判定只依据：MAXGAP / SEND_FAIL / 麒麟侧已下发（锁屏下应用/ACK 无法验证）"
+fi
 WAPPLY=0
 if [ -f "$AGENT_LOG" ]; then
     WNEW=$(tail -c +"$(( ${WSZ:-0} + 1 ))" "$AGENT_LOG" 2>/dev/null | tr -d '\r')

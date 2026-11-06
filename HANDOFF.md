@@ -166,10 +166,14 @@
 >   有害的「HID 优先窗口（暂停消息泵）」；写入侧 HID 优先**按需启用**（新泵下不触发）。
 > * 交接判据重写：真实光标（TTL 300ms）+ 贴入口边 + 继续外推 ≥16 计数；`交接耗时 15ms`。
 > * 新门禁：`--hw-clipstall`（hidduringclip.sh）、`--hw-freeze`（winfreeze.sh）。
-> 真机数据：`hidlat MAXGAP=15ms`（旧 372~482ms，650KB 剪贴板突发期间）、`kmbret PASS=21 FAIL=0 WARN=4`、
-> 麒麟 `SLOWOP=0`。**未验证**：剪贴板端到端（Windows 锁屏无法 Set-Clipboard）、Windows 光标冻结
-> 客观值（需 HID 驱动态/用户解锁）—— 详见 `NOTES §76.5`。回滚：Windows `deploy.sh --restart` 前把
-> `C:\Users\Public\otiagent.baseline.ps1` 拷回；麒麟 `git checkout -- otilink/... && gate.sh --deploy-kylin`。
+> 真机数据：`hidlat MAXGAP=15ms`（旧 372~482ms，650KB 剪贴板突发期间）、`kmbret PASS=21 FAIL=0 WARN=4`
+> （小步回程成功、park 37 包、**交接耗时 15ms**；现场真人日志还有一次 `交接耗时 35ms`）、麒麟 `SLOWOP=0`；
+> 剪贴板双向已由 win-pump 在解锁后手测互通。**未验证**：Windows 光标冻结客观值（winfreeze 需 HID 驱动态）、
+> `clipreg/xferreg` 正式回归（解锁窗口未排上）、Kylin→Windows 发端收不到 ACK（功能正常，NOTES §76.5）——
+> 详见 `NOTES §76.5`。⚠️ 仓库 `windows/otiagent.ps1` = 真机部署件 **nativepump-2**（逐字节核对）；
+> 未验证的 nativepump-3 硬化 patch 在 `/tmp/nativepump-3.patch`，不要直接部署。
+> 回滚：Windows `deploy.sh --restart` 前把 `C:\Users\Public\otiagent.baseline.ps1` 拷回
+> （或 `git checkout -- windows/otiagent.ps1`）；麒麟 `gate.sh --deploy-kylin` + 重启 otikm。
 
 ---
 

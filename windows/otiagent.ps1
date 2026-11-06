@@ -82,10 +82,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 # BuildTag：改本文件必须 bump（日志证据行/部署核对用；与 otiagent2.cs 的 BuildTag 分开）。
 #   pump-throttle-1 → nativepump-1：线缆 I/O 从 PowerShell 主循环搬进 Add-Type 的 C# 后台泵线程。
 #   nativepump-2：锁屏时 Set-Clipboard 抛 ExternalException 会把代理整个带走 —— CLIP 文本应用加 catch（2026-11-06 真机）。
-#   nativepump-3：①PS 一轮批量处理 ≤16 帧（锁屏等 PS 慢时不再让泵 rx 队列积压丢剪贴板分片）；
-#                ②rx 队列满时优先丢背景帧（PING/HELLO/MODE/ROLE）保住剪贴板/ACK；
-#                ③光标 40ms 移动跟随 + 没动时 200ms 心跳 + 写帧慢(>30ms)后 300ms 不发光标（少占设备，防堵 HID）。
-$script:BuildTag = 'nativepump-3'
+$script:BuildTag = 'nativepump-2'
 
 # ---- 单实例守卫（L4 的剪贴板代理版）----
 # 同一条线缆帧管道**只能有一个读者**。两个实例会互相抢走发送授权消息与帧，症状是
@@ -525,12 +522,10 @@ public static class Oti
 //     写帧期间不插别的设备操作（与 otilink/otitrans.c 的 cable_pump_once_locked 语义一致）。
 public static class CablePump
 {
-    public const string BuildTag = "nativepump-3";
+    public const string BuildTag = "nativepump-2";
     public const int QCAP = 64;              // 每个方向的队列容量（满丢最旧并计数）
     const string LogPath = @"C:\Users\Public\cable.log";
-    const int CURSOR_MS = 40;                // 光标移动时的最小发送间隔（brief 要求 20~50ms）
-    const int CURSOR_IDLE_MS = 200;          // 光标**没动**时的心跳周期（省设备命令，防抢 HID）
-    const int CURSOR_BACKOFF_MS = 300;       // 写帧慢(>30ms)后暂停发光标的时长（对端消费慢时躲开设备）
+    const int CURSOR_MS = 40;                // 光标遥测周期（brief 要求 20~50ms）
     const int ROLE_MS = 1000;                // ROLE 重发周期
     const int HELLO_MS = 10000;              // HELLO / 注入模式重发周期
     const int SLOW_MS = 30;                  // 单次设备操作超过它就打 SLOWOP（证据行）
@@ -555,9 +550,8 @@ public static class CablePump
     static volatile bool helloForce;
     static volatile bool modeForce;
     static long nRx, nTx, maxReadMs, maxWriteMs, resets, dropTx, dropRx, slowOps, badFrames;
-    static uint lastRxTick, lastDrainTick, lastCursorTick, lastCursorSent, lastRoleTick,
-                lastHelloTick, lastModeTick, lastSlowLogTick, cursorSkipUntil;
-    static int lastCursorX = -99999, lastCursorY = -99999;
+    static uint lastRxTick, lastDrainTick, lastCursorTick, lastRoleTick,
+                lastHelloTick, lastModeTick, lastSlowLogTick;
 
     // ---------------- 对 PowerShell 暴露的状态 ----------------
     public static string Build { get { return BuildTag; } }
@@ -619,8 +613,6 @@ public static class CablePump
             uint t = Tick();
             lastRxTick = t; lastDrainTick = t; lastCursorTick = t;
             lastRoleTick = t; lastHelloTick = t; lastModeTick = t; lastSlowLogTick = t;
-            lastCursorSent = t; cursorSkipUntil = t;
-            lastCursorX = -99999; lastCursorY = -99999;
             roleForce = true; helloForce = true; modeForce = true;
         }
         Thread t2 = new Thread(delegate() { Run(g); });
@@ -662,35 +654,6 @@ public static class CablePump
             txq.Enqueue(body);
         }
         return 0;
-    }
-
-    // rx 队列满时的丢弃策略：优先丢"背景帧"（PING=5/HELLO=8/MODE=9/ROLE=10），
-    // 尽量保住剪贴板数据帧与 ACK(6)——它们没有分片级重传，丢了会导致整笔重发甚至失败。
-    // 类型在消息体 [4..5]（Encode 布局：magic[0..3] type u16[4..5]）；不是本协议的消息体按数据帧对待。
-    static void EnqueueRx(byte[] b)
-    {
-        lock (lk)
-        {
-            if (rxq.Count >= QCAP)
-            {
-                int n = rxq.Count;
-                bool dropped = false;
-                for (int i = 0; i < n; i++)
-                {
-                    byte[] x = rxq.Dequeue();
-                    int t = (x.Length >= 6) ? (x[4] | (x[5] << 8)) : 0;
-                    if (!dropped && (t == 5 || t == 8 || t == 9 || t == 10))
-                    {
-                        dropped = true;
-                        dropRx++;
-                        continue;
-                    }
-                    rxq.Enqueue(x);
-                }
-                if (!dropped) { rxq.Dequeue(); dropRx++; }
-            }
-            rxq.Enqueue(b);
-        }
     }
 
     public static bool TryDequeueRx(out byte[] body)
@@ -790,7 +753,11 @@ public static class CablePump
                         if (len <= 0) { badFrames++; continue; }   // 空帧/长度非法
                         byte[] b = new byte[len];
                         if (len > 0) Array.Copy(frame, Oti.FRAME_HEAD, b, 0, len);
-                        EnqueueRx(b);
+                        lock (lk)
+                        {
+                            while (rxq.Count >= QCAP) { rxq.Dequeue(); dropRx++; }
+                            rxq.Enqueue(b);
+                        }
                         nRx++;
                     }
                 }
@@ -862,30 +829,13 @@ public static class CablePump
         if ((uint)(now - lastCursorTick) >= CURSOR_MS)
         {
             lastCursorTick = now;
-            // 慢写退避窗口内不发光标：宁可遥测晚 300ms，也别占住设备堵 HID。
-            if ((int)(now - cursorSkipUntil) >= 0)
+            int pend;
+            lock (lk) { pend = txq.Count; }
+            // 队列快满时先不发光标遥测：别把剪贴板数据帧挤掉（光标是"最新值"，晚一点无所谓）
+            if (pend < QCAP - 16)
             {
-                int pend;
-                lock (lk) { pend = txq.Count; }
-                // 队列快满时先不发光标遥测：别把剪贴板数据帧挤掉（光标是"最新值"，晚一点无所谓）
-                if (pend < QCAP - 16)
-                {
-                    byte[] pl = CursorPayload();
-                    if (pl != null)
-                    {
-                        int cx = pl[0] | (pl[1] << 8);
-                        int cy = pl[2] | (pl[3] << 8);
-                        bool moved = (cx != lastCursorX) || (cy != lastCursorY);
-                        // 移动时 40ms 一条（跟手）；**没动时降到 200ms 一条心跳** —— 主控端回程判据
-                        // 的新鲜度窗口是 300ms，200ms 心跳够用，却能省掉 ~80% 的光标帧设备命令。
-                        bool due = (uint)(now - lastCursorSent) >= CURSOR_IDLE_MS;
-                        if (moved || due)
-                        {
-                            EnqueueTx(Oti.Encode(11, 0, pl, 8));
-                            lastCursorX = cx; lastCursorY = cy; lastCursorSent = now;
-                        }
-                    }
-                }
+                byte[] pl = CursorPayload();
+                if (pl != null) EnqueueTx(Oti.Encode(11, 0, pl, 8));
             }
         }
         if (roleForce || (uint)(now - lastRoleTick) >= ROLE_MS)
@@ -949,9 +899,6 @@ public static class CablePump
     static void SlowOp(long ms)
     {
         slowOps++;
-        // 写帧慢 = 对端消费慢/设备忙：这 300ms 内不再发光标遥测。光标帧会占住设备
-        // （同队列的 HID 注入写排在后面），少发一帧就少一次卡 HID 的机会。
-        cursorSkipUntil = Tick() + CURSOR_BACKOFF_MS;
         uint now = Tick();
         if ((uint)(now - lastSlowLogTick) >= 5000)   // 限速 1 条/5s，长时间慢链路也不会把日志刷爆
         {
@@ -1835,7 +1782,7 @@ if ($Selftest) {
     Chk ([Oti]::OffsetOf('Cdb') -eq 36) "Cdb 偏移 = $([Oti]::OffsetOf('Cdb'))（期望 36）"
 
     # ---- 线缆原生泵（CablePump）离线自检：队列/统计/光标载荷/无效设备（绝不碰真设备）----
-    Chk ([CablePump]::BuildTag -eq 'nativepump-3') "线缆泵 BuildTag = $([CablePump]::BuildTag)"
+    Chk ([CablePump]::BuildTag -eq 'nativepump-2') "线缆泵 BuildTag = $([CablePump]::BuildTag)"
     Chk (([CablePump]::GetStats()) -match '^rx=\d+ tx=\d+ maxread=\d+ms maxwrite=\d+ms resets=\d+ drop=\d+') "泵统计格式可 grep（$([CablePump]::GetStats())）"
     $rc1 = [CablePump]::EnqueueTx([Oti]::Encode(5, 0, $null, 0))
     Chk ($rc1 -eq 0 -and [CablePump]::PendingTx -ge 1) "入队成功（rc=$rc1 pending=$([CablePump]::PendingTx)）"
@@ -3355,240 +3302,232 @@ while ($true) {
         }
     }
 
-    # 1) 取消息体并处理；cable 模式**一轮最多处理 16 条** —— PS 主循环慢的时候（如锁屏时
-    #    Get-Clipboard 每次阻塞 ~1.1s，整轮 1.2s），只处理 1 条会让泵 rx 队列长期满 64，
-    #    新到的剪贴板分片会被"满丢最旧"挤掉（2026-11-06 12:24 真机：650KB 文本出现
-    #    乱序/缺口/被下一笔打断，靠对端整笔重发 3 次才落地）。逐帧处理本身便宜（解包+memcpy），
-    #    批量处理不会明显拉长单轮；空闲时仍然只跑一轮就退出。
-    $rxBatch = 0
-    do {
-        $body = $null; $len = 0; $didWork = $false
-        if ($useTcp) {
-            $body = RxTcp
-            if ($null -ne $body) { $len = $body.Length }
-        } elseif ($useCable) {
-            # 设备 I/O 全在泵线程；这里只做微秒级出队（取到就交给下面的 switch 处理）。
-            $b = $null
-            if ([CablePump]::TryDequeueRx([ref]$b)) {
-                $body = $b; $len = $b.Length; $didWork = $true
-            }
-        } else {
-            $rc = [Oti]::ReadFrame($h, $frame, 1)
-            if ($rc -eq 0) {
-                $chk = [Oti]::FrameCheck($frame)
-                if ($chk -eq 1) {
-                    $len = [Oti]::FrameBodyLen($frame)
-                    $body = New-Object byte[] $len
-                    [Array]::Copy($frame, 20, $body, 0, $len)
-                } elseif ($chk -eq -1) { Write-Host "  [warn] 非法帧（首尾头不一致）" }
-            } elseif ($Verbose -and $rc -ne 0) { Write-Host "  读失败 rc=$rc" }
+    # 1) 取一条消息体（TCP = 4 字节长度前缀；cable = C# 泵线程内存队列；SPTI = 直接读）
+    $body = $null; $len = 0; $didWork = $false
+    if ($useTcp) {
+        $body = RxTcp
+        if ($null -ne $body) { $len = $body.Length }
+    } elseif ($useCable) {
+        # 设备 I/O 全在泵线程；这里只做微秒级出队（取到就交给下面的 switch 处理）。
+        $b = $null
+        if ([CablePump]::TryDequeueRx([ref]$b)) {
+            $body = $b; $len = $b.Length; $didWork = $true
         }
-        if ($useCable -and -not $didWork -and $null -eq $body) {
-            Start-Sleep -Milliseconds 2      # 空闲小睡：设备由泵线程排空，主循环只等内存队列
-        }
-        if ($rxBatch -eq 0) { $script:profPre = ((Get-Date) - $iter0).TotalMilliseconds }   # 取帧之后的那一段（见慢轮诊断）
-        if ($null -ne $body -and $len -gt 0) {
-            $t = [uint16]0; $s = [uint32]0; $pl = $null
-            if ([Oti]::Decode($body, $len, [ref]$t, [ref]$s, [ref]$pl)) {
-                $rx++
-                    switch ($t) {
-                        1 {  # KEY: payload = code u16, value u8
-                            # 按 seq 去重：Kylin 侧为对抗帧丢失会把同一条 KEY 重发 3 次（re/NOTES.md §61）
-                            if ($null -eq $script:seenSeq) { $script:seenSeq = @() }
-                            $dup = $script:seenSeq -contains $s
-                            if (-not $dup) {
-                                $script:seenSeq += $s
-                                if ($script:seenSeq.Count -gt 64) { $script:seenSeq = @($script:seenSeq | Select-Object -Last 32) }
-                            }
-                            if ((-not $dup) -and ($Inject -or $InjectKeys) -and -not $script:paused -and $pl.Length -ge 3) {
-                                $code = [BitConverter]::ToUInt16($pl, 0)
-                                if ([Oti]::Key($code, ($pl[2] -ne 0))) {
-                                    $injected++
-                                    if ($Verbose) { Write-Host "  KEY code=$code value=$($pl[2])" }
-                                } elseif ($Verbose) {
-                                    Write-Host "  KEY code=$code 未映射（跳过，宁可不按错键）"
-                                }
-                            }
+    } else {
+        $rc = [Oti]::ReadFrame($h, $frame, 1)
+        if ($rc -eq 0) {
+            $chk = [Oti]::FrameCheck($frame)
+            if ($chk -eq 1) {
+                $len = [Oti]::FrameBodyLen($frame)
+                $body = New-Object byte[] $len
+                [Array]::Copy($frame, 20, $body, 0, $len)
+            } elseif ($chk -eq -1) { Write-Host "  [warn] 非法帧（首尾头不一致）" }
+        } elseif ($Verbose -and $rc -ne 0) { Write-Host "  读失败 rc=$rc" }
+    }
+    if ($useCable -and -not $didWork -and $null -eq $body) {
+        Start-Sleep -Milliseconds 2      # 空闲小睡：设备由泵线程排空，主循环只等内存队列
+    }
+    $script:profPre = ((Get-Date) - $iter0).TotalMilliseconds   # 取帧之后的那一段（见慢轮诊断）
+    if ($null -ne $body -and $len -gt 0) {
+        $t = [uint16]0; $s = [uint32]0; $pl = $null
+        if ([Oti]::Decode($body, $len, [ref]$t, [ref]$s, [ref]$pl)) {
+            $rx++
+                switch ($t) {
+                    1 {  # KEY: payload = code u16, value u8
+                        # 按 seq 去重：Kylin 侧为对抗帧丢失会把同一条 KEY 重发 3 次（re/NOTES.md §61）
+                        if ($null -eq $script:seenSeq) { $script:seenSeq = @() }
+                        $dup = $script:seenSeq -contains $s
+                        if (-not $dup) {
+                            $script:seenSeq += $s
+                            if ($script:seenSeq.Count -gt 64) { $script:seenSeq = @($script:seenSeq | Select-Object -Last 32) }
                         }
-                        2 {  # MOUSE: dx i16, dy i16, wheel i16, buttons u16
-                            if ($Inject -and -not $script:paused -and $pl.Length -ge 8) {
-                                $dx = [BitConverter]::ToInt16($pl, 0); $dy = [BitConverter]::ToInt16($pl, 2)
-                                $wh = [BitConverter]::ToInt16($pl, 4)
-                                [Oti]::Mouse($dx, $dy, 0, 0); if ($wh -ne 0) { [Oti]::Wheel($wh) }
-                                Apply-Buttons ([int][BitConverter]::ToUInt16($pl, 6))
+                        if ((-not $dup) -and ($Inject -or $InjectKeys) -and -not $script:paused -and $pl.Length -ge 3) {
+                            $code = [BitConverter]::ToUInt16($pl, 0)
+                            if ([Oti]::Key($code, ($pl[2] -ne 0))) {
                                 $injected++
-                                if ($Verbose) { Write-Host "  MOUSE dx=$dx dy=$dy wheel=$wh btn=0x$([BitConverter]::ToUInt16($pl,6).ToString('x'))" }
-                            }
-                        }
-                        3 {  # SWITCH
-                            if ($pl.Length -ge 2) { Write-Host "  SWITCH side=$($pl[0]) 指针$(if($pl[0] -eq 1){'在本机'}else{'在对端'})" }
-                        }
-                        4 {  # CLIP: format u16, flags u16, fid u32, offset u32, total u32, dlen u32, data
-                            # 门槛必须 >= 20（= 剪贴板头本身：fmt2+flags2+fid4+off4+total4+dlen4）！
-                    # 原来是 -ge 24 → 1~3 个字符的短文本载荷只有 21/22/23 字节，整帧被丢掉：
-                    # 不应用、不 ACK，发送端重发 3 次后放弃 —— 现场表现"1/2/3 字符复制不过去，
-                    # >=4 个字符才行"（第 41 轮，用户报障）。回归：otilink/clipshort.sh
-                    if ($Clipboard -and -not $script:paused -and $pl.Length -ge 20) {
-                                $fmt   = [BitConverter]::ToUInt16($pl, 0)   # 1=文本 2=PNG 3=文件包 4=大文件分片 5=传输控制
-                                $flags = [BitConverter]::ToUInt16($pl, 2)
-                                $fid = [BitConverter]::ToUInt32($pl, 4); $off = [BitConverter]::ToUInt32($pl, 8)
-                                $total = [BitConverter]::ToUInt32($pl, 12); $dlen = [BitConverter]::ToUInt32($pl, 16)
-                                if ($fmt -eq 4) {
-                                    # 大文件分片：直接落盘（不进重组缓冲，内存恒定 64KB）
-                                    Handle-FilePart $pl
-                                } elseif ($fmt -eq 5) {
-                                    $kind = [BitConverter]::ToUInt16($pl, 20)
-                                    if ($kind -eq 1) { Handle-FileDone $pl } else { Handle-FileVerdict $pl }
-                                } else {
-                                if ($Verbose) { Write-Host "  CLIP 收块 fmt=$fmt flags=$flags fid=$fid off=$off total=$total dlen=$dlen" }
-                                if ((($flags -band 1) -ne 0) -and $clipRx.active -and $clipRx.got -lt $clipRx.total) {
-                                    Write-Host "  [warn] CLIP 前一笔未收完（fid=$($clipRx.fid) got=$($clipRx.got)/$($clipRx.total)）被 fid=$fid 打断"
-                                }
-                                if ($clipRx.active -and $fid -eq $clipRx.fid -and $off -ne $clipRx.got) {
-                                    Write-Host "  [warn] CLIP 乱序/缺口 fid=$fid off=$off 期望=$($clipRx.got) total=$total dlen=$dlen"
-                                }
-                                if (($flags -band 1) -ne 0) {
-                                    $clipRx.active = $true; $clipRx.fid = $fid; $clipRx.total = $total
-                                    $clipRx.fmt = $fmt
-                                    $clipRx.got = 0; $clipRx.buf = New-Object byte[] $total
-                                }
-                                if ($clipRx.active -and $fid -eq $clipRx.fid -and ($off + $dlen) -le $clipRx.total) {
-                                    [Array]::Copy($pl, 20, $clipRx.buf, $off, $dlen)
-                                    $clipRx.got = $off + $dlen
-                                    if (($flags -band 2) -ne 0) {
-                                        if ($clipRx.fmt -eq 2) {
-                                            # PNG -> CF_DIB 写进剪贴板（Win32 API，见 ClipImg）
-                                            $png = if ($clipRx.got -eq $clipRx.buf.Length) { $clipRx.buf } else { $clipRx.buf[0..($clipRx.got-1)] }
-                                            $ok = [ClipImg]::SetPng($png)
-                                            $lastClipHash = [Oti]::Crc32($clipRx.buf, 0, $clipRx.got)
-                                            $haveClipHash = $true
-                                            # 关键：同时记下"我刚写进去的 DIB 指纹"，否则下一轮轮询
-                                            # 会把这张图重新编码成 PNG 再发回去（PNG 字节必然不同）。
-                                            $lastDibHash = [ClipImg]::DibHash(); $haveDibHash = ($lastDibHash -ne 0)
-                                            $clipRx.active = $false
-                                            Write-Host "  CLIP 已应用远端**图片** $($clipRx.got) 字节 rc=$ok（并抑制回发）"
-                                            [void](Send-ClipAck $lastClipHash ([uint16]2))
-                                        } elseif ($clipRx.fmt -eq 3) {
-                                            # 文件包：u16 个数；每项 u32 名长、名字(UTF-8)、u64 长度、内容
-                                            $p = 2
-                                            $cnt = [BitConverter]::ToUInt16($clipRx.buf, 0)
-                                            $dir = Join-Path $env:TEMP ('otilink_files_' + [Guid]::NewGuid().ToString('N'))
-                                            [IO.Directory]::CreateDirectory($dir) | Out-Null
-                                            $paths = @()
-                                            for ($k = 0; $k -lt $cnt; $k++) {
-                                                $nl = [BitConverter]::ToUInt32($clipRx.buf, $p); $p += 4
-                                                $nm = [Text.Encoding]::UTF8.GetString($clipRx.buf, $p, $nl); $p += $nl
-                                                $sz = [BitConverter]::ToUInt64($clipRx.buf, $p); $p += 8
-                                                $fp = Join-Path $dir $nm
-                                                $ob = New-Object byte[] ([int]$sz)
-                                                [Array]::Copy($clipRx.buf, $p, $ob, 0, [int]$sz); $p += [int]$sz
-                                                [IO.File]::WriteAllBytes($fp, $ob)
-                                                $paths += $fp
-                                            }
-                                            $okf = [ClipFiles]::Set($paths)
-                                            $lastClipHash = [Oti]::Crc32($clipRx.buf, 0, $clipRx.got)
-                                            $haveClipHash = $true
-                                            $clipRx.active = $false
-                                            Write-Host "  CLIP 已应用远端**文件** $cnt 个 rc=$okf -> $dir"
-                                            [void](Send-ClipAck $lastClipHash ([uint16]3))
-                                            $script:lastFileIdent = Get-FileIdent $paths   # 防回环：刚落的文件别再发回去
-                                            $script:haveFileIdent = $true
-                                        } else {
-                                            $text = [Text.Encoding]::UTF8.GetString($clipRx.buf, 0, $clipRx.got)
-                                            # ⚠️ 剪贴板 API 在**锁屏/被别的进程独占**时会抛 ExternalException（真机实测：
-                                            # 锁屏时 Get/Set-Clipboard 都是 ~1.1s 后抛"打开剪贴板失败"）。这里**必须** catch：
-                                            # 不接的话整个代理会退出（2026-11-06 首次真机部署就因此在锁屏时挂过一次，
-                                            # clip.err 里是 Set-Clipboard ExternalException）——暂时应用不了剪贴板不该杀掉代理。
-                                            $applyOk = $true
-                                            try { Set-Clipboard -Value $text }
-                                            catch {
-                                                $applyOk = $false
-                                                Write-Host ("  [warn] 应用远端剪贴板失败（锁屏/剪贴板被占用？已忽略，代理继续）：" + $_.Exception.Message)
-                                            }
-                                            if ($applyOk) {
-                                                $lastClipHash = [Oti]::Crc32([Text.Encoding]::UTF8.GetBytes($text), 0, [Text.Encoding]::UTF8.GetByteCount($text))
-                                                $haveClipHash = $true
-                                                Write-Host "  CLIP 已应用远端剪贴板 $($clipRx.got) 字节（并抑制回发）"
-                                                if ($Verbose) { Write-Host ("  → 回执 ACK crc={0:x8}" -f $lastClipHash) }
-                                                [void](Send-ClipAck $lastClipHash ([uint16]1))
-                                            }
-                                            $clipRx.active = $false
-                                        }
-                                    }
-                                }
-                                }   # end else（普通剪贴板重组路径）
-                            }
-                        }
-                        7 {  # MOUSE_ABS: x i16, y i16, wheel i16, buttons u16（对端屏幕坐标）
-                            if ($Inject -and -not $script:paused -and $pl.Length -ge 8) {
-                                $ax = [BitConverter]::ToInt16($pl, 0); $ay = [BitConverter]::ToInt16($pl, 2)
-                                $aw = [BitConverter]::ToInt16($pl, 4)
-                                $sw = if ($AbsW -gt 0) { $AbsW } else { [Oti]::VirtW() }
-                                $sh = if ($AbsH -gt 0) { $AbsH } else { [Oti]::VirtH() }
-                                [Oti]::MouseAbs($ax, $ay, $sw, $sh)
-                                if ($aw -ne 0) { [Oti]::Wheel($aw) }
-                                Apply-Buttons ([int][BitConverter]::ToUInt16($pl, 6))
-                                $injected++
-                                if ($Verbose) { Write-Host "  MOUSE_ABS x=$ax y=$ay wheel=$aw（绝对注入，无加速）" }
-                            }
-                        }
-                        8 {  # HELLO: 对端屏幕宽高
-                            if ($pl.Length -ge 4) {
-                                $pw = [BitConverter]::ToUInt16($pl, 0); $ph = [BitConverter]::ToUInt16($pl, 2)
-                                $script:peerW = $pw; $script:peerH = $ph
-                                Write-Host "  HELLO 主控端屏幕 ${pw}x${ph}"
-                            }
-                        }
-                        6 {  # ACK：剪贴板确认（对端说我发的东西真落地了）
-                            if ($pl.Length -ge 8) {
-                                $acrc = [BitConverter]::ToUInt32($pl, 0)
-                                if ($Verbose) { Write-Host ("  RECV ACK crc={0:x8}（待确认={1:x8} active={2}）" -f $acrc, $script:clipAck.crc, $script:clipAck.active) }
-                                if ($script:clipAck.active -and $acrc -eq $script:clipAck.crc) {
-                                    $script:clipAck.active = $false
-                                    $script:clipAck.bytes = $null
-                                    $script:nAckOk++
-                                    if ($Verbose) { Write-Host ("  ACK 收到（crc={0:x8}）确认成功 {1} 次" -f $acrc, $script:nAckOk) }
-                                }
-                            }
-                        }
-                        5 { if ($Verbose) { Write-Host "  PING" } }
-                        10 {  # ROLE: has_local_input u8, want u8, state u8, flags u8, boot_id u32, input_age_ms u32
-                            # 第 1 步只解析+存变量（每 5 秒由主循环打印一行 ROLE:）；不据此起停 otiagent2。
-                            if ($pl.Length -ge 12) {
-                                $script:rolePeerSeen     = $true
-                                $script:rolePeerHasLocal = [int]$pl[0]
-                                $script:rolePeerWant     = [int]$pl[1]
-                                $script:rolePeerState    = [int]$pl[2]
-                                $script:rolePeerFlags    = [int]$pl[3]
-                                $script:rolePeerBoot     = [BitConverter]::ToUInt32($pl, 4)
-                                $script:rolePeerAge      = [BitConverter]::ToUInt32($pl, 8)
-                                $script:rolePeerMs       = Get-Date
-                                # I1：连续 3 个心跳看到对端 state=slave 才允许 grab（起 otiagent2）
-                                if ($script:rolePeerState -eq 2) { $script:rolePeerSlaveStreak++ } else { $script:rolePeerSlaveStreak = 0 }
-                                if ($Verbose) { Write-Host ("  ROLE 收到 state={0} hasLocal={1} want={2} flags={3} boot={4:x8} age={5}ms streak={6}" -f $script:rolePeerState, $script:rolePeerHasLocal, $script:rolePeerWant, $script:rolePeerFlags, $script:rolePeerBoot, $script:rolePeerAge, $script:rolePeerSlaveStreak) }
+                                if ($Verbose) { Write-Host "  KEY code=$code value=$($pl[2])" }
+                            } elseif ($Verbose) {
+                                Write-Host "  KEY code=$code 未映射（跳过，宁可不按错键）"
                             }
                         }
                     }
-                } elseif ($len -ge 5 -and $body[0] -eq 0x39) {
-                    # 厂商 XML 帧：帧体 = [0x39][u32 长度][XML]。麒麟端 otikm 在"撞边交还控制权"
-                    # 时会按厂商线格式发 Cmd_Notify_KM_Switch_To_Local（668 字节），厂商程序
-                    # （MacKMLink）也往同一条帧管道里写。这些**不是**我们的协议消息，
-                    # 以前一律打成 "[warn] 解包失败（CRC/格式）"，被误当成剪贴板传坏了
-                    # （整整误导了一轮排查）。这里单独识别、单独计数。
-                    $vl = [BitConverter]::ToUInt32($body, 1)
-                    $script:vendorRx++
-                    Write-Host "  [skip] 厂商 XML 帧 $vl 字节（第 $($script:vendorRx) 条，非本协议，正常忽略）"
-                } else {
-                    # 诊断：把失败帧的长度与头 16 字节打出来。厂商程序（MacKMLink）或
-                    # otikm 的厂商 XML 通知帧也走同一条帧管道，它们**不是**我们的格式，
-                    # 会在这里被判失败 —— 必须能看到内容才能区分"噪声"与"真损坏"。
-                    $nh = [Math]::Min(16, $len)
-                    $hx = (($body[0..($nh-1)] | ForEach-Object { $_.ToString('x2') }) -join ' ')
-                    Write-Host ("  [warn] 解包失败（CRC/格式）len={0} head={1}" -f $len, $hx)
+                    2 {  # MOUSE: dx i16, dy i16, wheel i16, buttons u16
+                        if ($Inject -and -not $script:paused -and $pl.Length -ge 8) {
+                            $dx = [BitConverter]::ToInt16($pl, 0); $dy = [BitConverter]::ToInt16($pl, 2)
+                            $wh = [BitConverter]::ToInt16($pl, 4)
+                            [Oti]::Mouse($dx, $dy, 0, 0); if ($wh -ne 0) { [Oti]::Wheel($wh) }
+                            Apply-Buttons ([int][BitConverter]::ToUInt16($pl, 6))
+                            $injected++
+                            if ($Verbose) { Write-Host "  MOUSE dx=$dx dy=$dy wheel=$wh btn=0x$([BitConverter]::ToUInt16($pl,6).ToString('x'))" }
+                        }
+                    }
+                    3 {  # SWITCH
+                        if ($pl.Length -ge 2) { Write-Host "  SWITCH side=$($pl[0]) 指针$(if($pl[0] -eq 1){'在本机'}else{'在对端'})" }
+                    }
+                    4 {  # CLIP: format u16, flags u16, fid u32, offset u32, total u32, dlen u32, data
+                        # 门槛必须 >= 20（= 剪贴板头本身：fmt2+flags2+fid4+off4+total4+dlen4）！
+                # 原来是 -ge 24 → 1~3 个字符的短文本载荷只有 21/22/23 字节，整帧被丢掉：
+                # 不应用、不 ACK，发送端重发 3 次后放弃 —— 现场表现"1/2/3 字符复制不过去，
+                # >=4 个字符才行"（第 41 轮，用户报障）。回归：otilink/clipshort.sh
+                if ($Clipboard -and -not $script:paused -and $pl.Length -ge 20) {
+                            $fmt   = [BitConverter]::ToUInt16($pl, 0)   # 1=文本 2=PNG 3=文件包 4=大文件分片 5=传输控制
+                            $flags = [BitConverter]::ToUInt16($pl, 2)
+                            $fid = [BitConverter]::ToUInt32($pl, 4); $off = [BitConverter]::ToUInt32($pl, 8)
+                            $total = [BitConverter]::ToUInt32($pl, 12); $dlen = [BitConverter]::ToUInt32($pl, 16)
+                            if ($fmt -eq 4) {
+                                # 大文件分片：直接落盘（不进重组缓冲，内存恒定 64KB）
+                                Handle-FilePart $pl
+                            } elseif ($fmt -eq 5) {
+                                $kind = [BitConverter]::ToUInt16($pl, 20)
+                                if ($kind -eq 1) { Handle-FileDone $pl } else { Handle-FileVerdict $pl }
+                            } else {
+                            if ($Verbose) { Write-Host "  CLIP 收块 fmt=$fmt flags=$flags fid=$fid off=$off total=$total dlen=$dlen" }
+                            if ((($flags -band 1) -ne 0) -and $clipRx.active -and $clipRx.got -lt $clipRx.total) {
+                                Write-Host "  [warn] CLIP 前一笔未收完（fid=$($clipRx.fid) got=$($clipRx.got)/$($clipRx.total)）被 fid=$fid 打断"
+                            }
+                            if ($clipRx.active -and $fid -eq $clipRx.fid -and $off -ne $clipRx.got) {
+                                Write-Host "  [warn] CLIP 乱序/缺口 fid=$fid off=$off 期望=$($clipRx.got) total=$total dlen=$dlen"
+                            }
+                            if (($flags -band 1) -ne 0) {
+                                $clipRx.active = $true; $clipRx.fid = $fid; $clipRx.total = $total
+                                $clipRx.fmt = $fmt
+                                $clipRx.got = 0; $clipRx.buf = New-Object byte[] $total
+                            }
+                            if ($clipRx.active -and $fid -eq $clipRx.fid -and ($off + $dlen) -le $clipRx.total) {
+                                [Array]::Copy($pl, 20, $clipRx.buf, $off, $dlen)
+                                $clipRx.got = $off + $dlen
+                                if (($flags -band 2) -ne 0) {
+                                    if ($clipRx.fmt -eq 2) {
+                                        # PNG -> CF_DIB 写进剪贴板（Win32 API，见 ClipImg）
+                                        $png = if ($clipRx.got -eq $clipRx.buf.Length) { $clipRx.buf } else { $clipRx.buf[0..($clipRx.got-1)] }
+                                        $ok = [ClipImg]::SetPng($png)
+                                        $lastClipHash = [Oti]::Crc32($clipRx.buf, 0, $clipRx.got)
+                                        $haveClipHash = $true
+                                        # 关键：同时记下"我刚写进去的 DIB 指纹"，否则下一轮轮询
+                                        # 会把这张图重新编码成 PNG 再发回去（PNG 字节必然不同）。
+                                        $lastDibHash = [ClipImg]::DibHash(); $haveDibHash = ($lastDibHash -ne 0)
+                                        $clipRx.active = $false
+                                        Write-Host "  CLIP 已应用远端**图片** $($clipRx.got) 字节 rc=$ok（并抑制回发）"
+                                        [void](Send-ClipAck $lastClipHash ([uint16]2))
+                                    } elseif ($clipRx.fmt -eq 3) {
+                                        # 文件包：u16 个数；每项 u32 名长、名字(UTF-8)、u64 长度、内容
+                                        $p = 2
+                                        $cnt = [BitConverter]::ToUInt16($clipRx.buf, 0)
+                                        $dir = Join-Path $env:TEMP ('otilink_files_' + [Guid]::NewGuid().ToString('N'))
+                                        [IO.Directory]::CreateDirectory($dir) | Out-Null
+                                        $paths = @()
+                                        for ($k = 0; $k -lt $cnt; $k++) {
+                                            $nl = [BitConverter]::ToUInt32($clipRx.buf, $p); $p += 4
+                                            $nm = [Text.Encoding]::UTF8.GetString($clipRx.buf, $p, $nl); $p += $nl
+                                            $sz = [BitConverter]::ToUInt64($clipRx.buf, $p); $p += 8
+                                            $fp = Join-Path $dir $nm
+                                            $ob = New-Object byte[] ([int]$sz)
+                                            [Array]::Copy($clipRx.buf, $p, $ob, 0, [int]$sz); $p += [int]$sz
+                                            [IO.File]::WriteAllBytes($fp, $ob)
+                                            $paths += $fp
+                                        }
+                                        $okf = [ClipFiles]::Set($paths)
+                                        $lastClipHash = [Oti]::Crc32($clipRx.buf, 0, $clipRx.got)
+                                        $haveClipHash = $true
+                                        $clipRx.active = $false
+                                        Write-Host "  CLIP 已应用远端**文件** $cnt 个 rc=$okf -> $dir"
+                                        [void](Send-ClipAck $lastClipHash ([uint16]3))
+                                        $script:lastFileIdent = Get-FileIdent $paths   # 防回环：刚落的文件别再发回去
+                                        $script:haveFileIdent = $true
+                                    } else {
+                                        $text = [Text.Encoding]::UTF8.GetString($clipRx.buf, 0, $clipRx.got)
+                                        # ⚠️ 剪贴板 API 在**锁屏/被别的进程独占**时会抛 ExternalException（真机实测：
+                                        # 锁屏时 Get/Set-Clipboard 都是 ~1.1s 后抛"打开剪贴板失败"）。这里**必须** catch：
+                                        # 不接的话整个代理会退出（2026-11-06 首次真机部署就因此在锁屏时挂过一次，
+                                        # clip.err 里是 Set-Clipboard ExternalException）——暂时应用不了剪贴板不该杀掉代理。
+                                        $applyOk = $true
+                                        try { Set-Clipboard -Value $text }
+                                        catch {
+                                            $applyOk = $false
+                                            Write-Host ("  [warn] 应用远端剪贴板失败（锁屏/剪贴板被占用？已忽略，代理继续）：" + $_.Exception.Message)
+                                        }
+                                        if ($applyOk) {
+                                            $lastClipHash = [Oti]::Crc32([Text.Encoding]::UTF8.GetBytes($text), 0, [Text.Encoding]::UTF8.GetByteCount($text))
+                                            $haveClipHash = $true
+                                            Write-Host "  CLIP 已应用远端剪贴板 $($clipRx.got) 字节（并抑制回发）"
+                                            if ($Verbose) { Write-Host ("  → 回执 ACK crc={0:x8}" -f $lastClipHash) }
+                                            [void](Send-ClipAck $lastClipHash ([uint16]1))
+                                        }
+                                        $clipRx.active = $false
+                                    }
+                                }
+                            }
+                            }   # end else（普通剪贴板重组路径）
+                        }
+                    }
+                    7 {  # MOUSE_ABS: x i16, y i16, wheel i16, buttons u16（对端屏幕坐标）
+                        if ($Inject -and -not $script:paused -and $pl.Length -ge 8) {
+                            $ax = [BitConverter]::ToInt16($pl, 0); $ay = [BitConverter]::ToInt16($pl, 2)
+                            $aw = [BitConverter]::ToInt16($pl, 4)
+                            $sw = if ($AbsW -gt 0) { $AbsW } else { [Oti]::VirtW() }
+                            $sh = if ($AbsH -gt 0) { $AbsH } else { [Oti]::VirtH() }
+                            [Oti]::MouseAbs($ax, $ay, $sw, $sh)
+                            if ($aw -ne 0) { [Oti]::Wheel($aw) }
+                            Apply-Buttons ([int][BitConverter]::ToUInt16($pl, 6))
+                            $injected++
+                            if ($Verbose) { Write-Host "  MOUSE_ABS x=$ax y=$ay wheel=$aw（绝对注入，无加速）" }
+                        }
+                    }
+                    8 {  # HELLO: 对端屏幕宽高
+                        if ($pl.Length -ge 4) {
+                            $pw = [BitConverter]::ToUInt16($pl, 0); $ph = [BitConverter]::ToUInt16($pl, 2)
+                            $script:peerW = $pw; $script:peerH = $ph
+                            Write-Host "  HELLO 主控端屏幕 ${pw}x${ph}"
+                        }
+                    }
+                    6 {  # ACK：剪贴板确认（对端说我发的东西真落地了）
+                        if ($pl.Length -ge 8) {
+                            $acrc = [BitConverter]::ToUInt32($pl, 0)
+                            if ($Verbose) { Write-Host ("  RECV ACK crc={0:x8}（待确认={1:x8} active={2}）" -f $acrc, $script:clipAck.crc, $script:clipAck.active) }
+                            if ($script:clipAck.active -and $acrc -eq $script:clipAck.crc) {
+                                $script:clipAck.active = $false
+                                $script:clipAck.bytes = $null
+                                $script:nAckOk++
+                                if ($Verbose) { Write-Host ("  ACK 收到（crc={0:x8}）确认成功 {1} 次" -f $acrc, $script:nAckOk) }
+                            }
+                        }
+                    }
+                    5 { if ($Verbose) { Write-Host "  PING" } }
+                    10 {  # ROLE: has_local_input u8, want u8, state u8, flags u8, boot_id u32, input_age_ms u32
+                        # 第 1 步只解析+存变量（每 5 秒由主循环打印一行 ROLE:）；不据此起停 otiagent2。
+                        if ($pl.Length -ge 12) {
+                            $script:rolePeerSeen     = $true
+                            $script:rolePeerHasLocal = [int]$pl[0]
+                            $script:rolePeerWant     = [int]$pl[1]
+                            $script:rolePeerState    = [int]$pl[2]
+                            $script:rolePeerFlags    = [int]$pl[3]
+                            $script:rolePeerBoot     = [BitConverter]::ToUInt32($pl, 4)
+                            $script:rolePeerAge      = [BitConverter]::ToUInt32($pl, 8)
+                            $script:rolePeerMs       = Get-Date
+                            # I1：连续 3 个心跳看到对端 state=slave 才允许 grab（起 otiagent2）
+                            if ($script:rolePeerState -eq 2) { $script:rolePeerSlaveStreak++ } else { $script:rolePeerSlaveStreak = 0 }
+                            if ($Verbose) { Write-Host ("  ROLE 收到 state={0} hasLocal={1} want={2} flags={3} boot={4:x8} age={5}ms streak={6}" -f $script:rolePeerState, $script:rolePeerHasLocal, $script:rolePeerWant, $script:rolePeerFlags, $script:rolePeerBoot, $script:rolePeerAge, $script:rolePeerSlaveStreak) }
+                        }
+                    }
                 }
-        }
-        $rxBatch++
-    } while ($useCable -and $null -ne $body -and $rxBatch -lt 16)
+            } elseif ($len -ge 5 -and $body[0] -eq 0x39) {
+                # 厂商 XML 帧：帧体 = [0x39][u32 长度][XML]。麒麟端 otikm 在"撞边交还控制权"
+                # 时会按厂商线格式发 Cmd_Notify_KM_Switch_To_Local（668 字节），厂商程序
+                # （MacKMLink）也往同一条帧管道里写。这些**不是**我们的协议消息，
+                # 以前一律打成 "[warn] 解包失败（CRC/格式）"，被误当成剪贴板传坏了
+                # （整整误导了一轮排查）。这里单独识别、单独计数。
+                $vl = [BitConverter]::ToUInt32($body, 1)
+                $script:vendorRx++
+                Write-Host "  [skip] 厂商 XML 帧 $vl 字节（第 $($script:vendorRx) 条，非本协议，正常忽略）"
+            } else {
+                # 诊断：把失败帧的长度与头 16 字节打出来。厂商程序（MacKMLink）或
+                # otikm 的厂商 XML 通知帧也走同一条帧管道，它们**不是**我们的格式，
+                # 会在这里被判失败 —— 必须能看到内容才能区分"噪声"与"真损坏"。
+                $nh = [Math]::Min(16, $len)
+                $hx = (($body[0..($nh-1)] | ForEach-Object { $_.ToString('x2') }) -join ' ')
+                Write-Host ("  [warn] 解包失败（CRC/格式）len={0} head={1}" -f $len, $hx)
+            }
+    }
 
     # 2) 剪贴板：本地变化则分块发送（按 ClipIntervalMs 节流，避免每 5ms 读剪贴板）
     if ($Clipboard -and (((Get-Date) - $lastClipCheck).TotalMilliseconds -ge $ClipIntervalMs)) {
