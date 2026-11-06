@@ -232,6 +232,7 @@ static void tx_send_done(struct oti_xfer_tx *t)
     t->phase = 1;
     t->wait_deadline_ms = now_ms() + 120000;   /* 大文件在慢链路上收端可能落后 >30s */
     t->verdict_resend_ms = now_ms() + 5000;
+    t->retx_resend_ms = now_ms() + 10000;
     xlog(t, "  %s 全部 %u 片已发出，等待对端校验（crc=%08x，最长 120s）…", t->name, t->nparts, t->crc);
 }
 
@@ -280,7 +281,18 @@ int oti_xfer_tx_poll(struct oti_xfer_tx *t)
     pthread_mutex_unlock(&t->lk);
 
     if (have) {
+        /* 裁决帧现在由对端**冗余发 3 份**抗丢帧（见 windows/otiagent.ps1 / 本轮改动）：
+           同一份裁决会被收到多次。只在"正在等裁决"（phase==1）时处理，其余一律忽略，
+           否则重复的 OK 会把多文件批次误当成"已全部完成"（实测：2 个文件只传了第 1 个）。
+           ABORT 不受此限（幂等，任何时候都该生效）。 */
+        if (t->phase != 1 && !(flags & OTI_XFER_ABORT)) {
+            free(map);
+            map = NULL;
+            xlog(t, "  忽略重复裁决 flags=0x%x（phase=%d）", flags, t->phase);
+            return 1;
+        }
         if (flags & OTI_XFER_OK) {
+            t->phase = 0;                 /* 先落态，重复裁决就不会再进这个分支 */
             double sec = (now_ms() - t->t_start_ms) / 1000.0;
             double mb = (t->total / 1048576.0);
             xlog(t, "✔ %s 传送完成（%llu 字节，%.1f 秒，%.1f MB/s）", t->name,
@@ -366,6 +378,14 @@ int oti_xfer_tx_poll(struct oti_xfer_tx *t)
         if (now > t->wait_deadline_ms) {
             oti_xfer_tx_abort(t, "等待对端校验超时（120 秒）");
             return 0;
+        }
+        /* 缺片补发后**主动重复**：RESUME 裁决也是单帧、会丢（实测 10+ 份只到 1 份）——
+           不能只等下一次 RESUME，否则补发的片丢了就永久卡住。每 10s 把缺片再补一遍。 */
+        if (t->todo && t->todo_n > 0 && now >= t->retx_resend_ms) {
+            t->retx_resend_ms = now + 10000;
+            for (uint32_t i = 0; i < t->todo_n; i++)
+                (void)tx_send_part(t, t->todo[i]);
+            xlog(t, "  未收到裁决，主动补发 %u 片（防 RESUME 丢帧）", t->todo_n);
         }
         /* DONE 帧同样是单帧，丢了收端就永远不裁决 → 每 5s 重发（幂等） */
         if (now >= t->verdict_resend_ms) {

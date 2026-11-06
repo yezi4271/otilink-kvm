@@ -5178,6 +5178,21 @@ otihid_mouse_packets(m->buttons, m->dx, m->dy, m->wheel, pk, 8) → 立即 otili
 * `test.jar` 302MB 端到端 md5（当前停在 93%，RESUME 丢失后失败）；
 * `clipreg` 正式回归（当前仍受 ACK 延迟/乱序影响，最佳 15/17）。
 
+### 76.8 用户指定文件实测：test.jpg / test.jar 双向（2026-11-06 15:50–16:15）
+
+**结果（md5 级证据）**
+* 麒麟→Windows `test.jpg`（1,608,614B）：**PASS**，Windows 侧多份副本 md5 全部 `d500bb783e970bbca44cbba3c42765bc`（与麒麟原文件一致）。
+* 麒麟→Windows `test.jar`（302,812,732B）：**未完成**。最好一轮 4705/4732 片（99.4%，~301MB），`.part` 文件已是全长但**缺 27 片**（md5 `1d80597e…` ≠ 原 `053dd5bc…`）；错片补发后仍收不到 → 发送端 120s 超时中止。
+* Windows→麒麟 `test.jpg`：**PASS**，`/tmp/otilink-files-2297957/test.jpg` md5 `d500bb78…` 与原件一致。
+* Windows→麒麟 `test.jar`：**未能测**（jar 只能靠 K→W 传输放到 Windows，而该方向未完成；302MB 走 SSH relay 拷贝中途连接被关）。
+
+**本轮修掉的 bug（已部署）**
+1. **重复裁决把多文件批次误判完成**：Windows 侧裁决 ×3 冗余，麒麟 `oti_xfer_tx_poll` 每收到一份都走 OK 分支 → `done_files++/cur++`，2 个文件的批次只传完第 1 个就报"本批全部完成"。修：只在 `phase==1` 处理裁决，OK 分支先 `phase=0`；实测 `忽略重复裁决 flags=0x1（phase=0）`、`开始发送 test.jar` 正常。
+2. **末片补发只等 RESUME**：RESUME 也是单帧会丢（实测 Windows 连发 10+ 份，麒麟只收到 1 份）→ 补发一次后永久卡住。修：等裁决期间每 10s 主动重发 `todo` 缺片（"未收到裁决，主动补发 N 片"），DONE 每 5s 重发。
+
+**当前会话状态（重要）**：连续 2 小时大文件测试 + 多次 abort 后，线缆会话明显劣化（两侧帧写反复 ~1.28s、单帧丢包高；最后一次 1.6MB 传了 44.7s 且对端回 ABORT）。
+**处置：物理拔插对拷线两端**（文档里的通用复位），再重启两端代理；先测小文件，大文件留到下次。
+
 ### 76.6 现场应急（本轮已做）
 
 * 11:37 对 Kylin `~/otilink/otitrans.c` 做了**临时热修**（`if (0 && g_hid_busy)`）并重启 otikm，
